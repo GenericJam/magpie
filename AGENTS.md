@@ -171,6 +171,165 @@ MIDI in (mob_midi) ────────────────────�
   sample id + start/end/fades/pitch/gain/reverse.
 - Real-time processes start from `App.on_start`, never from a screen.
 
+## The audio engine
+
+`c_src/magpie_audio.c` is a static NIF (`mob.exs` `:static_nifs`, Android
+only), `ERL_NIF_INIT(Elixir.Magpie.Audio.Nif, …)`. It includes
+`c_src/sampler.c`, plain C (no Android, no erl_nif) that builds on the Mac:
+voices, choke, the sequencer, the queues, the resampler. Elixir side:
+`Magpie.Audio` (the behaviour; `Native` on the phone, `Fake` in host tests,
+`config :magpie, :audio`) owned by **`Magpie.Engine`**, one GenServer
+started in `App.on_start`. Why it is built this way:
+`decisions/2026-11-12-audio-engine-design.md`.
+
+### `Magpie.Engine` API
+
+- **Subscribe** (`subscribe/1`, monitored) for
+  `{:magpie_audio, :playhead, step, frame}`,
+  `{:magpie_audio, :voice, pad, :start | :end}` (a voice of the pad started;
+  its last voice ended), `{:magpie_audio, :hit, pad, %Magpie.Kit.Step{}}`
+  and `{:magpie_audio, :pattern, %Magpie.Kit.Pattern{}, frame}` (it took
+  over). Frames are engine frames; `Magpie.Audio.frame_time(clock(), frame)`
+  is when one is heard, in `System.monotonic_time(:nanosecond)`.
+- **Samples:** `load_sample(id, path)` (MediaCodec: wav 16/24/float, mp3,
+  m4a, flac, ogg checked), `load_pcm(id, f32le, rate, channels)` (the
+  library's PCM, no decoder: use this for kits), both blocking the caller
+  until the sample is in RAM and returning `%{frames, channels, rate, peaks,
+  peak_frames, bytes, source_rate, load_ms}`; `decode(path)` (import: f32le
+  at the file's rate, up to 2 channels, plus peaks, for
+  `Magpie.Library.put_pcm/2`); `unload_sample/1` (clears pads using it);
+  `samples/0`, `memory/0`. Ids are library ids. Up to 256 samples, 5
+  minutes each.
+- **Peaks:** one byte per 256 frames, the largest |sample| over the
+  channels, linear, 255 = full scale.
+- **Pads:** `set_pad(index, %Magpie.Kit.Pad{} | nil)` (regions in seconds,
+  converted to frames of the loaded sample; `{:error, :unknown_sample |
+  {:invalid, field}}`), `clear_pad/1`, `pads/0`. Index =
+  `Magpie.Kit.pad_index(bank, slot)`. Changes apply from the pad's next
+  trigger.
+- **Live:** `trigger(index, velocity, quantize: ticks)`, `release/1`,
+  `note_on/3`, `note_off/2`. They run in the caller (no GenServer hop) and
+  only queue a command; `{:error, :not_running}` without a stream. The
+  caller applies the pad's velocity mode (`Magpie.Style.velocity/2`).
+  `quantize:` (24 a 16th, 96 a beat, 384 a bar) waits for the grid while
+  playing: Snap for loop launches.
+- **Sequencer:** `set_pattern(%Magpie.Kit.Pattern{}, at: :bar | :now)`
+  (`:bar` while playing: takes over at the next bar from its step 0, for
+  switching; `:now`: at once, same position, for edits; muted lanes are
+  left out), `set_tempo/1` (40..240), `set_swing/1` (0.5..0.75), `play/0`,
+  `stop/0` (a waiting pattern takes over), `state/0`.
+- **Live record:** while playing, each live trigger also arrives as a hit
+  `%Magpie.Kit.Step{step, vel, tick, note}`: the nearest step of the
+  playing pattern and `tick` (−12..12) from that step's swung start, at the
+  frame being *heard* when the call was made (the output timestamp), so
+  the output latency doesn't drag the recording late. Snap on: store it
+  with `tick: 0`.
+- `clock/0`, `info/0` (stream, underruns, callback timing, voices, steals,
+  trigger latency, sample bytes, dropped events); `Native.reset_stats/0`.
+  A restarted Engine resets the engine: load the kit again.
+
+### Inside
+
+- **Output:** AAudio low-latency, shared, stereo float at the device's
+  rate. Buffer 2 bursts; the event thread adds a burst after an underrun
+  and reopens the stream after a disconnect (headphones, Bluetooth).
+- **Commands:** a lock-free ring (1024) the callback drains at the start
+  of each buffer: a live call sounds from the next callback's first frame.
+  While no stream renders, control calls apply themselves and live calls
+  are dropped.
+- **Voices:** 32 sound at once, 16 more slots hold voices fading out.
+  Gain = (velocity/127)² (the DLS curve) × pad gain. Pitch by 4-point
+  Hermite resampling (pitch_st, keys notes from `midi_note`, and the
+  sample/engine rate ratio). Fades in sample time: fade-in at the start of
+  what is heard, fade-out before the region's end (in reverse too); at
+  least 0.5 ms in and 1 ms out against clicks. Modes: one_shot (release
+  ignored), gate (until release), loop (loops until release), toggle (a
+  trigger starts a loop, the next stops it), keys (note_on/off chromatic
+  from `midi_note`; trigger plays the root). A release fades over
+  max(fade_out_ms, 5 ms). Choke groups 1–3: a start fades the group's other
+  pads in 4 ms. Full: the quietest sounding voice (then the oldest) fades
+  in 4 ms in a spare slot; only with all 48 slots busy is the quietest
+  fading voice cut. Output soft-clips above 0.8 (tanh knee) into ±1.
+- **Sequencer:** position in ticks is linear in frames from a base
+  (rebased on tempo changes); an event sounds on the first frame at or
+  after its position, so steps are exact to the frame at any buffer size.
+  A step is `step × 24 + tick` (wrapped: step 0, tick −12 is the pattern's
+  end); swing warps each 8th-note pair (first half to `48 × swing` ticks).
+  Swing changes wait for the next pair, pattern switches for the next bar.
+  Sequenced gate, loop and keys pads sound for one step.
+- **Samples:** 16-bit at the engine's rate, resampled once on load
+  (Blackman-windowed sinc, 16 zero crossings), mono or stereo (more
+  channels: the first two). 96 KB per second mono, 192 KB stereo at 48 kHz.
+- **Events:** an event thread every 2 ms sends one playhead, at most a
+  start and an end per pad, every hit and pattern change; it also frees
+  retired samples and patterns and refreshes the clock mapping (20 ms).
+- **Locks:** `lock` (stream lifecycle; only dirty NIFs and the event
+  thread's trylock) → `ctl` (owner, sample table) → `push` / `jobs_lock`
+  → `stats_lock`. The callback takes none.
+
+### Measured
+
+On the moto g power 2021 (Android 11), `scripts/engine_check.exs`:
+
+- **Stream:** 48 kHz, 240-frame bursts (5 ms), buffer 480 frames, low
+  latency, shared (no exclusive mode on this phone). Output latency (frames
+  written but not yet heard) 32–36 ms. The callback is the legacy
+  `AudioTrack` thread (SCHED_FIFO 2) on a little core (A53, 1.8 GHz).
+- **Trigger latency**, NIF call → first frame heard (200 triggers):
+  p50 34.3 ms, p95 36.8 ms (29–37). That is the output path; the call
+  itself costs 4–12 µs on the BEAM.
+- **Step timing:** every step on its exact frame (0 frames off over 49–97
+  steps at 120 bpm straight, 173 bpm swing 0.62, 240 bpm swing 0.75).
+  Playhead messages arrive 27–33 ms *before* the step is heard (jitter
+  around that p95 1.4–3.4 ms, max 5 ms): draw the playhead at
+  `frame_time/2`, not on arrival.
+- **Load:** idle stream 28 µs per callback (0.6 % of real time, the app 5 %
+  of a core); sequencer at 140 bpm 56 µs; 31 looping voices plus the
+  sequencer 1.44 ms mean, 2.3 ms max per 5 ms callback (32 % of real time,
+  app 38 % of a core), 33 voices with steals 1.57 ms / 2.6 ms; no
+  underruns. The host bench (`sampler_host bench`) on the phone: 32 voices
+  cost 86 ns per voice-frame back to back on a little core and 259 ns paced
+  every 5 ms like the callback (the core wakes slowly): the paced number is
+  the one the app sees.
+- **Loading** (2 s stereo 44.1 kHz → 48 kHz): wav 130–165 ms, flac
+  170 ms, mp3 220 ms, m4a 275 ms, ogg/opus 165 ms; 10 s of library PCM
+  (`load_pcm`) 160–180 ms. Missing file `:not_found`.
+- **Memory:** 188 KB per stereo second in the engine (exactly 2 bytes ×
+  channels × 48000). The process grows more while PCM passes through the
+  BEAM (`Library.pcm/1` reads it into a binary; +18 MB RSS for 11 MB of
+  samples), and the BEAM's allocators don't hand that back at once.
+- **Budget per phone** (handoff open question 1): on a 4 GB phone like this
+  one, keep loaded samples under about 64 MB (≈ 5.5 min stereo, 11 min
+  mono): with the BEAM's own copy while loading that stays well clear of
+  Android's low-memory killer. A drum kit is far below (64 one-shots of
+  0.5 s stereo ≈ 6 MB); chopped breaks share one sample. Phones with 6 GB+
+  can take 128 MB. `Engine.memory/0` is the number to check against.
+
+### Checking it
+
+- Host, the C core: `cc -O2 -Wall -Wextra -o /tmp/sampler_host
+  c_src/test/sampler_host.c -lm && /tmp/sampler_host` (step timing to the
+  frame at 5 tempos × 4 swings with random block sizes, off-grid and
+  negative ticks, block-size independence, tempo change, pattern swap at
+  the bar and edits now, choke and steal with a bounded sample-to-sample
+  step, pitch to 0.5 ¢, reverse, loop, gate/one-shot/toggle/keys, fades and
+  velocity, hit stamping with swing, quantized launch, unload while
+  playing, queue overflow, the limiter, resampler SNR and aliasing, peaks).
+  Also with `-fsanitize=address,undefined`. `/tmp/sampler_host bench`
+  (built with `-Os`, as the app is) for render cost.
+- The NIF for Android: `$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang
+  --target=aarch64-linux-android28 --sysroot=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/sysroot
+  -I ~/.mob/cache/otp-android-*/erts-*/include
+  -DSTATIC_ERLANG_NIF_LIBNAME=magpie_audio -Wall -Wextra -c c_src/magpie_audio.c`
+  (also `armv7a-linux-androideabi28`, `x86_64-linux-android28`).
+- Host, Elixir: `mix test test/magpie/engine_test.exs` (the Fake: ownership,
+  loading and errors, pads in seconds, pattern compile, swap at the bar,
+  edits now, hits as kit steps).
+- Device: `mix mob.deploy --native --android --device <serial>`, `mix
+  mob.connect --no-iex --android-only --device <serial>`, then
+  `SERIAL=<serial> mix run --no-start scripts/engine_check.exs` (needs
+  ffmpeg; turn the volume down).
+
 ## Rules for Mob screens here (from Choir Coach and Humdinger)
 
 - **Every `on_tap` on a screen that re-renders on a timer** (pads while
@@ -204,5 +363,11 @@ MIDI in (mob_midi) ────────────────────�
   --android --device <serial>`; restart with `mix mob.connect --no-iex
   --android-only --device <serial>`. Scripts over dist need
   `Node.set_cookie(MobDev.DistCookie.for_project!())`.
+- `priv/generated/driver_tab_{android,ios}.zig` are committed (the rest of
+  `priv/generated/` is ignored): mob_dev only creates a driver table for
+  plugin NIFs, so without these files `magpie_audio` links but never
+  registers (`:nif_not_loaded` on the phone, MOB-519). Regenerate with `mix
+  mob.regen_driver_tab` after changing `:static_nifs`; they can go
+  untracked once mob_dev creates them for `:static_nifs` itself.
 - Decisions go in `decisions/YYYY-MM-DD-<slug>.md` (Context / Decision /
   Consequences), as in mob.

@@ -41,7 +41,11 @@ config :mob_dev,
   # built app's Info.plist as UIApplicationSupportsMultipleScenes. iOS only;
   # Android ignores it. The per-window navigation needs a mob release with
   # Mob.Scene (not released yet, mob#184): keep false until then.
-  multi_window: false
+  multi_window: false,
+
+  # The audio engine (c_src/magpie_audio.c, which includes c_src/sampler.c):
+  # AAudio, NDK MediaCodec, the sampler and sequencer. Android only for now.
+  static_nifs: [%{module: :magpie_audio, archs: [:android]}]
 
 # Activated capability plugins (the packages added in mix.exs). Each contributes
 # its native code, permissions, and any demo screens at build time. Drop a name

@@ -41,5 +41,10 @@ xcuserdata/
 # macOS
 .DS_Store
 
-# Rewritten by mob_dev on every build (runtime plugin manifest)
-priv/generated/
+# Rewritten by mob_dev on every build (runtime plugin manifest). The static-NIF
+# driver tables are tracked: mob_dev only refreshes tables that exist, so a
+# clone without them would link magpie_audio but never register it
+# (:nif_not_loaded on the phone). Regenerate with `mix mob.regen_driver_tab`.
+priv/generated/*
+!priv/generated/driver_tab_android.zig
+!priv/generated/driver_tab_ios.zig

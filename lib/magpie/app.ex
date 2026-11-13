@@ -29,6 +29,10 @@ defmodule Magpie.App do
       Ecto.Migrator.run(repo, migrations_dir(), :up, all: true)
     end)
 
+    # The sampler: the audio stream and the sequencer live outside the
+    # screens, so they keep time whichever screen is in front.
+    {:ok, _} = Magpie.Engine.start_link()
+
     Mob.Theme.set(Magpie.Style.theme())
     Mob.Screen.start_root(Magpie.HomeScreen)
     Mob.Dist.ensure_started(node: :"magpie_android@127.0.0.1", cookie: :mob_secret)
