@@ -156,6 +156,12 @@ defmodule Magpie.KitSessionTest do
       refute_received {:magpie_kit, _}
     end
 
+    test "update_pad/2 runs the function in the caller: a bad one leaves the session up" do
+      assert_raise RuntimeError, fn -> KitSession.update_pad(0, fn _ -> raise "boom" end) end
+      assert {:error, {:not_a_pad, :nope}} = KitSession.update_pad(0, fn _ -> :nope end)
+      assert %Pad{} = KitSession.snapshot().kit.banks["A"][0]
+    end
+
     test "clearing a pad empties it in the engine and the kit" do
       assert :ok = KitSession.clear_pad(0)
       assert Fake.state().pads == %{}

@@ -116,22 +116,12 @@ defmodule Magpie.PadsScreen do
 
   # ── Touch ───────────────────────────────────────────────────────────────
 
-  # The hot path: the trigger before anything else.
+  # The hot path: the trigger before anything else. Fingers landing together
+  # arrive as one message each; every `:down` already waiting is triggered
+  # here too, so the second finger doesn't wait for the first one's render.
   @impl true
-  def handle_info({:touch, {:pad, index}, %{phase: :down} = t}, socket) do
-    vel =
-      case socket.assigns.trig do
-        %{^index => {velocity, quantize, _release}} ->
-          vel = if velocity == :position, do: Style.velocity(t.y, t.height), else: velocity
-          _ = Engine.trigger(index, vel, quantize: quantize)
-          vel
-
-        _empty ->
-          nil
-      end
-
-    {:noreply, finger_down(socket, index, t, vel)}
-  end
+  def handle_info({:touch, {:pad, index}, %{phase: :down} = t}, socket),
+    do: {:noreply, socket |> press(index, t) |> press_waiting()}
 
   def handle_info({:touch, {:pad, _index}, %{phase: :move, pointer_id: id} = t}, socket) do
     case socket.assigns.fingers do
@@ -302,6 +292,35 @@ defmodule Magpie.PadsScreen do
       velocity = if pad.velocity == :fixed, do: pad.fixed_velocity, else: :position
       quantize = if kit.snap and pad.mode in [:loop, :toggle], do: @snap_ticks, else: 0
       {Kit.pad_index(bank, slot), {velocity, quantize, pad.mode in [:gate, :loop, :keys]}}
+    end
+  end
+
+  defp press(socket, index, t) do
+    vel =
+      case socket.assigns.trig do
+        %{^index => {velocity, quantize, _release}} ->
+          vel = if velocity == :position, do: Style.velocity(t.y, t.height), else: velocity
+          _ = Engine.trigger(index, vel, quantize: quantize)
+          vel
+
+        _empty ->
+          nil
+      end
+
+    finger_down(socket, index, t, vel)
+  end
+
+  # A `:down` from a pointer id still held here is left in the mailbox: that
+  # id's `:up` is queued before it (Android reuses ids), and must go first.
+  defp press_waiting(socket) do
+    fingers = socket.assigns.fingers
+
+    receive do
+      {:touch, {:pad, index}, %{phase: :down, pointer_id: id} = t}
+      when not is_map_key(fingers, id) ->
+        socket |> press(index, t) |> press_waiting()
+    after
+      0 -> socket
     end
   end
 
@@ -976,8 +995,10 @@ defmodule Magpie.PadsScreen do
     """
   end
 
+  # Five options don't fit "One-shot" at the board's 12 pt in 412 pt: 11.
   defp segmented(label, options) do
-    segments = for {text, tag, on} <- options, do: segment(text, tag, on)
+    size = if Enum.count_until(options, 5) == 5, do: 11, else: 12
+    segments = for {text, tag, on} <- options, do: segment(text, tag, on, size)
 
     ~MOB"""
     <Row fill_width={true} gap={10}>
@@ -989,7 +1010,7 @@ defmodule Magpie.PadsScreen do
     """
   end
 
-  defp segment(text, tag, on) do
+  defp segment(text, tag, on, size) do
     tap = {self(), tag}
     bg = if on, do: Style.color(:selected), else: 0x00000000
     fg = Style.color(if on, do: :text, else: :muted)
@@ -1004,7 +1025,7 @@ defmodule Magpie.PadsScreen do
       on_tap={tap}
       on_press_out={held()}
     >
-      <Text text={text} font={:semibold} text_size={12} text_color={fg} max_lines={1} />
+      <Text text={text} font={:semibold} text_size={size} text_color={fg} max_lines={1} />
     </Box>
     """
   end

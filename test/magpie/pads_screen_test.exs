@@ -7,6 +7,7 @@ defmodule Magpie.PadsScreenTest do
   alias Magpie.Audio.Fake
   alias Magpie.{Kit, KitSession, PadsScreen}
   alias Magpie.Kit.{Pad, Region}
+  alias Mob.Event.Touch
 
   @h 155.0
   @w 91.0
@@ -69,6 +70,17 @@ defmodule Magpie.PadsScreenTest do
         pointer_id: pointer,
         x: x,
         y: y,
+        width: @w,
+        height: @h
+      )
+
+  # A touch as native sends it, at the pad's top edge, for queueing.
+  defp touch_message(pad, phase, pointer),
+    do:
+      Touch.message({:pad, pad}, phase,
+        pointer_id: pointer,
+        x: 40.0,
+        y: 0.0,
         width: @w,
         height: @h
       )
@@ -184,6 +196,34 @@ defmodule Magpie.PadsScreenTest do
                &(&1.props[:width] == 32 and &1.props[:offset_x] == 14.0 and
                    &1.props[:offset_y] == 24.0)
              )
+    end
+
+    test "fingers landing together are all triggered before the screen renders" do
+      view = mount()
+      send(self(), touch_message(1, :down, 2))
+      send(self(), touch_message(3, :down, 3))
+      view = down(view, 0, 1, 0.0)
+
+      assert triggers() == [{0, 127, 0}, {1, 127, 0}, {3, 127, 0}]
+      assert assigns(view).fingers |> Map.keys() |> Enum.sort() == [1, 2, 3]
+      refute_received {:touch, _, _}
+    end
+
+    test "a waiting down from a pointer id still held stays queued behind that id's up" do
+      view = mount() |> down(0, 1, 0.0)
+      # Pointer 1 lifts and lands on pad 1 while pad 2's down (fixed 90) is handled.
+      up_msg = touch_message(0, :up, 1)
+      down_msg = touch_message(1, :down, 1)
+      send(self(), up_msg)
+      send(self(), down_msg)
+      view = down(view, 2, 2, 0.0)
+      assert triggers() == [{0, 127, 0}, {2, 90, 0}]
+
+      assert_received ^up_msg
+      assert_received ^down_msg
+      view = view |> render_info(up_msg) |> render_info(down_msg)
+      assert triggers() == [{0, 127, 0}, {2, 90, 0}, {1, 127, 0}]
+      assert %{1 => %{pad: 1}, 2 => %{pad: 2}} = assigns(view).fingers
     end
 
     test "fingers are independent: each releases its own pad" do

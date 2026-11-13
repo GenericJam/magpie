@@ -92,13 +92,25 @@ defmodule Magpie.KitSession do
 
   @doc """
   Change pad `index` (0..63): `fun` gets the pad (nil for an empty slot)
-  and returns the new one, or nil to clear it. The engine gets it at once
-  if its sample is loaded (its errors come back and leave the kit as it
-  was); a sample not loaded yet is loaded.
+  and returns the new one, or nil to clear it. `fun` runs in the caller (a
+  bad one can't take the session down) and again if the pad changed
+  meanwhile. The engine gets the pad at once if its sample is loaded (its
+  errors come back and leave the kit as it was); a sample not loaded yet
+  is loaded.
   """
   @spec update_pad(0..63, (Pad.t() | nil -> Pad.t() | nil)) :: :ok | {:error, term()}
-  def update_pad(index, fun) when index in 0..63 and is_function(fun, 1),
-    do: GenServer.call(__MODULE__, {:update_pad, index, fun})
+  def update_pad(index, fun) when index in 0..63 and is_function(fun, 1) do
+    old = GenServer.call(__MODULE__, {:pad, index})
+
+    case fun.(old) do
+      new when is_nil(new) or is_struct(new, Pad) ->
+        with {:error, :changed} <- GenServer.call(__MODULE__, {:put_pad, index, old, new}),
+             do: update_pad(index, fun)
+
+      other ->
+        {:error, {:not_a_pad, other}}
+    end
+  end
 
   @doc "Empty pad `index`."
   def clear_pad(index), do: update_pad(index, fn _ -> nil end)
@@ -185,13 +197,15 @@ defmodule Magpie.KitSession do
 
   def handle_call(:snapshot, _from, s), do: {:reply, snapshot(s), s}
 
-  def handle_call({:update_pad, index, fun}, _from, s) do
-    {bank, slot} = Kit.bank_slot(index)
+  def handle_call({:pad, index}, _from, s), do: {:reply, pad_at(s.kit, index), s}
 
-    case fun.(get_in(s.kit.banks, [bank, slot])) do
-      nil -> reply(set_pad(s, index, nil))
-      %Pad{} = pad -> reply(set_pad(s, index, %{pad | slot: slot}))
-      other -> {:reply, {:error, {:not_a_pad, other}}, s}
+  def handle_call({:put_pad, index, old, new}, _from, s) do
+    {_bank, slot} = Kit.bank_slot(index)
+
+    cond do
+      pad_at(s.kit, index) != old -> {:reply, {:error, :changed}, s}
+      new == nil -> reply(set_pad(s, index, nil))
+      true -> reply(set_pad(s, index, %{new | slot: slot}))
     end
   end
 
@@ -249,12 +263,12 @@ defmodule Magpie.KitSession do
         {{:error, :not_in_library}, s}
 
       sample ->
-        {bank, slot} = Kit.bank_slot(index)
+        {_bank, slot} = Kit.bank_slot(index)
         name = String.slice(sample.name, 0, 12)
         region = %Region{id: id}
 
         pad =
-          case get_in(s.kit.banks, [bank, slot]) do
+          case pad_at(s.kit, index) do
             nil -> %Pad{slot: slot, name: name, color: palette_color(slot), sample: region}
             pad -> %{pad | name: name, sample: region}
           end
@@ -285,6 +299,11 @@ defmodule Magpie.KitSession do
   end
 
   defp reply({result, s}), do: {:reply, result, s}
+
+  defp pad_at(kit, index) do
+    {bank, slot} = Kit.bank_slot(index)
+    get_in(kit.banks, [bank, slot])
+  end
 
   defp put_pad(kit, index, pad) do
     {bank, slot} = Kit.bank_slot(index)
