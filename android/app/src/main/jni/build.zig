@@ -125,6 +125,12 @@ pub fn build(b: *std.Build) void {
         b.fmt("{s}/usr/include/{s}", .{ ndk_sysroot, arch_triple }),
     };
     for (base_c_flags) |f| c_flags_buf.append(b.allocator, f) catch unreachable;
+    // Zig treats arm-linux-androideabi as a soft-float ABI and lowers every
+    // float op to a compiler-rt call. Android's armeabi-v7a is softfp: VFP
+    // instructions, soft calling convention (so objects still link with the
+    // soft ones and with the NDK's libc/libm). Without it, Magpie's mixer
+    // took 298 % of real time for 30 voices on a moto e (msm8953); with it, 53 %.
+    if (std.mem.eql(u8, abi, "armeabi-v7a")) c_flags_buf.append(b.allocator, "-mfloat-abi=softfp") catch unreachable;
     if (nxeigen_static) c_flags_buf.append(b.allocator, "-DMOB_STATIC_NX_EIGEN_NIF") catch unreachable;
     // Per-NIF compiles (project + plugin C NIFs) start from this snapshot and
     // add only -DSTATIC_ERLANG_NIF_LIBNAME=<name>: erl_nif.h derives

@@ -497,5 +497,10 @@ starts the take on the frame captured when its downbeat is heard.
   registers (`:nif_not_loaded` on the phone, MOB-519). Regenerate with `mix
   mob.regen_driver_tab` after changing `:static_nifs`; they can go
   untracked once mob_dev creates them for `:static_nifs` itself.
+- `android/app/src/main/jni/build.zig` adds `-mfloat-abi=softfp` to the C
+  flags for armeabi-v7a. The mob_new template doesn't (MOB-522), so Zig's
+  `androideabi` target compiles all C soft-float: on the moto e the mixer
+  took 298 % of real time for 30 voices without it, 53 % with it. Keep the
+  line if the file is ever regenerated, until mob_new ships the fix.
 - Decisions go in `decisions/YYYY-MM-DD-<slug>.md` (Context / Decision /
   Consequences), as in mob.
