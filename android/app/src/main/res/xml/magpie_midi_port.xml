@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Magpie port (MagpieMidiService). Its input port is what other apps
+     send to (notes play pads, a clock Magpie can follow); its output port is
+     what they receive from (pads' notes, Magpie's clock). "name" becomes
+     MidiDeviceInfo.PROPERTY_NAME. -->
+<devices>
+    <device manufacturer="Magpie" product="Magpie port" name="Magpie">
+        <input-port name="Magpie" />
+        <output-port name="Magpie" />
+    </device>
+</devices>

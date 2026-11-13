@@ -16,6 +16,9 @@ object MobPluginBootstrap {
         com.genericjam.magpie.capture.MagpieCapture.register()
         handOff(com.genericjam.magpie.capture.MagpieCapture, activity)
         collectPermissionProvider(com.genericjam.magpie.capture.MagpieCapture)
+        com.genericjam.magpie.midi.MagpieMidi.register()
+        handOff(com.genericjam.magpie.midi.MagpieMidi, activity)
+        collectPermissionProvider(com.genericjam.magpie.midi.MagpieMidi)
     }
 
     // Returns the first plugin-supplied Android permission mapping for `cap`,
