@@ -1,0 +1,483 @@
+# Checks recording on a connected Android phone over Erlang distribution:
+# the mic stream, the meters, a recording made while the sequencer plays
+# (callback timing and underruns with and without the mic, the clicks'
+# spacing in what was recorded), the count-in's downbeat against what the
+# mic heard, "when sound starts" with its pre-roll, the length limit,
+# playing a take back through a pad, other apps (with OTHER_APPS=1) and
+# importing (wav, mp3, aiff).
+#
+#   mix mob.deploy --native --android --device <serial>
+#   mix mob.connect --no-iex --android-only --device <serial>
+#   adb -s <serial> shell pm grant com.genericjam.magpie android.permission.RECORD_AUDIO
+#   SERIAL=<serial> mix run --no-start scripts/record_check.exs
+#
+# The phone's speaker plays clicks the mic records (no headphones, a quiet
+# room; volume 12 of 15 on the moto g power 2021, so a pad click clears
+# "when sound starts"'s 12 dB over the room). Needs ffmpeg on the Mac.
+# With OTHER_APPS=1 it also serves a 1499 Hz tone over `adb reverse`,
+# opens it in Chrome and starts it with a media key, answers the capture
+# consent dialog with a tap, records what Chrome plays (RMS, frequency),
+# then records again while Magpie's own sequencer plays (excluded: silence).
+
+serial = System.fetch_env!("SERIAL")
+app = "com.genericjam.magpie"
+files = "/data/data/#{app}/files/record_check"
+
+node =
+  String.to_atom(System.get_env("NODE", "magpie_android_#{String.downcase(serial)}@127.0.0.1"))
+
+{:ok, _} = Node.start(:"record_check_#{System.unique_integer([:positive])}@127.0.0.1")
+Node.set_cookie(MobDev.DistCookie.for_project!())
+true = Node.connect(node)
+
+rpc = fn m, f, a ->
+  case :rpc.call(node, m, f, a, 300_000) do
+    {:badrpc, reason} -> raise "rpc #{inspect(m)}.#{f} failed: #{inspect(reason)}"
+    value -> value
+  end
+end
+
+adb = fn args ->
+  {out, _} = System.cmd("adb", ["-s", serial | args], stderr_to_stdout: true)
+  out
+end
+
+fmt = fn
+  x when is_float(x) -> :erlang.float_to_binary(x, decimals: 2)
+  x -> inspect(x)
+end
+
+# ── Test sounds ──────────────────────────────────────────────────────────────
+
+tmp = Path.join(System.tmp_dir!(), "magpie_record_check")
+File.mkdir_p!(tmp)
+
+ffmpeg = fn args ->
+  {_, 0} = System.cmd("ffmpeg", ["-v", "error", "-y" | args], stderr_to_stdout: true)
+end
+
+# A click: 20 ms of 2 kHz, fading out.
+ffmpeg.(~w(-f lavfi -i sine=frequency=2000:duration=0.02:sample_rate=48000 -af afade=t=out:st=0.005:d=0.015,volume=0.9 -ac 1 #{tmp}/click.wav))
+# Two seconds of a stereo chord to import, as wav, mp3 and aiff.
+ffmpeg.(~w(-f lavfi -i sine=frequency=220:duration=2:sample_rate=44100 -f lavfi -i sine=frequency=331:duration=2:sample_rate=44100 -filter_complex [0][1]amerge=inputs=2,volume=0.4 #{tmp}/chord.wav))
+ffmpeg.(~w(-i #{tmp}/chord.wav -c:a libmp3lame -b:a 192k #{tmp}/chord.mp3))
+ffmpeg.(~w(-i #{tmp}/chord.wav -c:a pcm_s16be #{tmp}/chord.aiff))
+
+adb.(["shell", "run-as", app, "mkdir", "-p", files])
+
+for name <- ~w(click.wav chord.wav chord.mp3 chord.aiff) do
+  adb.(["push", "#{tmp}/#{name}", "/data/local/tmp/#{name}"])
+  adb.(["shell", "run-as", app, "cp", "/data/local/tmp/#{name}", "#{files}/#{name}"])
+  adb.(["shell", "rm", "/data/local/tmp/#{name}"])
+end
+
+# ── On the phone: one process per scenario owns the input ─────────────────────
+
+phone = """
+defmodule MagpieRecordCheck do
+  alias Magpie.Engine
+  alias Magpie.Kit.{Pad, Pattern, Region, Step}
+
+  def setup(click) do
+    {:ok, _} = Engine.load_sample("rc_click", click)
+    :ok = Engine.set_pad(0, %Pad{slot: 0, sample: %Region{id: "rc_click"}})
+    lanes = %{0 => %{mute: false, steps: for(s <- [0, 4, 8, 12], do: %Step{step: s, vel: 110})}}
+    :ok = Engine.set_pattern(%Pattern{id: "rc", bank: "A", length: 16, lanes: lanes}, at: :now)
+    :ok = Engine.set_tempo(120)
+  end
+
+  defp open(source) do
+    :ok = Engine.subscribe()
+    {:ok, id} = Engine.open_input(source)
+    receive do
+      {:magpie_audio, :input, ^id, :started, info} -> Map.put(info, :id, id)
+      {:magpie_audio, :input, ^id, :closed, reason} -> raise "input closed: \#{inspect(reason)}"
+    after
+      60_000 -> raise "no input"
+    end
+  end
+
+  defp close do
+    Engine.close_input()
+    Engine.unsubscribe()
+    flush()
+  end
+
+  defp flush do
+    receive do
+      _ -> flush()
+    after
+      0 -> :ok
+    end
+  end
+
+  # The meters (and anything else) for `ms`.
+  defp collect(ms, acc \\\\ []) do
+    deadline = System.monotonic_time(:millisecond) + ms
+    collect_until(deadline, acc)
+  end
+
+  defp collect_until(deadline, acc) do
+    left = deadline - System.monotonic_time(:millisecond)
+    receive do
+      msg -> collect_until(deadline, [{System.monotonic_time(:millisecond), msg} | acc])
+    after
+      max(left, 0) -> Enum.reverse(acc)
+    end
+  end
+
+  # The first message `pattern_fun` accepts within `ms` (meters keep
+  # arriving, so the deadline is fixed, not per message).
+  defp await(pattern_fun, ms), do: await_until(pattern_fun, System.monotonic_time(:millisecond) + ms)
+
+  defp await_until(pattern_fun, deadline) do
+    left = max(deadline - System.monotonic_time(:millisecond), 0)
+    receive do
+      msg -> if pattern_fun.(msg), do: msg, else: await_until(pattern_fun, deadline)
+    after
+      left -> :timeout
+    end
+  end
+
+  defp window(ms) do
+    Magpie.Audio.Native.reset_stats()
+    before = Engine.info()
+    Process.sleep(ms)
+    after_ = Engine.info()
+    %{
+      underruns: after_.underruns - before.underruns,
+      callback_mean_us: after_.callback_mean_us,
+      callback_max_us: after_.callback_max_us,
+      callback_gap_max_us: after_.callback_gap_max_us,
+      cpu_load: after_.cpu_load,
+      dropped: after_.dropped
+    }
+  end
+
+  # The sequencer plays a click on every beat; 5 s without the mic, 5 s
+  # with it recording; the take comes back with its meters.
+  def mic_while_playing do
+    :ok = Engine.play()
+    Process.sleep(1000)
+    quiet = window(5000)
+    info = open(:mic)
+    meters = collect(1000)
+    {:ok, _take} = Engine.record(mode: :now, max_seconds: 30)
+    recording = window(5000)
+    input = Engine.info().input
+    {:ok, rec} = Engine.stop_recording()
+    :ok = Engine.stop()
+    close()
+    %{info: info, quiet: quiet, recording: recording, input: input, rec: rec, idle_meters: meters}
+  end
+
+  # Count-in while playing: the take should start on the downbeat.
+  def count_in(play?) do
+    if play?, do: :ok = Engine.play()
+    if play?, do: Process.sleep(700)
+    open(:mic)
+    t0 = System.monotonic_time(:millisecond)
+    {:ok, take} = Engine.record(mode: :count_in, max_seconds: 30)
+    {:magpie_audio, :count_in, ^take, first, until} =
+      await(&match?({:magpie_audio, :count_in, ^take, _, _}, &1), 5000)
+    clock = Engine.clock()
+    started = await(&match?({:magpie_audio, :record, ^take, :started, _}, &1), 10_000)
+    t_started = System.monotonic_time(:millisecond) - t0
+    Process.sleep(2500)
+    {:ok, rec} = Engine.stop_recording()
+    if play?, do: :ok = Engine.stop()
+    close()
+    heard = Magpie.Audio.frame_time(clock, until)
+    %{first: first, until: until, started: started, started_after_ms: t_started,
+      downbeat_from_now_ms: (heard - System.monotonic_time(:nanosecond)) / 1.0e6, rec: rec}
+  end
+
+  # When sound starts: a click 1.5 s after arming.
+  def on_sound(threshold_db) do
+    open(:mic)
+    ambient = collect(1000) |> Enum.flat_map(fn {_, {:magpie_audio, :meter, _, db, _}} -> [db]; _ -> [] end)
+    threshold = (Enum.max(ambient, fn -> -60.0 end) + 12) |> max(-48.0) |> min(-12.0)
+    threshold = threshold_db || threshold
+    {:ok, take} = Engine.record(mode: :on_sound, threshold_db: threshold, pre_roll_ms: 150)
+    Process.sleep(1500)
+    waiting = Engine.info().input.recorder
+    Engine.trigger(0, 127)
+    heard = collect(1500)
+    started = Enum.find_value(heard, :timeout, fn {_, {:magpie_audio, :record, ^take, :started, _} = m} -> m; _ -> nil end)
+    click_db = heard |> Enum.flat_map(fn {_, {:magpie_audio, :meter, _, db, _}} -> [db]; _ -> [] end) |> Enum.max(fn -> nil end)
+    rec = case Engine.stop_recording() do {:ok, rec} -> rec; error -> error end
+    close()
+    %{ambient_max: Enum.max(ambient, fn -> nil end), threshold: threshold, waiting: waiting, started: started,
+      click_db: click_db, rec: rec}
+  end
+
+  def full do
+    open(:mic)
+    {:ok, take} = Engine.record(mode: :now, max_seconds: 2)
+    full = await(&match?({:magpie_audio, :record, ^take, :full, _}, &1), 5000)
+    {:ok, rec} = Engine.stop_recording()
+    close()
+    %{full: full, frames: rec.frames, rate: rec.rate}
+  end
+
+  def play_back(rec) do
+    :ok = Engine.subscribe()
+    {:ok, loaded} = Engine.load_pcm("rc_take", rec.pcm, rec.rate, rec.channels)
+    :ok = Engine.set_pad(1, %Pad{slot: 1, sample: %Region{id: "rc_take"}})
+    :ok = Engine.trigger(1, 120)
+    voice = await(&match?({:magpie_audio, :voice, 1, :start}, &1), 2000)
+    Engine.unsubscribe()
+    flush()
+    %{loaded: Map.drop(loaded, [:peaks]), voice: voice}
+  end
+
+  # Other apps for `seconds`; with `play?`, Magpie's own sequencer plays meanwhile.
+  def apps(seconds, play?) do
+    info = open(:apps)
+    meters = collect(1000)
+    {:ok, _take} = Engine.record(mode: :now, max_seconds: 30)
+    if play?, do: :ok = Engine.play()
+    Process.sleep(seconds * 1000)
+    if play?, do: :ok = Engine.stop()
+    {:ok, rec} = Engine.stop_recording()
+    close()
+    %{info: info, meters: meters, rec: rec}
+  end
+
+  def import(path, name) do
+    decode = Engine.decode(path)
+    result = Magpie.Import.import(path, name)
+    with {:ok, sample} <- result, do: Magpie.Library.delete(sample.id)
+    %{decode: (case decode do {:ok, d} -> {:ok, Map.drop(d, [:pcm, :peaks])}; e -> e end),
+      import: (case result do {:ok, s} -> {:ok, Map.take(s, [:source, :rate, :channels, :frames, :name])}; e -> e end)}
+  end
+end
+"""
+
+_ = rpc.(Code, :compile_string, [phone])
+# Ecto's debug queries would bury the report.
+:ok = rpc.(Logger, :configure, [[level: :info]])
+
+# ── Analysis on the Mac ──────────────────────────────────────────────────────
+
+# |x| per frame (largest over the channels).
+levels = fn rec ->
+  ch = rec.channels
+  samples = for <<x::float-32-little <- rec.pcm>>, do: abs(x)
+  samples |> Enum.chunk_every(ch) |> Enum.map(&Enum.max/1) |> List.to_tuple()
+end
+
+# Where sound starts after at least `quiet` frames under the threshold
+# (a third of the take's peak).
+onsets = fn lv, quiet ->
+  n = tuple_size(lv)
+  peak = Enum.max(Tuple.to_list(lv), fn -> 0.0 end)
+  thr = peak / 3
+
+  {list, _} =
+    Enum.reduce(0..(n - 1)//1, {[], quiet}, fn i, {acc, q} ->
+      if elem(lv, i) >= thr,
+        do: {if(q >= quiet, do: [i | acc], else: acc), 0},
+        else: {acc, q + 1}
+    end)
+
+  {Enum.reverse(list), peak}
+end
+
+db = fn x -> if x > 0, do: 20 * :math.log10(x), else: -120.0 end
+
+IO.puts("== Setup")
+:ok = rpc.(MagpieRecordCheck, :setup, ["#{files}/click.wav"])
+info = rpc.(Magpie.Engine, :info, [])
+rate = info.rate
+IO.puts("  output #{rate} Hz, burst #{info.burst}, buffer #{info.buffer_frames}")
+
+IO.puts("\n== The mic, recording while the sequencer plays a click on every beat (120 bpm)")
+m = rpc.(MagpieRecordCheck, :mic_while_playing, [])
+IO.puts("  input #{inspect(m.info)}, #{inspect(m.input)}")
+
+meter_times = for {t, {:magpie_audio, :meter, _, _, _}} <- m.idle_meters, do: t
+gaps = meter_times |> Enum.chunk_every(2, 1, :discard) |> Enum.map(fn [a, b] -> b - a end)
+IO.puts("  meters: #{length(meter_times)} in 1 s, gaps #{inspect(Enum.min_max(gaps, fn -> nil end))} ms")
+
+for {label, w} <- [{"playing, no mic", m.quiet}, {"playing + mic recording", m.recording}] do
+  IO.puts(
+    "  #{label}: underruns #{w.underruns}, callback mean #{fmt.(w.callback_mean_us)} µs, max #{fmt.(w.callback_max_us)} µs, " <>
+      "gap max #{fmt.(w.callback_gap_max_us)} µs, cpu #{fmt.(w.cpu_load * 100)} %, dropped #{inspect(w.dropped)}"
+  )
+end
+
+rec = m.rec
+lv = levels.(rec)
+{at, peak} = onsets.(lv, div(rate, 4))
+spacing = at |> Enum.chunk_every(2, 1, :discard) |> Enum.map(fn [a, b] -> b - a end)
+beat = div(rate * 60, 120)
+
+IO.puts(
+  "  take: #{rec.frames} frames (#{fmt.(rec.frames / rec.rate)} s) × #{rec.channels} at #{rec.rate} Hz, peak #{fmt.(db.(peak))} dBFS, " <>
+    "#{byte_size(rec.peaks)} peak bytes; #{length(at)} clicks heard, spacing − #{beat}: #{inspect(Enum.map(spacing, &(&1 - beat)))} frames"
+)
+
+IO.puts("\n== Playing the take through a pad (load_pcm, set_pad, trigger)")
+IO.puts("  #{inspect(rpc.(MagpieRecordCheck, :play_back, [rec]))}")
+
+IO.puts("\n== Count-in while playing (120 bpm): the take starts on the downbeat")
+
+for run <- 1..3 do
+  c = rpc.(MagpieRecordCheck, :count_in, [true])
+  lv = levels.(c.rec)
+  {at, peak} = onsets.(lv, div(rate, 4))
+  first = List.first(at)
+
+  IO.puts(
+    "  run #{run}: clicks from #{c.first}, downbeat #{c.until} (#{fmt.((c.until - c.first) / rate)} s later), started #{inspect(c.started)} " <>
+      "#{c.started_after_ms} ms after record/1; first click in the take at frame #{inspect(first)} " <>
+      "(#{if first, do: fmt.(first * 1000 / rate), else: "-"} ms), then #{inspect(at |> Enum.take(4))}, peak #{fmt.(db.(peak))} dBFS"
+  )
+end
+
+IO.puts("\n== Count-in stopped (the clicks alone)")
+c = rpc.(MagpieRecordCheck, :count_in, [false])
+lv = levels.(c.rec)
+{at, peak} = onsets.(lv, div(rate, 10))
+
+IO.puts(
+  "  clicks from #{c.first} to the downbeat #{c.until} (#{fmt.((c.until - c.first) / rate)} s = 4 beats at 120), started #{inspect(c.started)}; " <>
+    "sounds in the take: #{inspect(Enum.take(at, 4))}, peak #{fmt.(db.(peak))} dBFS"
+)
+
+IO.puts("\n== When sound starts (a click 1.5 s after arming, 150 ms pre-roll)")
+s = rpc.(MagpieRecordCheck, :on_sound, [nil])
+
+IO.puts(
+  "  ambient max #{fmt.(s.ambient_max)} dBFS, threshold #{fmt.(s.threshold)} dBFS, recorder #{s.waiting} while quiet; " <>
+    "the click metered at #{fmt.(s.click_db)} dBFS; started #{inspect(s.started)}"
+)
+
+case s.rec do
+  %{pcm: _} = rec ->
+    {at, peak} = onsets.(levels.(rec), div(rate, 20))
+
+    IO.puts(
+      "  the click's onset in the take at frame #{inspect(List.first(at))} " <>
+        "(#{if at != [], do: fmt.(hd(at) * 1000 / rate), else: "-"} ms), peak #{fmt.(db.(peak))} dBFS"
+    )
+
+  error ->
+    IO.puts("  FAIL: no take (#{inspect(error)})")
+end
+
+IO.puts("\n== The length limit (2 s)")
+f = rpc.(MagpieRecordCheck, :full, [])
+IO.puts("  #{inspect(f.full)}, the take #{f.frames} frames = #{fmt.(f.frames / f.rate)} s")
+
+IO.puts("\n== Import")
+
+for name <- ~w(chord.wav chord.mp3 chord.aiff) do
+  IO.puts("  #{name}: #{inspect(rpc.(MagpieRecordCheck, :import, ["#{files}/#{name}", name]))}")
+end
+
+if System.get_env("OTHER_APPS") == "1" do
+  IO.puts("\n== Other apps: Chrome playing a 1499 Hz tone (-6 dBFS), then Magpie's own sequencer")
+  ffmpeg.(~w(-f lavfi -i sine=frequency=1499:duration=60:sample_rate=48000 -af volume=4 -ac 2 -c:a libmp3lame -b:a 192k #{tmp}/tone.mp3))
+  port = 8765
+  server = Port.open({:spawn_executable, System.find_executable("python3")}, [:binary, args: ["-m", "http.server", "#{port}", "--bind", "127.0.0.1", "--directory", tmp]])
+  adb.(["reverse", "tcp:#{port}", "tcp:#{port}"])
+  Process.sleep(500)
+
+  [_, chrome_uid] = Regex.run(~r/uid:(\d+)/, adb.(["shell", "pm", "list", "packages", "-U", "com.android.chrome"]))
+  chrome_playing = fn -> adb.(["shell", "dumpsys", "audio"]) =~ ~r"u/pid:#{chrome_uid}/\d+ state:started" end
+
+  # The same tab every run (the application id); Chrome blocks autoplay
+  # for a URL it is sent, so a media key starts it.
+  adb.(["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", "http://127.0.0.1:#{port}/tone.mp3",
+        "--es", "com.android.browser.application_id", "magpie_record_check", "com.android.chrome"])
+  Process.sleep(3000)
+  adb.(["shell", "input", "keyevent", "KEYCODE_MEDIA_PLAY"])
+  Process.sleep(1000)
+  IO.puts("  Chrome's player started: #{chrome_playing.()}")
+
+  # Magpie in front, the input opened, the consent dialog's "Start now" tapped.
+  capture = fn seconds, play? ->
+    adb.(["shell", "am", "start", "-n", "#{app}/.MainActivity"])
+    Process.sleep(1500)
+    task = Task.async(fn -> rpc.(MagpieRecordCheck, :apps, [seconds, play?]) end)
+
+    tap =
+      Enum.find_value(1..20, fn _ ->
+        Process.sleep(500)
+        adb.(["shell", "uiautomator", "dump", "/sdcard/rc_ui.xml"])
+        xml = adb.(["shell", "cat", "/sdcard/rc_ui.xml"])
+
+        case Regex.run(~r/text="Start now"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/i, xml) do
+          [_, x1, y1, x2, y2] ->
+            [x1, y1, x2, y2] = Enum.map([x1, y1, x2, y2], &String.to_integer/1)
+            adb.(["shell", "input", "tap", "#{div(x1 + x2, 2)}", "#{div(y1 + y2, 2)}"])
+            {div(x1 + x2, 2), div(y1 + y2, 2)}
+
+          _ ->
+            nil
+        end
+      end)
+
+    IO.puts("  consent: #{if tap, do: "tapped Start now at #{inspect(tap)}", else: "dialog not found"}")
+    Task.await(task, 120_000)
+  end
+
+  # The take's left channel: RMS, the strongest frequency near the
+  # zero-crossing estimate (Goertzel, 1 Hz then 0.05 Hz steps over the
+  # middle second), its level and share of the energy; L against R.
+  tone = fn rec ->
+    size = 4 * rec.channels
+    frames = for <<f::binary-size(^size) <- rec.pcm>>, do: for(<<x::float-32-little <- f>>, do: x)
+    left = Enum.map(frames, &hd/1)
+    lr = frames |> Enum.map(fn [l | rest] -> abs(l - List.first(rest, l)) end) |> Enum.max(fn -> 0.0 end)
+    n = length(left)
+    rms = :math.sqrt(Enum.reduce(left, 0.0, &(&1 * &1 + &2)) / max(n, 1))
+    win = left |> Enum.drop(max(div(n - rec.rate, 2), 0)) |> Enum.take(rec.rate)
+    m = max(length(win), 1)
+    energy = Enum.reduce(win, 0.0, &(&1 * &1 + &2)) / m
+    guess = (win |> Enum.chunk_every(2, 1, :discard) |> Enum.count(fn [x, y] -> x < 0 and y >= 0 end)) * rec.rate / m
+
+    amp = fn f ->
+      c = 2 * :math.cos(2 * :math.pi() * f / rec.rate)
+      {s1, s2} = Enum.reduce(win, {0.0, 0.0}, fn x, {s1, s2} -> {x + c * s1 - s2, s1} end)
+      2 * :math.sqrt(max(s1 * s1 + s2 * s2 - c * s1 * s2, 0.0)) / m
+    end
+
+    {hz, a} =
+      if rms > 1.0e-6 and guess > 25 do
+        coarse = Enum.max_by(for(k <- -20..20, do: guess + k), amp)
+        fine = Enum.max_by(for(k <- -20..20, do: coarse + k * 0.05), amp)
+        {fine, amp.(fine)}
+      else
+        {nil, 0.0}
+      end
+
+    %{peak: Enum.max(Enum.map(left, &abs/1), fn -> 0.0 end), rms: rms, hz: hz, tone_rms: a / :math.sqrt(2),
+      share: if(energy > 0, do: a * a / 2 / energy, else: 0.0), lr: lr}
+  end
+
+  report = fn label, a ->
+    t = tone.(a.rec)
+    meters = for {_, {:magpie_audio, :meter, _, d, _}} <- a.meters, do: Float.round(d, 1)
+    silent = meters |> Enum.take_while(&(&1 <= -119.0)) |> length()
+
+    IO.puts(
+      "  #{label}: #{inspect(a.info)}; the first #{silent} of #{length(meters)} meters after :started silent; take #{a.rec.frames} frames × #{a.rec.channels}, " <>
+        "peak #{fmt.(db.(t.peak))} dBFS, RMS #{fmt.(db.(t.rms))} dBFS; " <>
+        if(t.hz, do: "#{fmt.(t.hz)} Hz at #{fmt.(db.(t.tone_rms))} dBFS RMS, #{fmt.(100 * t.share)} % of the energy", else: "no tone") <>
+        "; max |L − R| #{fmt.(t.lr)}"
+    )
+  end
+
+  report.("Chrome", capture.(4, false))
+  adb.(["shell", "input", "keyevent", "KEYCODE_MEDIA_PAUSE"])
+  Process.sleep(1000)
+  report.("Magpie's sequencer (its own UID is excluded)", capture.(4, true))
+
+  adb.(["reverse", "--remove", "tcp:#{port}"])
+  {:os_pid, server_pid} = Port.info(server, :os_pid)
+  Port.close(server)
+  System.cmd("kill", ["#{server_pid}"])
+end

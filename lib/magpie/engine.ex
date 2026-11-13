@@ -27,6 +27,16 @@ defmodule Magpie.Engine do
       {:magpie_audio, :hit, pad, %Magpie.Kit.Step{}}  # a live trigger while playing (see below)
       {:magpie_audio, :pattern, %Magpie.Kit.Pattern{}, frame}  # this pattern took over at `frame`
 
+  and the input and recording messages of `Magpie.Audio` (see
+  "Recording" below), each tagged with the input or the take it is about:
+
+      {:magpie_audio, :input, input, :started, %{source, rate, channels}}
+      {:magpie_audio, :input, input, :closed, reason}   # :denied, :disconnected, :stopped, :error
+      {:magpie_audio, :meter, input, level_db, %{take, state, frames, peaks}}  # ~40 ms while an input is open
+      {:magpie_audio, :record, take, :started, %{pre_roll_frames, late_frames}}
+      {:magpie_audio, :record, take, :full, frames}    # max length reached
+      {:magpie_audio, :count_in, take, first_frame, until_frame}
+
   `frame` is an engine frame; `Magpie.Audio.frame_time(clock(), frame)`
   says when it is heard, for drawing the playhead in time with the sound.
 
@@ -47,6 +57,27 @@ defmodule Magpie.Engine do
   return its info (`t:Magpie.Audio.sample_info/0`); this process stays
   free meanwhile. `decode/1` decodes a file for importing into the
   library. A restarted engine starts clean: load the kit again.
+
+  ## Recording
+
+  `open_input(:mic | :apps)` closes any input and opens this one,
+  answering `{:ok, input}` (an id the input's messages carry), and
+  monitors the caller: when it exits the input closes, so the mic is
+  never left on by a screen that went away. `state/0`'s `input` follows
+  it (`:opening`, then `:open` with its rate and channels; nil once
+  closed; `:closing` while a mic stream that wouldn't stop is being
+  closed again, every second and slower, until it is released). If the
+  new source can't open, what was open is closed all the same: the
+  input is nil. Meters arrive every ~40 ms while it is open: `level_db`
+  (peak dBFS) and, while a take is armed, the take, its frames so far and
+  the new peak bytes (append them for the waveform). `record/1` arms the
+  recorder (`:now`, `:on_sound` above a threshold with a pre-roll,
+  `:count_in` one bar of clicks first) and answers `{:ok, take}`;
+  `stop_recording/0` returns `t:Magpie.Audio.recording/0` (f32le at the
+  input's rate plus peaks, ready for `Magpie.Library.put_pcm/2`);
+  `cancel_recording/0` drops it. Messages about an input or a take that
+  is over (still queued when the next one began) are dropped here, and a
+  subscriber matches the ids it was given for the same reason.
   """
 
   use GenServer
@@ -57,6 +88,11 @@ defmodule Magpie.Engine do
   alias Magpie.Kit.{Pad, Pattern, Region, Step}
 
   @load_timeout 120_000
+  @record_defaults %{mode: :now, max_seconds: 60, threshold_db: -30, pre_roll_ms: 150}
+  @close_retry_ms 1_000
+  @close_retry_max_ms 30_000
+  # state/0's input while a close is retried and nothing else was known.
+  @closing %{id: nil, source: nil, status: :closing, rate: nil, channels: nil}
   @modes [:one_shot, :gate, :loop, :toggle, :keys]
   @banks ~w(A B C D)
   # The most events the engine takes in one pattern (c_src/sampler.c SP_MAX_STEPS).
@@ -73,10 +109,20 @@ defmodule Magpie.Engine do
             swing: 0.5,
             playing: false,
             step: nil,
-            subscribers: %{}
+            subscribers: %{},
+            input: nil,
+            input_ref: nil,
+            take: nil,
+            close_retry_ms: @close_retry_ms,
+            close_backoff: @close_retry_ms,
+            retry: nil
 
   # ── Public API ──────────────────────────────────────────────────────────────
 
+  @doc """
+  Start the Engine. `close_retry_ms:` (1000) is the first wait before a
+  mic that wouldn't stop is closed again (doubling, up to 30 s).
+  """
   def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   @doc "Forward the engine's messages to `pid` until it exits or unsubscribes."
@@ -165,7 +211,7 @@ defmodule Magpie.Engine do
   @doc "Stop the sequencer; sounding voices ring on."
   def stop, do: GenServer.call(__MODULE__, :stop)
 
-  @doc "`%{playing, step, tempo, swing, pattern, pending, stream}`."
+  @doc "`%{playing, step, tempo, swing, pattern, pending, stream, input}`."
   def state, do: GenServer.call(__MODULE__, :state)
 
   @doc """
@@ -197,10 +243,60 @@ defmodule Magpie.Engine do
   @doc "Engine diagnostics (see `c:Magpie.Audio.info/0`)."
   def info, do: Audio.impl().info()
 
+  @doc """
+  Close any input, then open `:mic` or `:apps` (what other apps play; the
+  phone asks the user first). `{:ok, input}` means it is opening:
+  `{:magpie_audio, :input, input, :started, info}` or `{:magpie_audio,
+  :input, input, :closed, reason}` follows. An error after the close
+  leaves no input (`:input_stuck`: the old mic wouldn't stop; the Engine
+  keeps closing it). The input closes when the caller exits.
+  """
+  @spec open_input(:mic | :apps) :: {:ok, Audio.input()} | {:error, term()}
+  def open_input(source) when source in [:mic, :apps],
+    do: GenServer.call(__MODULE__, {:open_input, source, self()})
+
+  def open_input(_source), do: {:error, {:invalid, :source}}
+
+  @doc """
+  Close the input (a recording in progress is dropped). `{:error,
+  :input_stuck}`: the mic stream wouldn't stop; it is closed to every
+  screen and the Engine tries again on its own until it is released.
+  """
+  @spec close_input() :: :ok | {:error, term()}
+  def close_input, do: GenServer.call(__MODULE__, :close_input)
+
+  @doc """
+  Arm the recorder on the open input. Options: `mode:` `:now` (default),
+  `:on_sound` (from the first sound at or above `threshold_db:`, -90..0,
+  default -30, keeping `pre_roll_ms:`, 0..500, default 150, from before
+  it) or `:count_in` (after one bar of clicks; needs the output stream);
+  `max_seconds:` 1..300, default 60. `{:ok, take}`: the id the take's
+  messages carry. `{:error, {:invalid, field}}` for a bad option, else
+  the engine's answer (`:no_input`, `:recording`, `:not_running`,
+  `:alloc`).
+  """
+  @spec record(keyword()) :: {:ok, Audio.take()} | {:error, term()}
+  def record(opts \\ []) do
+    with {:ok, params} <- record_params(opts),
+         do: GenServer.call(__MODULE__, {:record, params})
+  end
+
+  @doc """
+  Stop and take the recording: `{:ok, recording}` (`t:Magpie.Audio.recording/0`)
+  or `{:error, :not_recording | :not_started}` (armed, but it never
+  began). The recorder is disarmed either way.
+  """
+  @spec stop_recording() :: {:ok, Audio.recording()} | {:error, term()}
+  def stop_recording, do: GenServer.call(__MODULE__, :stop_recording, @load_timeout)
+
+  @doc "Disarm the recorder and drop what it recorded."
+  @spec cancel_recording() :: :ok | {:error, term()}
+  def cancel_recording, do: GenServer.call(__MODULE__, :cancel_recording)
+
   # ── Server ──────────────────────────────────────────────────────────────────
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
     impl = Audio.impl()
 
     stream =
@@ -218,7 +314,12 @@ defmodule Magpie.Engine do
       {:error, reason} -> Logger.warning("Magpie.Engine: reset refused (#{inspect(reason)})")
     end
 
-    {:ok, %__MODULE__{stream: stream}}
+    retry = Keyword.get(opts, :close_retry_ms, @close_retry_ms)
+    s = %__MODULE__{stream: stream, close_retry_ms: retry, close_backoff: retry}
+
+    # A restarted engine never inherits an open input (the mic stays off).
+    {_, s} = close_input(s)
+    {:ok, s}
   end
 
   @impl true
@@ -325,9 +426,48 @@ defmodule Magpie.Engine do
        swing: s.swing,
        pattern: s.pattern,
        pending: with({_, pattern} <- s.pending, do: pattern),
-       stream: s.stream
+       stream: s.stream,
+       input: s.input
      }, s}
   end
+
+  def handle_call({:open_input, source, pid}, _from, s) do
+    case Audio.impl().input_open(source) do
+      {:ok, id} ->
+        input = %{id: id, source: source, status: :opening, rate: nil, channels: nil}
+        s = drop_input(s)
+        {:reply, {:ok, id}, %{s | input: input, input_ref: Process.monitor(pid)}}
+
+      {:error, :not_owner} = error ->
+        {:reply, error, s}
+
+      {:error, :input_stuck} = error ->
+        {:reply, error, stuck(s)}
+
+      # What was open was closed before the new source failed.
+      {:error, _} = error ->
+        {:reply, error, drop_input(s)}
+    end
+  end
+
+  def handle_call(:close_input, _from, s) do
+    {result, s} = close_input(s)
+    {:reply, result, s}
+  end
+
+  def handle_call({:record, params}, _from, s) do
+    case Audio.impl().record_start(params) do
+      {:ok, take} -> {:reply, {:ok, take}, %{s | take: take}}
+      {:error, _} = error -> {:reply, error, s}
+    end
+  end
+
+  # The recording passed through this process: hibernating frees it now.
+  def handle_call(:stop_recording, _from, s),
+    do: {:reply, Audio.impl().record_stop(), %{s | take: nil}, :hibernate}
+
+  def handle_call(:cancel_recording, _from, s),
+    do: {:reply, Audio.impl().record_cancel(), %{s | take: nil}}
 
   @impl true
   def handle_info({:magpie_audio, :loaded, id, result}, s) do
@@ -362,10 +502,58 @@ defmodule Magpie.Engine do
     end
   end
 
+  # Input and recording messages count only for the current input and take:
+  # one about an earlier one (queued before it closed) is dropped.
+  def handle_info(
+        {:magpie_audio, :input, id, :started, info} = msg,
+        %{input: %{id: id, status: :opening}} = s
+      ) do
+    forward(s, msg)
+    {:noreply, %{s | input: Map.merge(s.input, Map.put(info, :status, :open))}}
+  end
+
+  # The native side marks the source closed; input_close/0 releases the
+  # stream and stops the capture service (or, stuck, is tried again).
+  def handle_info(
+        {:magpie_audio, :input, id, :closed, _reason} = msg,
+        %{input: %{id: id, status: status}} = s
+      )
+      when status in [:opening, :open] do
+    {_, s} = close_input(s)
+    forward(s, msg)
+    {:noreply, s}
+  end
+
+  def handle_info({:magpie_audio, :meter, id, _, _} = msg, %{input: %{id: id}} = s) do
+    forward(s, msg)
+    {:noreply, s}
+  end
+
+  def handle_info({:magpie_audio, kind, take, _, _} = msg, %{take: take} = s)
+      when kind in [:record, :count_in] and take != nil do
+    forward(s, msg)
+    {:noreply, s}
+  end
+
+  def handle_info({:magpie_audio, kind, _, _, _}, s)
+      when kind in [:input, :meter, :record, :count_in],
+      do: {:noreply, s}
+
   def handle_info({:magpie_audio, kind, _, _} = msg, s) when kind in [:voice, :hit] do
     forward(s, msg)
     {:noreply, s}
   end
+
+  def handle_info({:retry_close, ref}, %{retry: ref} = s) when ref != nil do
+    {_, s} = close_input(s)
+    {:noreply, s}
+  end
+
+  def handle_info({:retry_close, _ref}, s), do: {:noreply, s}
+
+  # The input's opener exited: the mic goes off with it.
+  def handle_info({:DOWN, ref, :process, _pid, _}, %{input_ref: ref} = s) when ref != nil,
+    do: {:noreply, s |> close_input() |> elem(1)}
 
   def handle_info({:DOWN, ref, :process, pid, _}, s) do
     case s.subscribers do
@@ -375,6 +563,69 @@ defmodule Magpie.Engine do
   end
 
   # ── Helpers ─────────────────────────────────────────────────────────────────
+
+  # A mic stream that won't stop is closed to everyone (the native side
+  # takes no more from it) but not released: the Engine closes it again
+  # later, on its own, whoever asked.
+  defp close_input(s) do
+    case Audio.impl().input_close() do
+      :ok ->
+        {:ok, drop_input(s)}
+
+      {:error, :input_stuck} = error ->
+        {error, stuck(s)}
+
+      {:error, reason} = error ->
+        Logger.warning("Magpie.Engine: closing the input: #{inspect(reason)}")
+        {error, s}
+    end
+  end
+
+  defp drop_input(s) do
+    if s.input_ref, do: Process.demonitor(s.input_ref, [:flush])
+
+    %{
+      s
+      | input: nil,
+        input_ref: nil,
+        take: nil,
+        retry: nil,
+        close_backoff: s.close_retry_ms
+    }
+  end
+
+  defp stuck(s) do
+    Logger.warning(
+      "Magpie.Engine: the input wouldn't close; trying again in #{s.close_backoff} ms"
+    )
+
+    if s.input_ref, do: Process.demonitor(s.input_ref, [:flush])
+    retry = make_ref()
+    Process.send_after(self(), {:retry_close, retry}, s.close_backoff)
+
+    %{
+      s
+      | input: %{(s.input || @closing) | status: :closing},
+        input_ref: nil,
+        take: nil,
+        retry: retry,
+        close_backoff: min(s.close_backoff * 2, @close_retry_max_ms)
+    }
+  end
+
+  defp record_params(opts) do
+    Enum.reduce_while(opts, {:ok, @record_defaults}, fn {key, value}, {:ok, params} ->
+      if record_opt?(key, value),
+        do: {:cont, {:ok, Map.put(params, key, value)}},
+        else: {:halt, {:error, {:invalid, key}}}
+    end)
+  end
+
+  defp record_opt?(:mode, mode), do: mode in [:now, :on_sound, :count_in]
+  defp record_opt?(:max_seconds, s), do: in_range?(s, 1, 300)
+  defp record_opt?(:threshold_db, db), do: in_range?(db, -90, 0)
+  defp record_opt?(:pre_roll_ms, ms), do: in_range?(ms, 0, 500)
+  defp record_opt?(_key, _value), do: false
 
   defp control(:ok, new, _old), do: {:reply, :ok, new}
   defp control({:error, _} = error, _new, old), do: {:reply, error, old}

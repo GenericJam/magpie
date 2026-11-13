@@ -20,6 +20,43 @@ defmodule Magpie.Audio do
       {:magpie_audio, :hit, pad, %Magpie.Kit.Step{}} # a live trigger while playing, where it was heard
       {:magpie_audio, :pattern, pattern_number, frame} # a pattern took over
 
+  Input and recording (`c:input_open/1`, `c:record_start/1`):
+
+      {:magpie_audio, :input, input, :started, %{source: :mic | :apps, rate: rate, channels: 1 | 2}}
+      {:magpie_audio, :input, input, :closed, reason}
+      {:magpie_audio, :meter, input, level_db, %{take: take | nil, state: state, frames: frames, peaks: new_peaks}}
+      {:magpie_audio, :record, take, :started, %{pre_roll_frames: n, late_frames: n}}
+      {:magpie_audio, :record, take, :full, frames}
+      {:magpie_audio, :count_in, take, first_frame, until_frame}
+
+  `input` is the id `c:input_open/1` returned, `take` the one
+  `c:record_start/1` returned (positive integers, never reused): a
+  message about an input or a take that is over can still be on its way
+  when the next one starts, so match on the id.
+
+  - `:input, :started`: the input runs. The mic starts at once (mono at
+    the engine's rate); other apps after the MediaProjection consent and
+    the capture service start (stereo).
+  - `:input, :closed`: `:denied` (consent refused), `:disconnected`,
+    `:stopped` (the user ended the projection) or `:error`. Call
+    `c:input_close/0` to release it.
+  - `:meter`, every ~40 ms while an input is open: `level_db` is the
+    input's peak dBFS since the previous meter (float, floor -120.0);
+    `take` the armed take (nil: none); `state` is `:idle` (monitoring
+    only), `:waiting` (`:on_sound` armed), `:counting` (count-in armed),
+    `:recording` or `:full` (max length reached); `frames` the take's
+    frames so far (at the input's rate); `peaks` its new peak bytes since
+    the previous meter (append them; see `t:peaks/0`).
+  - `:record, :started`: the take began: at once for `:now`, at the
+    first frame at or above the threshold (less the pre-roll) for
+    `:on_sound`, on the downbeat after the count-in.
+  - `:record, :full`: max length reached; the recorder keeps what it has
+    and takes no more audio. `c:record_stop/0` returns it.
+  - `:count_in`: four clicks (one bar of 4/4 at the current tempo) at
+    engine frames `first + k × (until − first) / 4`, k = 0..3; the
+    recording starts with the audio captured when `until` is heard.
+    While the sequencer plays, `first` is its next bar.
+
   Frames are engine frames: frames rendered since the engine started, at
   the engine's rate (the device's own, 48 kHz on the phones tried).
   `clock/0` maps them onto `System.monotonic_time(:nanosecond)`.
@@ -65,6 +102,30 @@ defmodule Magpie.Audio do
           frames: non_neg_integer(),
           peaks: peaks(),
           peak_frames: pos_integer()
+        }
+
+  @typedoc """
+  A finished recording: exactly `t:decoded/0` (interleaved f32le at the
+  input's rate, peaks per 256 frames).
+  """
+  @type recording :: decoded()
+
+  @typedoc "An opened input (`c:input_open/1`); every input message carries it."
+  @type input :: pos_integer()
+
+  @typedoc "An armed take (`c:record_start/1`); every recording message carries it."
+  @type take :: pos_integer()
+
+  @typedoc """
+  How a recording starts (`:now`; `:on_sound` at `threshold_db`, keeping
+  `pre_roll_ms` from before it; `:count_in`, after one bar of clicks) and
+  its length limit.
+  """
+  @type record_opts :: %{
+          mode: :now | :on_sound | :count_in,
+          max_seconds: number(),
+          threshold_db: number(),
+          pre_roll_ms: number()
         }
 
   @typedoc """
@@ -166,6 +227,41 @@ defmodule Magpie.Audio do
   @callback clock() :: clock() | nil
   @doc "Diagnostics: stream, callback timing, underruns, voices, latency, memory."
   @callback info() :: map()
+  @doc """
+  Close any open input, then open `:mic` or `:apps` (other apps'
+  playback, Android 10+) as a new input id. The outcome arrives as
+  `{:magpie_audio, :input, input, :started, info}` or `{:magpie_audio,
+  :input, input, :closed, reason}`. Errors returned directly:
+  `:not_owner` (nothing changed); `:input_stuck` (the open mic wouldn't
+  stop: it is closed to the owner but still allocated, and the next
+  close or open tries again); after the close, `:unsupported` (apps
+  below API 29), `:busy` (a consent dialog is still up),
+  `:no_permission` (RECORD_AUDIO not granted), `:input_unavailable`
+  (AAudio refused), `{:missing, lib}`.
+  """
+  @callback input_open(source :: :mic | :apps) :: {:ok, input()} | {:error, term()}
+  @doc """
+  Close the input; a recording in progress is dropped. `:input_stuck`:
+  the mic stream wouldn't stop (closed to the owner, still allocated):
+  try again later.
+  """
+  @callback input_close() :: :ok | {:error, term()}
+  @doc """
+  Arm the recorder on the open input as a new take id. `:not_running`:
+  `:count_in` needs the output stream (the engine renders its clicks);
+  `:recording`: already armed.
+  """
+  @callback record_start(record_opts()) ::
+              {:ok, take()}
+              | {:error, :no_input | :recording | :not_running | :alloc | :not_owner}
+  @doc """
+  Stop and take the recording. `:not_started`: armed but the recording
+  never began (no sound yet, count-in not done); the recorder is disarmed
+  either way.
+  """
+  @callback record_stop() :: {:ok, recording()} | {:error, :not_recording | :not_started}
+  @doc "Disarm the recorder and drop what it has."
+  @callback record_cancel() :: :ok | {:error, term()}
 
   @doc "The engine in use."
   def impl, do: Application.get_env(:magpie, :audio, Magpie.Audio.Native)
