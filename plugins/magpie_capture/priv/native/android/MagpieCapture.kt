@@ -16,9 +16,9 @@ package com.genericjam.magpie.capture
 // outcome goes back through nativeStarted / nativeEnded ("denied",
 // "stopped" when the user ends the projection, "error").
 //
-// Locking: `lock` guards the session; natives are never called while it is
-// held (the NIF calls stop() with its own lock held, and the natives take
-// that lock).
+// Locking: `lock` guards the session and the consent dialog's launch;
+// natives are never called while it is held (the NIF calls stop() with its
+// own lock held, and the natives take that lock).
 
 import android.Manifest
 import android.app.Activity
@@ -128,23 +128,31 @@ object MagpieCapture : io.mob.plugin.MobActivityAware {
         }
     }
 
+    // Checked and launched under `lock`, so a stop() either comes first (no
+    // dialog) or after the launch (the dialog is up; onConsent drops its
+    // answer). launch() only asks the system to start the dialog; its
+    // result arrives later on the main thread.
     private fun askConsent(activity: Activity, owner: ActivityResultRegistryOwner, req: Request) {
-        if (synchronized(lock) { pending !== req }) return // stopped before the dialog could open
-        try {
-            val mpm = activity.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            var launcher: ActivityResultLauncher<Intent>? = null
-            launcher = owner.activityResultRegistry.register(
-                keyPrefix + req.session,
-                ActivityResultContracts.StartActivityForResult(),
-            ) { result ->
-                launcher?.unregister()
-                onConsent(activity, req, result.resultCode, result.data)
+        val launched = synchronized(lock) {
+            if (pending !== req) return // stopped before the dialog could open
+            try {
+                val mpm = activity.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                var launcher: ActivityResultLauncher<Intent>? = null
+                launcher = owner.activityResultRegistry.register(
+                    keyPrefix + req.session,
+                    ActivityResultContracts.StartActivityForResult(),
+                ) { result ->
+                    launcher?.unregister()
+                    onConsent(activity, req, result.resultCode, result.data)
+                }
+                launcher.launch(mpm.createScreenCaptureIntent())
+                true
+            } catch (e: Throwable) {
+                Log.e(TAG, "consent: ${e.message}", e)
+                false
             }
-            launcher.launch(mpm.createScreenCaptureIntent())
-        } catch (e: Throwable) {
-            Log.e(TAG, "consent: ${e.message}", e)
-            fail(req, "error")
         }
+        if (!launched) fail(req, "error")
     }
 
     private fun onConsent(activity: Activity, req: Request, resultCode: Int, data: Intent?) {

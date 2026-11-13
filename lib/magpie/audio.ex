@@ -22,26 +22,32 @@ defmodule Magpie.Audio do
 
   Input and recording (`c:input_open/1`, `c:record_start/1`):
 
-      {:magpie_audio, :input, :started, %{source: :mic | :apps, rate: rate, channels: 1 | 2}}
-      {:magpie_audio, :input, :closed, reason}
-      {:magpie_audio, :meter, level_db, %{state: state, frames: frames, peaks: new_peaks}}
-      {:magpie_audio, :record, :started, %{pre_roll_frames: n, late_frames: n}}
-      {:magpie_audio, :record, :full, frames}
-      {:magpie_audio, :count_in, first_frame, until_frame}
+      {:magpie_audio, :input, input, :started, %{source: :mic | :apps, rate: rate, channels: 1 | 2}}
+      {:magpie_audio, :input, input, :closed, reason}
+      {:magpie_audio, :meter, input, level_db, %{take: take | nil, state: state, frames: frames, peaks: new_peaks}}
+      {:magpie_audio, :record, take, :started, %{pre_roll_frames: n, late_frames: n}}
+      {:magpie_audio, :record, take, :full, frames}
+      {:magpie_audio, :count_in, take, first_frame, until_frame}
+
+  `input` is the id `c:input_open/1` returned, `take` the one
+  `c:record_start/1` returned (positive integers, never reused): a
+  message about an input or a take that is over can still be on its way
+  when the next one starts, so match on the id.
 
   - `:input, :started`: the input runs. The mic starts at once (mono at
     the engine's rate); other apps after the MediaProjection consent and
     the capture service start (stereo).
   - `:input, :closed`: `:denied` (consent refused), `:disconnected`,
-    `:stopped` (the user ended the projection) or `:error`.
+    `:stopped` (the user ended the projection) or `:error`. Call
+    `c:input_close/0` to release it.
   - `:meter`, every ~40 ms while an input is open: `level_db` is the
     input's peak dBFS since the previous meter (float, floor -120.0);
-    `state` is `:idle` (monitoring only), `:waiting` (`:on_sound` armed),
-    `:counting` (count-in armed), `:recording` or `:full` (max length
-    reached); `frames` the frames recorded so far (at the input's rate);
-    `peaks` the recording's new peak bytes since the previous meter
-    (append them; see `t:peaks/0`).
-  - `:record, :started`: the recording began: at once for `:now`, at the
+    `take` the armed take (nil: none); `state` is `:idle` (monitoring
+    only), `:waiting` (`:on_sound` armed), `:counting` (count-in armed),
+    `:recording` or `:full` (max length reached); `frames` the take's
+    frames so far (at the input's rate); `peaks` its new peak bytes since
+    the previous meter (append them; see `t:peaks/0`).
+  - `:record, :started`: the take began: at once for `:now`, at the
     first frame at or above the threshold (less the pre-roll) for
     `:on_sound`, on the downbeat after the count-in.
   - `:record, :full`: max length reached; the recorder keeps what it has
@@ -103,6 +109,12 @@ defmodule Magpie.Audio do
   input's rate, peaks per 256 frames).
   """
   @type recording :: decoded()
+
+  @typedoc "An opened input (`c:input_open/1`); every input message carries it."
+  @type input :: pos_integer()
+
+  @typedoc "An armed take (`c:record_start/1`); every recording message carries it."
+  @type take :: pos_integer()
 
   @typedoc """
   How a recording starts (`:now`; `:on_sound` at `threshold_db`, keeping
@@ -216,23 +228,32 @@ defmodule Magpie.Audio do
   @doc "Diagnostics: stream, callback timing, underruns, voices, latency, memory."
   @callback info() :: map()
   @doc """
-  Open the input `:mic` or `:apps` (other apps' playback, Android 10+),
-  closing any other one. The outcome arrives as `{:magpie_audio, :input,
-  :started, info}` or `{:magpie_audio, :input, :closed, reason}`. Errors
-  returned directly: `:not_owner`, `:unsupported` (apps below API 29),
-  `:busy` (a consent dialog is still up), `:no_permission` (RECORD_AUDIO
-  not granted), `:input_unavailable` (AAudio refused), `{:missing, lib}`.
+  Close any open input, then open `:mic` or `:apps` (other apps'
+  playback, Android 10+) as a new input id. The outcome arrives as
+  `{:magpie_audio, :input, input, :started, info}` or `{:magpie_audio,
+  :input, input, :closed, reason}`. Errors returned directly:
+  `:not_owner` (nothing changed); `:input_stuck` (the open mic wouldn't
+  stop: it is closed to the owner but still allocated, and the next
+  close or open tries again); after the close, `:unsupported` (apps
+  below API 29), `:busy` (a consent dialog is still up),
+  `:no_permission` (RECORD_AUDIO not granted), `:input_unavailable`
+  (AAudio refused), `{:missing, lib}`.
   """
-  @callback input_open(source :: :mic | :apps) :: :ok | {:error, term()}
-  @doc "Close the input; a recording in progress is dropped."
+  @callback input_open(source :: :mic | :apps) :: {:ok, input()} | {:error, term()}
+  @doc """
+  Close the input; a recording in progress is dropped. `:input_stuck`:
+  the mic stream wouldn't stop (closed to the owner, still allocated):
+  try again later.
+  """
   @callback input_close() :: :ok | {:error, term()}
   @doc """
-  Arm the recorder on the open input. `:not_running`: `:count_in` needs
-  the output stream (the engine renders its clicks); `:recording`:
-  already armed.
+  Arm the recorder on the open input as a new take id. `:not_running`:
+  `:count_in` needs the output stream (the engine renders its clicks);
+  `:recording`: already armed.
   """
   @callback record_start(record_opts()) ::
-              :ok | {:error, :no_input | :recording | :not_running | :alloc | :not_owner}
+              {:ok, take()}
+              | {:error, :no_input | :recording | :not_running | :alloc | :not_owner}
   @doc """
   Stop and take the recording. `:not_started`: armed but the recording
   never began (no sound yet, count-in not done); the recorder is disarmed

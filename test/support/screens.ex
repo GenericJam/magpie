@@ -23,7 +23,9 @@ defmodule Magpie.Test.Screens do
 
   defp drain(view) do
     receive do
-      {:magpie_audio, _, _, _} = message -> view |> render_info(message) |> drain()
+      message
+      when tuple_size(message) in [4, 5] and elem(message, 0) == :magpie_audio ->
+        view |> render_info(message) |> drain()
     after
       0 -> view
     end

@@ -2,6 +2,7 @@ defmodule Magpie.RecordScreenTest do
   # The engine, its fake and the sample directory are one per VM: not async.
   use Mob.ScreenCase, async: false
 
+  import ExUnit.CaptureLog
   import Magpie.Test.Screens
 
   alias Magpie.Audio.Fake
@@ -14,7 +15,9 @@ defmodule Magpie.RecordScreenTest do
   setup do
     :ok = Fake.fail_open(nil)
     :ok = Fake.fail_input(nil)
-    start_supervised!(Engine)
+    :ok = Fake.refuse_input(nil)
+    :ok = Fake.stick_input(0)
+    start_supervised!({Engine, close_retry_ms: 50})
     TestRepo.start()
 
     dir = Path.join(@tmp_root, Integer.to_string(System.unique_integer([:positive])))
@@ -41,6 +44,14 @@ defmodule Magpie.RecordScreenTest do
   defp press(view, tag), do: render_info(view, {:tap, tag})
 
   defp chip(view), do: view |> canvas_texts("wave") |> hd()
+
+  defp eventually(fun, tries \\ 50) do
+    cond do
+      fun.() -> :ok
+      tries == 0 -> flunk("condition never held")
+      true -> Process.sleep(10) && eventually(fun, tries - 1)
+    end
+  end
 
   # The magpie on the card in `mood` (top-right, size 0.75).
   defp bird?(view, mood) do
@@ -185,7 +196,8 @@ defmodule Magpie.RecordScreenTest do
 
     test "reaching the length limit saves on its own, with a notice" do
       view = mounted() |> press(:record) |> pump() |> feed(level(4800, 0.25))
-      view = view |> render_info({:magpie_audio, :record, :full, 4800}) |> render_async()
+      take = Fake.state().rec.take
+      view = view |> render_info({:magpie_audio, :record, take, :full, 4800}) |> render_async()
 
       assert [%{frames: 4800, source: :recorded}] = Library.list()
       assert "Stopped at the 60 s limit" in texts(view)
@@ -209,6 +221,80 @@ defmodule Magpie.RecordScreenTest do
       view = view |> press(:record) |> pump() |> feed(level(960, 0.2))
       view |> press(:record) |> render_async()
       assert [%{name: "Other apps " <> _, channels: 2, frames: 480}] = Library.list()
+    end
+  end
+
+  describe "late messages and failed inputs" do
+    test "a :full from an earlier take doesn't stop the next one" do
+      view = mounted() |> press(:record) |> pump() |> feed(level(4800, 0.25))
+      old = Fake.state().rec.take
+      view = view |> press(:record) |> render_async()
+      assert chip(view) == "SAVED 0.1 s"
+
+      view = view |> press(:record) |> pump() |> feed(level(4800, 0.25))
+      view = render_info(view, {:magpie_audio, :record, old, :full, 4800})
+
+      assert chip(view) == "● REC 0:00.1"
+      assert "■ Stop" in texts(view)
+      assert [_first] = Library.list()
+    end
+
+    test "an earlier take's meter doesn't draw into the next" do
+      view = mounted() |> press(:record) |> pump() |> feed(level(4800, 0.25))
+      old = Fake.state().rec.take
+      view = view |> press(:record) |> render_async() |> press(:record) |> pump()
+
+      meter = %{take: old, state: :recording, frames: 96_000, peaks: :binary.copy(<<255>>, 375)}
+      view = render_info(view, {:magpie_audio, :meter, Engine.state().input.id, -6.0, meter})
+
+      assert coral_bars(view) == []
+      assert chip(view) == "● REC 0:00.0"
+    end
+
+    test "a late :closed for the mic doesn't close other apps opened after it" do
+      view = mounted()
+      mic = Engine.state().input.id
+      view = view |> press({:source, :apps}) |> pump()
+
+      view = render_info(view, {:magpie_audio, :input, mic, :closed, :disconnected})
+      assert chip(view) == "READY"
+      assert %{source: :apps, status: :open} = Engine.state().input
+
+      view = view |> press(:record) |> pump() |> feed(level(960, 0.2))
+      view |> press(:record) |> render_async()
+      assert [%{channels: 2}] = Library.list()
+    end
+
+    test "other apps failing to open: the mic was closed for it, so back to the mic" do
+      view = mounted()
+      :ok = Fake.refuse_input(:unsupported)
+      view = view |> press({:source, :apps}) |> pump()
+
+      assert %{source: :mic, status: :open} = Engine.state().input
+      assert "Couldn't open other apps (unsupported); back to the microphone." in texts(view)
+      assert chip(view) == "READY"
+    end
+
+    test "the mic failing to open after other apps: no input on either side" do
+      view = mounted() |> press({:source, :apps}) |> pump()
+      :ok = Fake.refuse_input(:input_unavailable)
+      view = view |> press({:source, :mic}) |> pump()
+
+      assert Engine.state().input == nil
+      assert chip(view) == "NO INPUT"
+      assert "Couldn't open the microphone (input_unavailable)." in texts(view)
+    end
+
+    test "leaving with a mic that won't close: logged, and the Engine closes it later" do
+      view = mounted()
+      :ok = Fake.stick_input(1)
+
+      log = capture_log(fn -> assert navigated_to(press(view, :back)) == {:pop} end)
+      assert log =~ "the input didn't close (:input_stuck)"
+      assert %{status: :closing} = Engine.state().input
+
+      eventually(fn -> Engine.state().input == nil end)
+      assert Fake.state().stuck == 0
     end
   end
 

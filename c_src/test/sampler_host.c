@@ -1,21 +1,26 @@
 /*
- * Host harness for c_src/sampler.c: renders offline into buffers and checks
- * the sequencer's timing to the frame, choke and voice stealing without
- * clicks, pitch, reverse, loops, gates, hits, quantized launches and the
- * resampler.
+ * Host harness for c_src/sampler.c and c_src/recorder.c: renders offline
+ * into buffers and checks the sequencer's timing to the frame, choke and
+ * voice stealing without clicks, pitch, reverse, loops, gates, hits,
+ * quantized launches, the resampler, the count-in and the recorder (also
+ * on real threads against the NIF's handshake).
  *
  *   cc -O2 -Wall -Wextra -o /tmp/sampler_host c_src/test/sampler_host.c -lm && /tmp/sampler_host
  *   cc -g -O1 -fsanitize=address,undefined -o /tmp/sampler_host_asan c_src/test/sampler_host.c -lm && /tmp/sampler_host_asan
+ *   cc -g -O1 -fsanitize=thread -o /tmp/sampler_host_tsan c_src/test/sampler_host.c -lm && /tmp/sampler_host_tsan
  *   /tmp/sampler_host bench     # render cost of 32 voices (build with -Os, as the app is)
  *
- * Exit 1 on any failure; each check prints one line. The bench also runs
+ * Exit 1 on any failure; each check prints one line. The threaded recorder
+ * test runs STRESS_MS (1500) with STRESS_SEED (1). The bench also runs
  * on the phone: cross-compile with the NDK's clang, `adb push` it to
  * /data/local/tmp and run it under `taskset 1` (a little core).
  */
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "../sampler.c"
 #include "../recorder.c"
@@ -1017,6 +1022,7 @@ static int64_t capture_ns(double i) { return REC_T0 + (int64_t)llround(i * 1e9 /
  * frame `when` (≥ 0), set the start time to that of frame `target`. */
 static void feed(rc_recorder *r, int64_t frames, int64_t when, double target) {
     float block[2 * 1024];
+    bool told = false;
     for (int64_t done = 0; done < frames;) {
         int n = 1 + (int)(next_rand() % 997);
         if (n > frames - done) n = (int)(frames - done);
@@ -1024,7 +1030,10 @@ static void feed(rc_recorder *r, int64_t frames, int64_t when, double target) {
             for (int c = 0; c < r->channels; c++) block[i * r->channels + c] = (float)rec_signal(r->pos + i, c);
         rc_write(r, block, n, capture_ns((double)r->pos));
         done += n;
-        if (when >= 0 && r->pos >= when && atomic_load(&r->start_ns) == 0) atomic_store(&r->start_ns, capture_ns(target));
+        if (when >= 0 && r->pos >= when && !told) {
+            rc_start_at(r, atomic_load(&r->gen), capture_ns(target));
+            told = true;
+        }
     }
 }
 
@@ -1052,7 +1061,7 @@ static int64_t peak_mismatches(rc_recorder *r, int64_t count) {
 
 static void test_recorder(void) {
     printf("recorder (meter, threshold and pre-roll, start time, max length, peaks)\n");
-    rc_recorder *r = malloc(sizeof(*r));
+    rc_recorder *r = calloc(1, sizeof(*r));
     rc_init(r, RATE, 2);
     burst_at = INT64_MAX;
 
@@ -1156,7 +1165,7 @@ static void test_count_in_loopback(void) {
     cmd(e, SP_CMD_TEMPO, 111);
     cmd(e, SP_CMD_PLAY, 0);
 
-    rc_recorder *r = malloc(sizeof(*r));
+    rc_recorder *r = calloc(1, sizeof(*r));
     rc_init(r, RATE, 2);
     const int64_t frames = 6 * RATE;
     float *out = buffer(frames);
@@ -1176,9 +1185,9 @@ static void test_count_in_loopback(void) {
         done += n;
         sp_event ev;
         while (sp_pop_event(e, &ev))
-            if (!told && ev.type == SP_EV_COUNT_IN && ev.a == (int32_t)atomic_load(&r->gen)) {
+            if (!told && ev.type == SP_EV_COUNT_IN) {
                 until = ev.until;
-                atomic_store(&r->start_ns, capture_ns((double)(until + latency)));
+                rc_start_at(r, (uint32_t)ev.a, capture_ns((double)(until + latency)));
                 told = true;
             }
         collect(e);
@@ -1199,6 +1208,377 @@ static void test_count_in_loopback(void) {
     free(r);
     free(out);
     free_engine(e);
+}
+
+typedef struct {
+    rc_gate *g;
+    _Atomic bool in, left;
+} gate_probe;
+
+/* A producer inside the gate for 50 ms. */
+static void *gate_holder(void *arg) {
+    gate_probe *p = arg;
+    if (!rc_enter(p->g, 7)) return NULL;
+    atomic_store(&p->in, true);
+    nanosleep(&(struct timespec){0, 50000000}, NULL);
+    atomic_store(&p->left, true);
+    rc_leave(p->g);
+    return NULL;
+}
+
+/* Arm generations: a start time for an arm that is over never starts a
+ * later one, across a new input too. The input's gate admits only the open
+ * input and, shut, waits out a producer inside. */
+static void test_recorder_generations(void) {
+    printf("recorder generations and the input's gate\n");
+    rc_recorder *r = calloc(1, sizeof(*r));
+    rc_init(r, RATE, 2);
+    burst_at = INT64_MAX;
+    feed(r, 2000, -1, 0);
+
+    rc_arm(r, RC_AT_TIME, RATE, 0, 0, RATE / 2);
+    uint32_t first = atomic_load(&r->gen);
+    rc_finish(r);
+    rc_free_buffers(r);
+    rc_arm(r, RC_AT_TIME, RATE, 0, 0, RATE / 2);
+    uint32_t second = atomic_load(&r->gen);
+    int64_t base = r->pos;
+    /* The first arm's downbeat, arriving late: inside what the second feeds. */
+    rc_start_at(r, first, capture_ns((double)base + 500));
+    feed(r, 6000, -1, 0);
+    bool waited = atomic_load(&r->state) == RC_WAIT_TIME && atomic_load(&r->frames) == 0;
+    rc_start_at(r, second, capture_ns((double)base + 7000));
+    feed(r, 4000, -1, 0);
+    CHECK(second == first + 1 && waited && atomic_load(&r->trigger_at) == base + 7000 &&
+              atomic_load(&r->started_at) == base + 7000 && rec_mismatches(r) == 0,
+          "arm %u's start time doesn't start arm %u (still counting 6000 frames on); its own starts it on frame %lld "
+          "(want %lld)",
+          first, second, (long long)(atomic_load(&r->started_at) - base), 7000LL);
+    rc_finish(r);
+    rc_free_buffers(r);
+
+    rc_init(r, RATE, 1);
+    rc_arm(r, RC_AT_TIME, RATE, 0, 0, RATE / 2);
+    feed(r, 9000, -1, 0);
+    CHECK(atomic_load(&r->gen) == second + 1 && atomic_load(&r->state) == RC_WAIT_TIME && atomic_load(&r->frames) == 0,
+          "a new input: the generation goes on (%u), the last arm's start time starts nothing", atomic_load(&r->gen));
+    rc_finish(r);
+    rc_free_buffers(r);
+    free(r);
+
+    rc_gate g = {0};
+    bool before = rc_enter(&g, 7);
+    rc_gate_open(&g, 7);
+    bool other = rc_enter(&g, 6), none = rc_enter(&g, 0), mine = rc_enter(&g, 7);
+    if (mine) rc_leave(&g);
+    CHECK(!before && !other && !none && mine && atomic_load(&g.inside) == 0,
+          "gate: shut admits nobody, open only its input");
+
+    gate_probe p = {.g = &g};
+    pthread_t t;
+    pthread_create(&t, NULL, gate_holder, &p);
+    for (int i = 0; i < 2000 && !atomic_load(&p.in); i++) nanosleep(&(struct timespec){0, 1000000}, NULL);
+    rc_gate_shut(&g);
+    bool held = atomic_load(&p.in) && atomic_load(&p.left);
+    bool after = rc_enter(&g, 7);
+    pthread_join(t, NULL);
+    CHECK(held && !after && atomic_load(&g.inside) == 0,
+          "gate: shutting waits out the producer inside (50 ms), then keeps its input out");
+}
+
+/* ── The recorder under threads ──────────────────────────────────────────── */
+
+/* The NIF's roles on real threads: a producer (the mic callback or the
+ * capture thread) writing behind the input's gate, a straggler from closed
+ * inputs, the event thread (count-in starts from a queue in arm order, and
+ * under the lock the published counters and peak bytes), and control
+ * (arm, stop, cancel, close and reopen with another channel count) under
+ * the lock with random gaps. Every input frame's value is a function of
+ * its position, so each take is checked frame by frame: a contiguous run
+ * of the input from where it started, its peaks, its trigger. Build with
+ * -fsanitize=thread for the races themselves (STRESS_MS, STRESS_SEED). */
+
+#define STRESS_TAKES (1 << 16)
+
+/* Input frame p, channel c: exact in float, loud in one 4096-frame stretch
+ * of four (thresholds trip there), the channels apart. */
+static float stress_sample(int64_t p, int c) {
+    uint32_t h = (uint32_t)p * 2654435761u + (uint32_t)c * 40503u;
+    float x = (float)((h >> 8) & 0xffff) / 65536.0f * (c ? -1.0f : 1.0f);
+    return ((p >> 12) & 3) == 0 ? x : x * 0.0625f;
+}
+
+static uint8_t stress_peak(int ch, int64_t start, int64_t k, int64_t frames) {
+    float m = 0;
+    for (int64_t f = k * RC_PEAK_FRAMES; f < (k + 1) * RC_PEAK_FRAMES && f < frames; f++)
+        for (int c = 0; c < ch; c++)
+            if (fabsf(stress_sample(start + f, c)) > m) m = fabsf(stress_sample(start + f, c));
+    return rc_peak_byte(m);
+}
+
+typedef struct {
+    rc_recorder r;
+    rc_gate gate;
+    pthread_mutex_t lock; /* the NIF's IN.lock */
+    unsigned seed;
+    _Atomic bool quit;
+    _Atomic int64_t input;    /* the open (or last) input's id */
+    _Atomic int64_t produced; /* frames the producer has written to it */
+    _Atomic uint32_t counting; /* the take waiting for its count-in, 0 none */
+    _Atomic uint32_t queue[STRESS_TAKES];
+    _Atomic int q_tail, q_head;
+    _Atomic int64_t issued[STRESS_TAKES]; /* the frame a take's start time was given for */
+    /* Control's, under lock (the reader reads them under it too). */
+    bool armed;
+    int mode;
+    int64_t max_frames, pre_roll;
+    float threshold;
+    uint32_t take;
+    /* The reader's, under lock. */
+    uint32_t read_take;
+    int64_t read_peaks;
+    long reads;
+    /* Tallies. */
+    _Atomic long bad, refused, stragglers, stale_starts;
+    long takes[3], full, empty, cancels, reopens;
+} stress_t;
+
+static void stress_fail(stress_t *s, const char *what, long long a, long long b) {
+    if (atomic_fetch_add(&s->bad, 1) < 8) printf("  FAIL stress: %s (%lld, %lld)\n", what, a, b);
+}
+
+static void *stress_producer(void *arg) {
+    stress_t *s = arg;
+    unsigned seed = s->seed * 3 + 1;
+    float block[2 * 1024];
+    int64_t mine = 0, count = 0;
+    while (!atomic_load(&s->quit)) {
+        int64_t id = atomic_load(&s->input);
+        if (id != mine) {
+            mine = id;
+            count = 0;
+        }
+        int n = 1 + (int)(rand_r(&seed) % 1024);
+        if (rc_enter(&s->gate, mine)) {
+            const int ch = s->r.channels;
+            for (int i = 0; i < n; i++)
+                for (int c = 0; c < ch; c++) block[i * ch + c] = stress_sample(count + i, c);
+            rc_write(&s->r, block, n, capture_ns((double)count));
+            count += n;
+            atomic_store(&s->produced, count);
+            rc_leave(&s->gate);
+        } else {
+            atomic_fetch_add(&s->refused, 1);
+        }
+        if (rand_r(&seed) % 8 == 0) sched_yield();
+    }
+    return NULL;
+}
+
+/* A producer of an input that was closed: never admitted. */
+static void *stress_straggler(void *arg) {
+    stress_t *s = arg;
+    unsigned seed = s->seed * 5 + 2;
+    while (!atomic_load(&s->quit)) {
+        int64_t stale = atomic_load(&s->input) - 1 - (int64_t)(rand_r(&seed) % 3);
+        if (rc_enter(&s->gate, stale)) {
+            stress_fail(s, "a closed input's producer got in", stale, atomic_load(&s->input));
+            rc_leave(&s->gate);
+        }
+        atomic_fetch_add(&s->stragglers, 1);
+        if (rand_r(&seed) % 4 == 0) sched_yield();
+    }
+    return NULL;
+}
+
+/* The event thread's count-in starts, in arm order, often late: around
+ * the producer's position (up to an eighth of a second before it). */
+static void *stress_events(void *arg) {
+    stress_t *s = arg;
+    unsigned seed = s->seed * 7 + 3;
+    while (!atomic_load(&s->quit)) {
+        int head = atomic_load(&s->q_head);
+        if (head == atomic_load(&s->q_tail)) {
+            usleep(100);
+            continue;
+        }
+        uint32_t take = atomic_load(&s->queue[head & (STRESS_TAKES - 1)]);
+        atomic_store(&s->q_head, head + 1);
+        if (rand_r(&seed) % 2) usleep(rand_r(&seed) % 2000);
+        int64_t at = atomic_load(&s->produced) + (int64_t)(rand_r(&seed) % (RATE / 2)) - RATE / 8;
+        if (at < 0) at = 0;
+        atomic_store(&s->issued[take & (STRESS_TAKES - 1)], at);
+        if (take != atomic_load(&s->counting)) atomic_fetch_add(&s->stale_starts, 1);
+        rc_start_at(&s->r, take, capture_ns((double)at));
+    }
+    return NULL;
+}
+
+/* deliver_input: under the lock, what an armed recorder has published.
+ * Peak bytes below peak_bytes are final and follow started_at. */
+static void *stress_reader(void *arg) {
+    stress_t *s = arg;
+    while (!atomic_load(&s->quit)) {
+        if (pthread_mutex_trylock(&s->lock) == 0) {
+            if (s->armed) {
+                if (s->read_take != s->take) {
+                    s->read_take = s->take;
+                    s->read_peaks = 0;
+                }
+                int64_t pb = atomic_load(&s->r.peak_bytes);
+                int64_t start = atomic_load(&s->r.started_at);
+                int64_t frames = atomic_load(&s->r.frames);
+                if (pb > 0 && start < 0) stress_fail(s, "peak bytes before the start", pb, start);
+                if (pb * RC_PEAK_FRAMES > frames || frames > s->max_frames)
+                    stress_fail(s, "published counts out of order", pb, frames);
+                for (int64_t k = s->read_peaks; start >= 0 && k < pb; k++)
+                    if (s->r.peaks[k] != stress_peak(s->r.channels, start, k, frames))
+                        stress_fail(s, "a published peak byte", k, s->r.peaks[k]);
+                s->read_peaks = pb;
+            }
+            rc_take_level(&s->r);
+            s->reads++;
+            pthread_mutex_unlock(&s->lock);
+        }
+        usleep(50);
+    }
+    return NULL;
+}
+
+/* record_stop: the take, checked against the input. Control, lock held. */
+static void stress_stop(stress_t *s) {
+    rc_recorder *r = &s->r;
+    int was = rc_finish(r);
+    atomic_store(&s->counting, 0);
+    int64_t frames = atomic_load(&r->frames);
+    if (frames > 0) {
+        int64_t peaks = rc_flush_peak(r), start = atomic_load(&r->started_at), trig = atomic_load(&r->trigger_at);
+        const int ch = r->channels;
+        if (start < 0 || frames > s->max_frames || (was == RC_FULL && frames != s->max_frames))
+            stress_fail(s, "start or length", start, frames);
+        if (peaks != rc_peak_count(frames)) stress_fail(s, "peak count", peaks, frames);
+        int64_t wrong = 0;
+        for (int64_t k = 0; k < frames; k++)
+            for (int c = 0; c < ch; c++)
+                if (r->buf[k * ch + c] != stress_sample(start + k, c)) wrong++;
+        if (wrong) stress_fail(s, "frames not the input's from the start", wrong, start);
+        for (int64_t p = 0; p < peaks; p++)
+            if (r->peaks[p] != stress_peak(ch, start, p, frames)) stress_fail(s, "a peak byte", p, r->peaks[p]);
+        if (s->mode == RC_AT_TIME) {
+            int64_t want = atomic_load(&s->issued[s->take & (STRESS_TAKES - 1)]);
+            if (trig != want || start < trig) stress_fail(s, "count-in start: another take's time", trig, want);
+        } else if (s->mode == RC_ON_SOUND) {
+            float loud = 0;
+            for (int c = 0; c < ch; c++)
+                if (fabsf(stress_sample(trig, c)) > loud) loud = fabsf(stress_sample(trig, c));
+            if (loud < s->threshold || start > trig || start < trig - s->pre_roll)
+                stress_fail(s, "on sound: trigger or pre-roll", trig, start);
+        } else if (trig != start) {
+            stress_fail(s, "now: trigger", trig, start);
+        }
+        s->takes[s->mode]++;
+        if (was == RC_FULL) s->full++;
+    } else {
+        s->empty++;
+    }
+    rc_free_buffers(r);
+    s->armed = false;
+}
+
+static void stress_arm(stress_t *s, unsigned *seed) {
+    int mode = (int)(rand_r(seed) % 3);
+    if (mode == RC_AT_TIME && atomic_load(&s->q_tail) - atomic_load(&s->q_head) >= STRESS_TAKES) return;
+    int64_t max = 64 + (int64_t)(rand_r(seed) % (2 * RATE)), pre = (int64_t)(rand_r(seed) % (RATE / 10));
+    float threshold = 0.1f + (float)(rand_r(seed) % 85) / 100.0f;
+    if (!rc_arm(&s->r, mode, max, threshold, pre, mode == RC_NOW ? 0 : pre > RATE / 2 ? pre : RATE / 2)) {
+        stress_fail(s, "arm refused", mode, max);
+        return;
+    }
+    s->armed = true;
+    s->mode = mode;
+    s->max_frames = max;
+    s->pre_roll = pre;
+    s->threshold = threshold;
+    s->take = atomic_load(&s->r.gen);
+    atomic_store(&s->issued[s->take & (STRESS_TAKES - 1)], -1);
+    if (mode == RC_AT_TIME) {
+        atomic_store(&s->counting, s->take);
+        int tail = atomic_load(&s->q_tail);
+        atomic_store(&s->queue[tail & (STRESS_TAKES - 1)], s->take);
+        atomic_store(&s->q_tail, tail + 1);
+    }
+}
+
+static void test_recorder_stress(void) {
+    const char *ms_env = getenv("STRESS_MS"), *seed_env = getenv("STRESS_SEED");
+    int64_t ms = ms_env ? atoll(ms_env) : 1500;
+    stress_t *s = calloc(1, sizeof(*s));
+    s->seed = seed_env ? (unsigned)strtoul(seed_env, NULL, 10) : 1;
+    printf("recorder under threads (%lld ms, seed %u: producer, straggler, events, reader, control)\n", (long long)ms,
+           s->seed);
+    pthread_mutex_init(&s->lock, NULL);
+    int64_t ids = 1;
+    rc_init(&s->r, RATE, 2);
+    atomic_store(&s->input, ids);
+    rc_gate_open(&s->gate, ids);
+
+    pthread_t threads[4];
+    void *(*mains[4])(void *) = {stress_producer, stress_straggler, stress_events, stress_reader};
+    for (int i = 0; i < 4; i++) pthread_create(&threads[i], NULL, mains[i], s);
+
+    unsigned seed = s->seed;
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000 >= ms) break;
+        pthread_mutex_lock(&s->lock);
+        unsigned a = rand_r(&seed) % 100;
+        if (!s->armed && a < 40) {
+            stress_arm(s, &seed);
+        } else if (s->armed && a < 60) {
+            stress_stop(s);
+        } else if (s->armed && a < 70) {
+            rc_finish(&s->r);
+            atomic_store(&s->counting, 0);
+            rc_free_buffers(&s->r);
+            s->armed = false;
+            s->cancels++;
+        } else if (a >= 95) {
+            /* close_input_locked, then the next input_open */
+            rc_gate_shut(&s->gate);
+            if (s->armed) {
+                rc_finish(&s->r);
+                atomic_store(&s->counting, 0);
+                rc_free_buffers(&s->r);
+                s->armed = false;
+            }
+            rc_init(&s->r, RATE, 1 + (int)(rand_r(&seed) % 2));
+            atomic_store(&s->input, ++ids);
+            rc_gate_open(&s->gate, ids);
+            s->reopens++;
+        }
+        pthread_mutex_unlock(&s->lock);
+        usleep(rand_r(&seed) % 300);
+    }
+    atomic_store(&s->quit, true);
+    for (int i = 0; i < 4; i++) pthread_join(threads[i], NULL);
+    if (s->armed) stress_stop(s);
+
+    long checked = s->takes[0] + s->takes[1] + s->takes[2];
+    CHECK(atomic_load(&s->bad) == 0,
+          "%ld takes checked frame by frame (now %ld, on sound %ld, count-in %ld; %ld full), %ld stopped before "
+          "starting, %ld cancelled, %ld inputs reopened, %ld reads under the lock",
+          checked, s->takes[RC_NOW], s->takes[RC_ON_SOUND], s->takes[RC_AT_TIME], s->full, s->empty, s->cancels,
+          s->reopens, s->reads);
+    CHECK(s->takes[RC_NOW] > 0 && s->takes[RC_ON_SOUND] > 0 && s->takes[RC_AT_TIME] > 0 && s->full > 0 &&
+              s->reopens > 0 && atomic_load(&s->stale_starts) > 0 && atomic_load(&s->refused) > 0,
+          "every path ran: %ld count-in starts for takes already over, %ld writes refused at the gate after a "
+          "close, %ld straggler tries",
+          atomic_load(&s->stale_starts), atomic_load(&s->refused), atomic_load(&s->stragglers));
+    rc_free_buffers(&s->r);
+    pthread_mutex_destroy(&s->lock);
+    free(s);
 }
 
 /* `bench`: the cost of rendering 32 voices (stereo loops over 8 distinct
@@ -1258,6 +1638,8 @@ int main(int argc, char **argv) {
     test_count_in();
     test_recorder();
     test_count_in_loopback();
+    test_recorder_generations();
+    test_recorder_stress();
     printf("%s: %d failure%s\n", failures ? "FAILED" : "passed", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

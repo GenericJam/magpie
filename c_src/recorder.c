@@ -10,16 +10,21 @@
  *
  * Roles:
  *
- *   producer   rc_write, from the input's own thread (one at a time). It
- *              never locks, allocates or frees; it may wait for nothing.
+ *   producer   rc_write, from the input's own thread (one at a time),
+ *              between rc_enter and rc_leave of the input's gate. It never
+ *              locks, allocates or frees; it may wait for nothing.
  *   control    rc_arm / rc_finish / rc_flush_peak, under the caller's lock.
  *              rc_arm allocates while the recorder is idle; rc_finish takes
  *              the state back to idle and waits out a producer that is
  *              inside rc_write, after which the buffers are the control
- *              side's to keep or free.
+ *              side's to keep or free. rc_gate_open / rc_gate_shut let an
+ *              input write and stop it, also under the caller's lock.
  *   readers    rc_take_level and the published counters (frames, peak
  *              bytes, where the recording started) from any thread; the
  *              peak bytes below `peak_bytes` are final.
+ *   any        rc_start_at: an arm's start time (the count-in's downbeat),
+ *              tagged with the arm's generation so a late one for an
+ *              earlier arm never starts a later one.
  *
  * Time: `pos` counts input frames since the input opened. A frame's capture
  * time is `t0 + i / rate` for frame i of a block whose first frame was
@@ -66,9 +71,10 @@ typedef struct {
     int64_t pre_roll;
 
     _Atomic int state;
-    _Atomic uint32_t gen;     /* bumps on every arm */
-    _Atomic int64_t start_ns; /* RC_WAIT_TIME: capture time to start at; 0 until known */
-    _Atomic bool busy;        /* the producer is inside rc_write */
+    _Atomic uint32_t gen;       /* bumps on every arm */
+    _Atomic int64_t start_ns;   /* RC_WAIT_TIME: capture time to start at, for arm `start_gen` */
+    _Atomic uint32_t start_gen; /* the arm start_ns belongs to; another arm's is no start time */
+    _Atomic bool busy;          /* the producer is inside rc_write */
 
     /* Producer's own. */
     uint32_t seen_gen;
@@ -95,17 +101,65 @@ static uint8_t rc_peak_byte(float peak) {
     return (uint8_t)lrintf(p * 255.0f);
 }
 
-/* Before the input starts (no producer runs). The arm generation goes on
- * counting, so an event about an earlier arm never matches a later one. */
+/* The input's gate: which input may write (its id, 0 none) and how many
+ * producers are inside. A producer whose input was closed (a stream that
+ * wouldn't stop, a capture thread that outlived its join) is shut out
+ * before it touches the recorder, so the next input's rc_init never runs
+ * under it. Never reset while an input could still try it. */
+typedef struct {
+    _Atomic int64_t open;
+    _Atomic int inside;
+} rc_gate;
+
+/* Producer: true when `id` is the open input; then rc_write, and rc_leave. */
+static bool rc_enter(rc_gate *g, int64_t id) {
+    atomic_fetch_add(&g->inside, 1);
+    if (id != 0 && atomic_load(&g->open) == id) return true;
+    atomic_fetch_sub(&g->inside, 1);
+    return false;
+}
+
+static void rc_leave(rc_gate *g) { atomic_fetch_sub(&g->inside, 1); }
+
+/* Control: input `id` (after rc_init for it) may write. */
+static void rc_gate_open(rc_gate *g, int64_t id) { atomic_store(&g->open, id); }
+
+/* Control: no input may write; returns once the producers inside have
+ * left (each within one rc_write). */
+static void rc_gate_shut(rc_gate *g) {
+    atomic_store(&g->open, 0);
+    while (atomic_load(&g->inside) > 0) sched_yield();
+}
+
+/* Before the input starts (its gate shut, so no producer runs). `r` was
+ * zeroed once before its first use (static, or calloc). The arm generation
+ * goes on counting, so an event about an earlier arm never matches a
+ * later one; the start time isn't touched (rc_start_at may run meanwhile,
+ * and an earlier arm's start is no later arm's). */
 static void rc_init(rc_recorder *r, int rate, int channels) {
-    uint32_t gen = atomic_load(&r->gen);
-    memset(r, 0, sizeof(*r));
-    r->rate = rate;
     r->channels = channels;
-    atomic_store(&r->gen, gen);
-    r->seen_gen = gen;
+    r->rate = rate;
+    r->buf = NULL;
+    r->peaks = NULL;
+    r->max_frames = 0;
+    r->ring = NULL;
+    r->ring_frames = 0;
+    r->threshold = 0;
+    r->pre_roll = 0;
+    atomic_store(&r->state, RC_IDLE);
+    atomic_store(&r->busy, false);
+    r->seen_gen = atomic_load(&r->gen);
+    r->pos = 0;
+    r->ring_fill = 0;
+    r->done = 0;
+    r->peak_done = 0;
+    r->peak_acc = 0;
+    r->peak_n = 0;
+    atomic_store(&r->frames, 0);
+    atomic_store(&r->peak_bytes, 0);
     atomic_store(&r->started_at, -1);
     atomic_store(&r->trigger_at, -1);
+    atomic_store(&r->level, 0);
 }
 
 static void rc_free_buffers(rc_recorder *r) {
@@ -146,7 +200,6 @@ static bool rc_arm(rc_recorder *r, int mode, int64_t max_frames, float threshold
     atomic_store(&r->peak_bytes, 0);
     atomic_store(&r->started_at, -1);
     atomic_store(&r->trigger_at, -1);
-    atomic_store(&r->start_ns, 0);
     atomic_fetch_add(&r->gen, 1);
     atomic_store(&r->state, mode == RC_NOW ? RC_RECORDING : mode == RC_ON_SOUND ? RC_WAIT_SOUND : RC_WAIT_TIME);
     return true;
@@ -159,6 +212,15 @@ static int rc_finish(rc_recorder *r) {
     int was = atomic_exchange(&r->state, RC_IDLE);
     while (atomic_load(&r->busy)) sched_yield();
     return was;
+}
+
+/* Any thread: arm `gen` (RC_WAIT_TIME) starts at the frame captured at
+ * CLOCK_MONOTONIC `ns`. One caller at a time, in arm order (the event
+ * thread, as the renderer reports the count-ins); a start for an arm that
+ * is over is ignored by every later one. */
+static void rc_start_at(rc_recorder *r, uint32_t gen, int64_t ns) {
+    atomic_store_explicit(&r->start_ns, ns, memory_order_relaxed);
+    atomic_store_explicit(&r->start_gen, gen, memory_order_release);
 }
 
 /* Control, after rc_finish: the last, partial peak byte. The number of
@@ -309,9 +371,9 @@ static void rc_write(rc_recorder *r, const float *in, int n, int64_t t0_ns) {
         break;
     }
     case RC_WAIT_TIME: {
-        int64_t at = atomic_load(&r->start_ns);
         bool started = false;
-        if (at > 0) {
+        if (atomic_load_explicit(&r->start_gen, memory_order_acquire) == r->seen_gen) {
+            int64_t at = atomic_load_explicit(&r->start_ns, memory_order_relaxed);
             /* 1e-3 frame (≈ 20 ns at 48 kHz): ns rounding stays on its frame. */
             double off = (double)(at - t0_ns) * r->rate / 1e9;
             int64_t start = r->pos + (int64_t)ceil(off - 1e-3);

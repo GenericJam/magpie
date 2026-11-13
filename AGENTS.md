@@ -331,9 +331,16 @@ On the moto g power 2021 (Android 11), `scripts/engine_check.exs`:
   the count-in's clicks and downbeat stopped and on the sequencer's bar,
   the recorder's threshold, pre-roll, start time (ahead, late from the
   ring, past it), length limit and peaks, and the whole count-in chain
-  through a latency loopback: the take starts on the downbeat's frame).
-  Also with `-fsanitize=address,undefined`. `/tmp/sampler_host bench`
-  (built with `-Os`, as the app is) for render cost.
+  through a latency loopback: the take starts on the downbeat's frame;
+  arm generations (an earlier arm's start time never starts a later one)
+  and the input's gate; then the recorder on threads for 1.5 s
+  (`STRESS_MS`, `STRESS_SEED`): producer, a straggler from closed inputs,
+  count-in starts in arm order, a reader under the lock, and control
+  arming, stopping, cancelling and reopening the input at random, every
+  take checked frame by frame against the input). Also with
+  `-fsanitize=address,undefined` and `-fsanitize=thread`.
+  `/tmp/sampler_host bench` (built with `-Os`, as the app is) for render
+  cost.
 - The NIF for Android: `$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang
   --target=aarch64-linux-android28 --sysroot=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/sysroot
   -I ~/.mob/cache/otp-android-*/erts-*/include
@@ -365,23 +372,39 @@ starts the take on the frame captured when its downbeat is heard.
 
 ### `Magpie.Engine` recording API
 
-- `open_input(:mic | :apps)` (monitors the caller: the input closes when it
-  exits), `close_input/0`; `{:magpie_audio, :input, :started, %{source,
-  rate, channels}}` / `{:magpie_audio, :input, :closed, :denied | :stopped
-  | :disconnected | :error}`. `state/0`'s `input`.
-- `{:magpie_audio, :meter, level_db, %{state, frames, peaks}}` every 40 ms
-  while an input is open: peak dBFS since the last one, the recorder's state
-  (`:idle | :waiting | :counting | :recording | :full`), frames so far and
-  the new peak bytes (append them).
+- `open_input(:mic | :apps)` → `{:ok, input}`: closes any input, then opens
+  this one (monitors the caller: the input closes when it exits); after a
+  failed open nothing is open. `close_input/0`; `{:magpie_audio, :input,
+  input, :started, %{source, rate, channels}}` / `{:magpie_audio, :input,
+  input, :closed, :denied | :stopped | :disconnected | :error}`.
+  `state/0`'s `input` (`%{id, source, status, rate, channels}`; status
+  `:closing` while a mic stream that wouldn't stop is closed again, every
+  second and slower, by the Engine on its own; `close_input/0` answers
+  `{:error, :input_stuck}` then).
+- `{:magpie_audio, :meter, input, level_db, %{take, state, frames,
+  peaks}}` every 40 ms while an input is open: peak dBFS since the last
+  one, the armed take (nil none), the recorder's state (`:idle | :waiting
+  | :counting | :recording | :full`), frames so far and the new peak bytes
+  (append them).
 - `record(mode: :now | :on_sound | :count_in, max_seconds: 60,
-  threshold_db: -30, pre_roll_ms: 150)`; `{:magpie_audio, :record,
-  :started, %{pre_roll_frames, late_frames}}`, `{:magpie_audio, :record,
-  :full, frames}`, `{:magpie_audio, :count_in, first_frame, downbeat_frame}`
-  (4 clicks, one bar at the tempo; while the sequencer plays, from its next
-  bar). `:count_in` needs the output stream.
+  threshold_db: -30, pre_roll_ms: 150)` → `{:ok, take}`; `{:magpie_audio,
+  :record, take, :started, %{pre_roll_frames, late_frames}}`,
+  `{:magpie_audio, :record, take, :full, frames}`, `{:magpie_audio,
+  :count_in, take, first_frame, downbeat_frame}` (4 clicks, one bar at the
+  tempo; while the sequencer plays, from its next bar). `:count_in` needs
+  the output stream.
+- Ids are positive integers, never reused. A message about an input or a
+  take that is over can still be queued when the next one starts: the
+  Engine drops them, and a subscriber matches the ids it was given.
 - `stop_recording/0` → `{:ok, %{pcm, rate, channels, frames, peaks,
   peak_frames}}` (the recorder's own buffer as a resource binary, no copy)
   or `{:error, :not_recording | :not_started}`; `cancel_recording/0`.
+- Inside: the input's producer (the mic callback, Kotlin's read thread)
+  writes through a gate (`rc_enter`/`rc_leave`) open only for the input's
+  id; closing shuts it and waits out a producer inside, so a stream that
+  wouldn't stop or a capture thread that outlived its join never writes
+  into the next input. The count-in's start time is tagged with its take
+  (`rc_start_at`).
 - Changing `lib/magpie/audio/nif.ex` and hot-pushing (`mix mob.deploy`
   without `--native`) reloads the module and drops the static NIF
   (`:nif_not_loaded`): restart the app (`mix mob.connect`).

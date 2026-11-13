@@ -85,10 +85,10 @@ defmodule MagpieRecordCheck do
 
   defp open(source) do
     :ok = Engine.subscribe()
-    :ok = Engine.open_input(source)
+    {:ok, id} = Engine.open_input(source)
     receive do
-      {:magpie_audio, :input, :started, info} -> info
-      {:magpie_audio, :input, :closed, reason} -> raise "input closed: \#{inspect(reason)}"
+      {:magpie_audio, :input, ^id, :started, info} -> Map.put(info, :id, id)
+      {:magpie_audio, :input, ^id, :closed, reason} -> raise "input closed: \#{inspect(reason)}"
     after
       60_000 -> raise "no input"
     end
@@ -159,7 +159,7 @@ defmodule MagpieRecordCheck do
     quiet = window(5000)
     info = open(:mic)
     meters = collect(1000)
-    :ok = Engine.record(mode: :now, max_seconds: 30)
+    {:ok, _take} = Engine.record(mode: :now, max_seconds: 30)
     recording = window(5000)
     input = Engine.info().input
     {:ok, rec} = Engine.stop_recording()
@@ -174,10 +174,11 @@ defmodule MagpieRecordCheck do
     if play?, do: Process.sleep(700)
     open(:mic)
     t0 = System.monotonic_time(:millisecond)
-    :ok = Engine.record(mode: :count_in, max_seconds: 30)
-    {:magpie_audio, :count_in, first, until} = await(&match?({:magpie_audio, :count_in, _, _}, &1), 5000)
+    {:ok, take} = Engine.record(mode: :count_in, max_seconds: 30)
+    {:magpie_audio, :count_in, ^take, first, until} =
+      await(&match?({:magpie_audio, :count_in, ^take, _, _}, &1), 5000)
     clock = Engine.clock()
-    started = await(&match?({:magpie_audio, :record, :started, _}, &1), 10_000)
+    started = await(&match?({:magpie_audio, :record, ^take, :started, _}, &1), 10_000)
     t_started = System.monotonic_time(:millisecond) - t0
     Process.sleep(2500)
     {:ok, rec} = Engine.stop_recording()
@@ -191,14 +192,14 @@ defmodule MagpieRecordCheck do
   # When sound starts: a click 1.5 s after arming.
   def on_sound(threshold_db) do
     open(:mic)
-    ambient = collect(1000) |> Enum.flat_map(fn {_, {:magpie_audio, :meter, db, _}} -> [db]; _ -> [] end)
+    ambient = collect(1000) |> Enum.flat_map(fn {_, {:magpie_audio, :meter, _, db, _}} -> [db]; _ -> [] end)
     threshold = (Enum.max(ambient, fn -> -60.0 end) + 12) |> max(-48.0) |> min(-12.0)
     threshold = threshold_db || threshold
-    :ok = Engine.record(mode: :on_sound, threshold_db: threshold, pre_roll_ms: 150)
+    {:ok, take} = Engine.record(mode: :on_sound, threshold_db: threshold, pre_roll_ms: 150)
     Process.sleep(1500)
     waiting = Engine.info().input.recorder
     Engine.trigger(0, 127)
-    started = await(&match?({:magpie_audio, :record, :started, _}, &1), 5000)
+    started = await(&match?({:magpie_audio, :record, ^take, :started, _}, &1), 5000)
     Process.sleep(1000)
     {:ok, rec} = Engine.stop_recording()
     close()
@@ -207,8 +208,8 @@ defmodule MagpieRecordCheck do
 
   def full do
     open(:mic)
-    :ok = Engine.record(mode: :now, max_seconds: 2)
-    full = await(&match?({:magpie_audio, :record, :full, _}, &1), 5000)
+    {:ok, take} = Engine.record(mode: :now, max_seconds: 2)
+    full = await(&match?({:magpie_audio, :record, ^take, :full, _}, &1), 5000)
     {:ok, rec} = Engine.stop_recording()
     close()
     %{full: full, frames: rec.frames, rate: rec.rate}
@@ -228,7 +229,7 @@ defmodule MagpieRecordCheck do
   def apps(seconds) do
     info = open(:apps)
     meters = collect(1000)
-    :ok = Engine.record(mode: :now, max_seconds: 30)
+    {:ok, _take} = Engine.record(mode: :now, max_seconds: 30)
     Process.sleep(seconds * 1000)
     {:ok, rec} = Engine.stop_recording()
     close()
@@ -287,7 +288,7 @@ IO.puts("\n== The mic, recording while the sequencer plays a click on every beat
 m = rpc.(MagpieRecordCheck, :mic_while_playing, [])
 IO.puts("  input #{inspect(m.info)}, #{inspect(m.input)}")
 
-meter_times = for {t, {:magpie_audio, :meter, _, _}} <- m.idle_meters, do: t
+meter_times = for {t, {:magpie_audio, :meter, _, _, _}} <- m.idle_meters, do: t
 gaps = meter_times |> Enum.chunk_every(2, 1, :discard) |> Enum.map(fn [a, b] -> b - a end)
 IO.puts("  meters: #{length(meter_times)} in 1 s, gaps #{inspect(Enum.min_max(gaps, fn -> nil end))} ms")
 

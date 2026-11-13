@@ -27,23 +27,29 @@ defmodule Magpie.Audio.Fake do
 
   ## Input and recording
 
-  `input_open/1` sends `:started` at once (48 kHz; the mic mono, other
+  `input_open/1` closes the input and answers `{:ok, input}` (a new id
+  each time) and sends `:started` at once (48 kHz; the mic mono, other
   apps stereo) unless `fail_input/1` armed a failure, which closes it
-  instead (`{:input, :closed, reason}`, as a refused consent does);
-  `end_input/1` closes it as the system would. Audio arrives only through
-  `feed/1`: interleaved f32le at the input's channels. Each call is one
-  meter period: it runs the recorder over the frames and sends one
-  `:meter` (the fed frames' peak dBFS; new peak bytes, one per 256
+  instead (`{:input, input, :closed, reason}`, as a refused consent
+  does); `refuse_input/1` makes it answer an error after the close (as
+  the phone does when the new source can't open); `stick_input/1` makes
+  closes answer `{:error, :input_stuck}` (a mic stream that won't stop:
+  the input is gone, the close must be tried again). `end_input/1`
+  closes it as the system would. Audio arrives only through `feed/1`:
+  interleaved f32le at the input's channels. Each call is one meter
+  period: it runs the recorder over the frames and sends one `:meter`
+  (the fed frames' peak dBFS; the take, new peak bytes, one per 256
   recorded frames, the partial block flushed on stop, as the C does).
 
-  The recorder: `:now` records from the next fed frame; `:on_sound`
-  starts at the first frame with any |x| ≥ 10^(threshold_db / 20),
-  keeping up to `pre_roll_ms` of what was fed since arming; `:count_in`
-  needs the output (`{:error, :not_running}` without it), sends
-  `:count_in` from the current frame to four beats later at the fake's
-  tempo and records only after `downbeat/0` (no pre-roll). At
-  `max_seconds` it sends `:full` and takes no more. `record_stop/0`
-  without a recorded frame is `{:error, :not_started}`.
+  The recorder: `record_start/1` answers `{:ok, take}` (a new id each
+  time; every recording message carries it). `:now` records from the
+  next fed frame; `:on_sound` starts at the first frame with any |x| ≥
+  10^(threshold_db / 20), keeping up to `pre_roll_ms` of what was fed
+  since arming; `:count_in` needs the output (`{:error, :not_running}`
+  without it), sends `:count_in` from the current frame to four beats
+  later at the fake's tempo and records only after `downbeat/0` (no
+  pre-roll). At `max_seconds` it sends `:full` and takes no more.
+  `record_stop/0` without a recorded frame is `{:error, :not_started}`.
   """
 
   @behaviour Magpie.Audio
@@ -169,6 +175,20 @@ defmodule Magpie.Audio.Fake do
   @doc "Make the next `input_open/1` close at once with `reason` (`:denied`: the consent refused)."
   def fail_input(reason), do: call({:fail_input, reason})
 
+  @doc """
+  Make the next `input_open/1` answer `{:error, reason}` after closing the
+  open input, as the phone does when the new source can't open (nil:
+  open again).
+  """
+  def refuse_input(reason), do: call({:refuse_input, reason})
+
+  @doc """
+  Make the next `count` closes (`input_close/0`, and the close
+  `input_open/1` starts with) answer `{:error, :input_stuck}`: the input
+  is gone (no meters, recording dropped) but not released.
+  """
+  def stick_input(count) when is_integer(count) and count >= 0, do: call({:stick_input, count})
+
   @doc "The system closes the open input with `reason` (`:stopped`, `:disconnected`, …)."
   def end_input(reason), do: call({:end_input, reason})
 
@@ -199,6 +219,10 @@ defmodule Magpie.Audio.Fake do
       open: open,
       fail_open: fail_open,
       fail_input: nil,
+      refuse_input: nil,
+      stuck: 0,
+      last_input: 0,
+      last_take: 0,
       input: nil,
       rec: nil,
       samples: %{},
@@ -252,11 +276,16 @@ defmodule Magpie.Audio.Fake do
 
   def handle_call({:fail_input, reason}, _from, s), do: {:reply, :ok, %{s | fail_input: reason}}
 
+  def handle_call({:refuse_input, reason}, _from, s),
+    do: {:reply, :ok, %{s | refuse_input: reason}}
+
+  def handle_call({:stick_input, count}, _from, s), do: {:reply, :ok, %{s | stuck: count}}
+
   def handle_call({:end_input, _reason}, _from, %{input: nil} = s),
     do: {:reply, {:error, :no_input}, s}
 
   def handle_call({:end_input, reason}, _from, s) do
-    send(s.owner, {:magpie_audio, :input, :closed, reason})
+    send(s.owner, {:magpie_audio, :input, s.input.id, :closed, reason})
     {:reply, :ok, %{s | input: nil, rec: nil}}
   end
 
@@ -264,7 +293,8 @@ defmodule Magpie.Audio.Fake do
   def handle_call({:feed, pcm}, _from, s), do: {:reply, :ok, feed(s, pcm)}
 
   def handle_call(:downbeat, _from, %{rec: %{state: :counting} = rec} = s) do
-    send(s.owner, {:magpie_audio, :record, :started, %{pre_roll_frames: 0, late_frames: 0}})
+    started = %{pre_roll_frames: 0, late_frames: 0}
+    send(s.owner, {:magpie_audio, :record, rec.take, :started, started})
     {:reply, :ok, %{s | rec: %{rec | state: :recording}}}
   end
 
@@ -275,20 +305,35 @@ defmodule Magpie.Audio.Fake do
 
   def handle_call(:close, _from, s), do: {:reply, :ok, %{s | open: false}}
 
-  def handle_call(:reset, _from, s),
-    do: {:reply, :ok, %{fresh(s.owner, s.open, s.fail_open) | fail_input: s.fail_input}}
+  # The test's knobs and the ids outlive a reset, as the phone's counters do.
+  def handle_call(:reset, _from, s) do
+    keep = Map.take(s, [:fail_input, :refuse_input, :stuck, :last_input, :last_take])
+    {:reply, :ok, Map.merge(fresh(s.owner, s.open, s.fail_open), keep)}
+  end
+
+  def handle_call({:input_open, _source}, _from, %{stuck: stuck} = s) when stuck > 0,
+    do: {:reply, {:error, :input_stuck}, %{s | input: nil, rec: nil, stuck: stuck - 1}}
+
+  def handle_call({:input_open, _source}, _from, %{refuse_input: reason} = s)
+      when reason != nil,
+      do: {:reply, {:error, reason}, %{s | input: nil, rec: nil, refuse_input: nil}}
 
   def handle_call({:input_open, source}, _from, %{fail_input: nil} = s) do
+    id = s.last_input + 1
     channels = if source == :mic, do: 1, else: 2
     info = %{source: source, rate: @rate, channels: channels}
-    send(s.owner, {:magpie_audio, :input, :started, info})
-    {:reply, :ok, %{s | input: info, rec: nil}}
+    send(s.owner, {:magpie_audio, :input, id, :started, info})
+    {:reply, {:ok, id}, %{s | input: Map.put(info, :id, id), rec: nil, last_input: id}}
   end
 
   def handle_call({:input_open, _source}, _from, s) do
-    send(s.owner, {:magpie_audio, :input, :closed, s.fail_input})
-    {:reply, :ok, %{s | input: nil, rec: nil, fail_input: nil}}
+    id = s.last_input + 1
+    send(s.owner, {:magpie_audio, :input, id, :closed, s.fail_input})
+    {:reply, {:ok, id}, %{s | input: nil, rec: nil, fail_input: nil, last_input: id}}
   end
+
+  def handle_call(:input_close, _from, %{stuck: stuck} = s) when stuck > 0,
+    do: {:reply, {:error, :input_stuck}, %{s | input: nil, rec: nil, stuck: stuck - 1}}
 
   def handle_call(:input_close, _from, s), do: {:reply, :ok, %{s | input: nil, rec: nil}}
 
@@ -301,7 +346,10 @@ defmodule Magpie.Audio.Fake do
   def handle_call({:record_start, %{mode: :count_in}}, _from, %{open: false} = s),
     do: {:reply, {:error, :not_running}, s}
 
-  def handle_call({:record_start, opts}, _from, s), do: {:reply, :ok, arm(s, opts)}
+  def handle_call({:record_start, opts}, _from, s) do
+    s = arm(s, opts)
+    {:reply, {:ok, s.rec.take}, s}
+  end
 
   def handle_call(:record_stop, _from, %{rec: nil} = s), do: {:reply, {:error, :not_recording}, s}
 
@@ -620,7 +668,10 @@ defmodule Magpie.Audio.Fake do
   # ── The recorder ──────────────────────────────────────────────────────────
 
   defp arm(s, opts) do
+    take = s.last_take + 1
+
     rec = %{
+      take: take,
       mode: opts.mode,
       state: :recording,
       max_frames: round(opts.max_seconds * @rate),
@@ -635,9 +686,12 @@ defmodule Magpie.Audio.Fake do
       new: <<>>
     }
 
+    s = %{s | last_take: take}
+
     case opts.mode do
       :now ->
-        send(s.owner, {:magpie_audio, :record, :started, %{pre_roll_frames: 0, late_frames: 0}})
+        started = %{pre_roll_frames: 0, late_frames: 0}
+        send(s.owner, {:magpie_audio, :record, take, :started, started})
         %{s | rec: rec}
 
       :on_sound ->
@@ -645,7 +699,8 @@ defmodule Magpie.Audio.Fake do
 
       :count_in ->
         first = frame(s)
-        send(s.owner, {:magpie_audio, :count_in, first, first + round(4 * 60 * @rate / s.tempo)})
+        until = first + round(4 * 60 * @rate / s.tempo)
+        send(s.owner, {:magpie_audio, :count_in, take, first, until})
         %{s | rec: %{rec | state: :counting}}
     end
   end
@@ -657,11 +712,11 @@ defmodule Magpie.Audio.Fake do
 
     meter =
       case rec do
-        nil -> %{state: :idle, frames: 0, peaks: <<>>}
-        rec -> %{state: rec.state, frames: rec.frames, peaks: rec.new}
+        nil -> %{take: nil, state: :idle, frames: 0, peaks: <<>>}
+        rec -> %{take: rec.take, state: rec.state, frames: rec.frames, peaks: rec.new}
       end
 
-    send(s.owner, {:magpie_audio, :meter, level_db(pcm), meter})
+    send(s.owner, {:magpie_audio, :meter, s.input.id, level_db(pcm), meter})
     %{s | rec: rec && %{rec | new: <<>>}}
   end
 
@@ -675,7 +730,7 @@ defmodule Magpie.Audio.Fake do
         <<before::binary-size(^bytes), rest::binary>> = pcm
         pre = last_bytes(rec.ring <> before, rec.pre_roll * size)
         started = %{pre_roll_frames: div(byte_size(pre), size), late_frames: 0}
-        send(s.owner, {:magpie_audio, :record, :started, started})
+        send(s.owner, {:magpie_audio, :record, rec.take, :started, started})
         append(s, %{rec | state: :recording, ring: <<>>}, pre <> rest, size)
     end
   end
@@ -685,12 +740,12 @@ defmodule Magpie.Audio.Fake do
 
   # Up to max_frames; reaching it sends :full once and takes no more.
   defp append(s, rec, pcm, size) do
-    take = min(rec.max_frames - rec.frames, div(byte_size(pcm), size))
-    chunk = binary_part(pcm, 0, take * size)
-    rec = add_peaks(%{rec | pcm: rec.pcm <> chunk, frames: rec.frames + take}, chunk, size)
+    count = min(rec.max_frames - rec.frames, div(byte_size(pcm), size))
+    chunk = binary_part(pcm, 0, count * size)
+    rec = add_peaks(%{rec | pcm: rec.pcm <> chunk, frames: rec.frames + count}, chunk, size)
 
     if rec.frames >= rec.max_frames do
-      send(s.owner, {:magpie_audio, :record, :full, rec.frames})
+      send(s.owner, {:magpie_audio, :record, rec.take, :full, rec.frames})
       %{rec | state: :full}
     else
       rec

@@ -41,14 +41,24 @@ defmodule Magpie.RecordScreen do
 
   Undesigned states get a plain fallback: the microphone denied (the
   magpie greyed, "Magpie needs the microphone to record." and Try again),
-  and one-line notices under the sources (other apps not shared or
-  stopped, the 60 s limit, an import or save error).
+  and one-line notices under the sources (other apps not shared, stopped
+  or not opening, the 60 s limit, an import or save error). Other apps
+  lost for any reason go back to the microphone when it is granted.
+
+  The screen keeps the input id `Engine.open_input/1` gave it and the
+  take id `Engine.record/1` gave it, and ignores input, meter and
+  recording messages about any other (one still queued from before a
+  switch or a new take). A failed open leaves no input (the Engine closed
+  the old one first). Leaving logs a mic that wouldn't close; the Engine
+  keeps closing it.
 
   Every tap target also has `on_press_out={held()}` (MOB-509): the screen
   re-renders on every meter.
   """
 
   use Mob.Screen
+
+  require Logger
 
   import Mob.Canvas
 
@@ -96,6 +106,8 @@ defmodule Magpie.RecordScreen do
         source: :mic,
         selected: :mic,
         input: nil,
+        input_id: nil,
+        take: nil,
         rate: 48_000,
         mode: :now,
         phase: :monitoring,
@@ -544,8 +556,10 @@ defmodule Magpie.RecordScreen do
     do: {:noreply, mic_granted(socket)}
 
   def handle_info({:permission, :microphone, :denied}, socket) do
-    if socket.assigns.input, do: Engine.close_input()
-    {:noreply, Mob.Socket.assign(socket, mic: :denied, input: nil, phase: :monitoring)}
+    if socket.assigns.input, do: close_input()
+
+    {:noreply,
+     Mob.Socket.assign(socket, mic: :denied, input: nil, input_id: nil, phase: :monitoring)}
   end
 
   def handle_info({:tap, :try_again}, socket), do: {:noreply, ask_mic(socket)}
@@ -600,26 +614,41 @@ defmodule Magpie.RecordScreen do
   def handle_info({:files, :cancelled}, socket),
     do: {:noreply, Mob.Socket.assign(socket, :selected, socket.assigns.source)}
 
-  def handle_info({:magpie_audio, :input, :started, info}, socket),
-    do: {:noreply, Mob.Socket.assign(socket, input: :open, source: info.source, rate: info.rate)}
+  # Input, meter and recording messages count for this screen's input and
+  # take only: one queued from an earlier one is ignored.
+  def handle_info({:magpie_audio, :input, id, :started, info}, %{assigns: %{input_id: id}} = s)
+      when id != nil,
+      do: {:noreply, Mob.Socket.assign(s, input: :open, source: info.source, rate: info.rate)}
 
-  def handle_info({:magpie_audio, :input, :closed, reason}, socket),
-    do: {:noreply, input_closed(socket, reason)}
+  def handle_info({:magpie_audio, :input, id, :closed, reason}, %{assigns: %{input_id: id}} = s)
+      when id != nil,
+      do: {:noreply, input_closed(s, reason)}
 
-  def handle_info({:magpie_audio, :meter, level_db, meter}, socket),
-    do: {:noreply, meter(socket, level_db, meter)}
+  def handle_info({:magpie_audio, :meter, id, level_db, meter}, %{assigns: %{input_id: id}} = s)
+      when id != nil,
+      do: {:noreply, meter(s, level_db, meter)}
 
-  def handle_info({:magpie_audio, :record, :started, _info}, %{assigns: %{phase: p}} = socket)
-      when p in @busy,
-      do: {:noreply, Mob.Socket.assign(socket, phase: :recording, tick: nil)}
+  def handle_info(
+        {:magpie_audio, :record, take, :started, _info},
+        %{assigns: %{take: take, phase: phase}} = s
+      )
+      when take != nil and phase in @busy,
+      do: {:noreply, Mob.Socket.assign(s, phase: :recording, tick: nil)}
 
-  def handle_info({:magpie_audio, :record, :full, _frames}, %{assigns: %{phase: p}} = socket)
-      when p in @busy do
-    socket = save(socket)
-    {:noreply, Mob.Socket.assign(socket, :notice, "Stopped at the #{@max_seconds} s limit")}
+  def handle_info(
+        {:magpie_audio, :record, take, :full, _frames},
+        %{assigns: %{take: take, phase: phase}} = s
+      )
+      when take != nil and phase in @busy do
+    s = save(s)
+    {:noreply, Mob.Socket.assign(s, :notice, "Stopped at the #{@max_seconds} s limit")}
   end
 
-  def handle_info({:magpie_audio, :count_in, first, until}, %{assigns: %{phase: :counting}} = s) do
+  def handle_info(
+        {:magpie_audio, :count_in, take, first, until},
+        %{assigns: %{take: take, phase: :counting}} = s
+      )
+      when take != nil do
     s = Mob.Socket.assign(s, count_in: {first, until})
     {:noreply, s |> Mob.Socket.assign(:beat, beat(s.assigns)) |> tick()}
   end
@@ -680,40 +709,57 @@ defmodule Magpie.RecordScreen do
 
   defp open(socket, source) do
     case Engine.open_input(source) do
-      :ok ->
+      {:ok, id} ->
         socket
         |> monitoring()
-        |> Mob.Socket.assign(source: source, selected: source, input: :opening, notice: nil)
+        |> Mob.Socket.assign(
+          source: source,
+          selected: source,
+          input: :opening,
+          input_id: id,
+          notice: nil
+        )
 
       {:error, reason} ->
-        Mob.Socket.assign(socket,
-          notice: "Couldn't open #{source_name(source)}: #{inspect(reason)}",
-          selected: socket.assigns.source
-        )
+        noun = source |> source_name() |> String.downcase()
+        input_lost(socket, source, "Couldn't open #{noun} (#{error_text(reason)})")
     end
   end
 
   defp input_closed(socket, reason) do
     was = socket.assigns.source
-    socket = socket |> monitoring() |> Mob.Socket.assign(input: nil)
 
     notice =
       case reason do
-        :denied -> "Other apps weren't shared; back to the microphone."
-        reason -> "#{source_name(was)} stopped (#{reason})."
+        :denied -> "Other apps weren't shared"
+        reason -> "#{source_name(was)} stopped (#{reason})"
       end
 
-    socket =
-      if was == :apps and socket.assigns.mic == :granted,
-        do: open(socket, :mic),
-        else: Mob.Socket.assign(socket, :selected, was)
+    input_lost(socket, was, notice)
+  end
 
-    Mob.Socket.assign(socket, :notice, notice)
+  # No input any more (it closed, or a new one failed to open after the
+  # Engine closed the old): other apps go back to the mic when it is
+  # granted.
+  defp input_lost(socket, was, notice) do
+    socket =
+      socket |> monitoring() |> Mob.Socket.assign(input: nil, input_id: nil, source: was)
+
+    if was == :apps and socket.assigns.mic == :granted do
+      socket = open(socket, :mic)
+
+      if socket.assigns.input_id,
+        do: Mob.Socket.assign(socket, :notice, notice <> "; back to the microphone."),
+        else: socket
+    else
+      Mob.Socket.assign(socket, selected: was, notice: notice <> ".")
+    end
   end
 
   defp source_name(:mic), do: "The microphone"
   defp source_name(:apps), do: "Other apps"
 
+  # The take's peaks only from its own meters.
   defp meter(socket, level_db, meter) do
     a = socket.assigns
 
@@ -723,7 +769,7 @@ defmodule Magpie.RecordScreen do
         else: a.ambient
 
     recording =
-      if a.phase in @busy,
+      if a.phase in @busy and meter.take == a.take,
         do: [peaks: a.peaks <> meter.peaks, frames: meter.frames],
         else: []
 
@@ -738,7 +784,7 @@ defmodule Magpie.RecordScreen do
         if(a.mode == :on_sound, do: [threshold_db: threshold(a.ambient)], else: [])
 
     case Engine.record(opts) do
-      :ok ->
+      {:ok, take} ->
         phase =
           case a.mode do
             :now -> :recording
@@ -748,6 +794,7 @@ defmodule Magpie.RecordScreen do
 
         Mob.Socket.assign(socket,
           phase: phase,
+          take: take,
           peaks: <<>>,
           frames: 0,
           saved: nil,
@@ -770,7 +817,7 @@ defmodule Magpie.RecordScreen do
     meta = %{name: default_name(socket.assigns.source), source: :recorded}
 
     socket
-    |> Mob.Socket.assign(phase: :saving, tick: nil)
+    |> Mob.Socket.assign(phase: :saving, take: nil, tick: nil)
     |> Mob.Socket.start_async(:save, fn -> stop_and_save(meta) end)
   end
 
@@ -802,6 +849,7 @@ defmodule Magpie.RecordScreen do
   defp monitoring(socket) do
     Mob.Socket.assign(socket,
       phase: :monitoring,
+      take: nil,
       peaks: <<>>,
       frames: 0,
       saved: nil,
@@ -846,7 +894,16 @@ defmodule Magpie.RecordScreen do
   # landscape lock stays: each screen locks what it needs on mount.
   defp leave(socket) do
     if socket.assigns.phase in @busy, do: Engine.cancel_recording()
-    Engine.close_input()
+    close_input()
+  end
+
+  # A mic stream that wouldn't stop: the Engine has it closed to every
+  # screen and keeps closing it on its own; this screen can only say so.
+  defp close_input do
+    with {:error, reason} <- Engine.close_input() do
+      Logger.warning("Magpie.RecordScreen: the input didn't close (#{inspect(reason)})")
+    end
+
     :ok
   end
 end
