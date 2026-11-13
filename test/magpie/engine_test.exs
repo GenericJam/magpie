@@ -69,7 +69,7 @@ defmodule Magpie.EngineTest do
       loaded!(dir, "kick")
       assert :ok = Engine.set_pad(0, pad("kick"))
 
-      assert {:error, :not_owner} = Fake.set_pad(1, nil)
+      assert {:error, :not_owner} = Fake.set_pad(1, nil, false)
       assert {:error, :not_owner} = Fake.play()
       assert {:error, :not_owner} = Fake.load_sample("other", "/nowhere.wav")
 
@@ -317,6 +317,20 @@ defmodule Magpie.EngineTest do
 
       :ok = Engine.note_off(2, 64)
       assert_receive {:magpie_audio, :voice, 2, :end}
+    end
+
+    test "a pad set with stop ends its voices whatever the new mode; a refused one leaves them" do
+      :ok = Engine.set_pad(1, pad("kick", mode: :toggle))
+      :ok = Engine.trigger(1, 100)
+      assert_receive {:magpie_audio, :voice, 1, :start}
+
+      assert {:error, {:invalid, :pitch_st}} =
+               Engine.set_pad(1, pad("kick", pitch_st: 30), stop: true)
+
+      refute_receive {:magpie_audio, :voice, 1, :end}
+
+      :ok = Engine.set_pad(1, pad("kick"), stop: true)
+      assert_receive {:magpie_audio, :voice, 1, :end}
     end
 
     test "sequenced gate and loop pads sound for one step; stopping ends them" do

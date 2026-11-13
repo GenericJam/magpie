@@ -158,6 +158,24 @@ launcher masks keep the whole nest. Regenerate every launcher icon with
 - **`Magpie.RecordScreen`**: the Record board. Params `%{pad: 0..63,
   reply_to: pid}` record into a pad: the title names it and each saved
   sample goes to `reply_to` as `{:recorded, pad, %Magpie.Library.Sample{}}`.
+- **`Magpie.KitSession`**: the kit being played, one GenServer from
+  `App.on_start` after the Engine. Loads the kit's samples (library →
+  `Engine.load_pcm/4`, one at a time in a loader process) and applies its
+  pads; `subscribe/1` (monitored; returns the snapshot, then
+  `{:magpie_kit, %KitSession.Snapshot{kit, pads}}` on every change, `pads`
+  per index: `status` `:loading | :ready | {:error, reason}`, `wave` 12
+  peaks 0..255 over the region, `seconds` at its pitch), `snapshot/0`,
+  `update_pad(index, fn pad -> pad end)` (engine first; its error leaves
+  the kit alone; a new sample or mode, or clearing, stops the pad's voices
+  through `set_pad(…, stop: true)`), `clear_pad/1`,
+  `put_sample(index, sample_id)` (a new pad takes the sample's name and a
+  colour by slot), `set_snap/1`, `flush/0`,
+  `pattern(kit, bank)`, `whereis/0` (RecordScreen's `reply_to`: it handles
+  `{:recorded, pad, sample}`). Autosaves 1 s after a change. Starts with
+  the last saved kit, else the board's Dusty Breaks keeping only pads
+  whose samples the library has (empty on a fresh install). Tests:
+  `Magpie.Test.Kits` (`setup_library/0`, `sample!/2`, `kit/2`, `pad/3`,
+  `start_session!/2`, `await_loaded/0`).
 
 ## Architecture (planned)
 
@@ -215,11 +233,16 @@ started in `App.on_start`. Why it is built this way:
   minutes each.
 - **Peaks:** one byte per 256 frames, the largest |sample| over the
   channels, linear, 255 = full scale.
-- **Pads:** `set_pad(index, %Magpie.Kit.Pad{} | nil)` (regions in seconds,
-  converted to frames of the loaded sample; `{:error, :unknown_sample |
-  {:invalid, field}}`), `clear_pad/1`, `pads/0`. Index =
-  `Magpie.Kit.pad_index(bank, slot)`. Changes apply from the pad's next
-  trigger.
+- **Pads:** `set_pad(index, %Magpie.Kit.Pad{} | nil, stop: false)` (regions
+  in seconds, converted to frames of the loaded sample; `{:error,
+  :unknown_sample | {:invalid, field} | :busy}`), `clear_pad/2`, `pads/0`.
+  Index = `Magpie.Kit.pad_index(bank, slot)`. Changes apply from the pad's
+  next trigger. `stop: true`: the pad's sounding voices fade and its
+  waiting quantized launches go in the same command as the change, whatever
+  the old or new mode, with no stream too; an error changes nothing. Use it
+  when a pad's sound or mode changes: a `release/1` after the change goes
+  by the new mode, and a toggle's stopping trigger is a live call (dropped
+  with no stream).
 - **Live:** `trigger(index, velocity, quantize: ticks)`, `release/1`,
   `note_on/3`, `note_off/2`. They run in the caller (no GenServer hop) and
   only queue a command; `{:error, :not_running}` without a stream. The
@@ -325,8 +348,9 @@ On the moto g power 2021 (Android 11), `scripts/engine_check.exs`:
   frame at 5 tempos × 4 swings with random block sizes, off-grid and
   negative ticks, block-size independence, tempo change, pattern swap at
   the bar and edits now, choke and steal with a bounded sample-to-sample
-  step, pitch to 0.5 ¢, reverse, loop, gate/one-shot/toggle/keys, fades and
-  velocity, hit stamping with swing, quantized launch, unload while
+  step, pitch to 0.5 ¢, reverse, loop, gate/one-shot/toggle/keys, a pad
+  change with `stop` (with no stream, and dropping a waiting launch), fades
+  and velocity, hit stamping with swing, quantized launch, unload while
   playing, queue overflow, the limiter, resampler SNR and aliasing, peaks;
   the count-in's clicks and downbeat stopped and on the sequencer's bar,
   the recorder's threshold, pre-roll, start time (ahead, late from the
@@ -458,6 +482,91 @@ starts the take on the frame captured when its downbeat is heard.
     silence for ~10 s. A tap or `KEYCODE_MEDIA_PLAY` starts it;
   - Magpie's own sequencer: digital silence (its UID is excluded).
 
+## The pads (`Magpie.PadsScreen`)
+
+The root screen (`stack(:main, root: Magpie.PadsScreen)`), landscape,
+locked on mount. Why it is built this way:
+`decisions/2026-11-13-pads-screen-and-kit-session.md`.
+
+- **Layout:** top bar (magpie menu button, bank A–D, kit name, tempo, Snap,
+  Play, Record pattern, Seq), then 8 × 2 weighted pad cells with 8 pt
+  gaps inside the 28 pt gutters. Each cell is the `on_touch` node
+  (`{:pad, index}`, index = `Kit.pad_index/2`, `id: "pad_<index>"`);
+  the face inside it moves 2 pt when pressed. Landing line, ring, badge and
+  loop bar are offset children stacked over the face (an Android `Box`
+  stacks its children).
+- **Touch:** `:down` triggers first (velocity from y or the pad's fixed
+  one; Snap quantizes loop/toggle launches to 1/16 while playing), then
+  triggers every other `:down` already queued before the one render.
+  `:up`/`:cancel` release gate, loop and keys pads when their last finger
+  lifts. Fingers are tracked by pointer id; voice `:start`/`:end` keep a
+  pad lit (or looping, with a progress bar from a tokened 50 ms timer)
+  after the lift. Empty pad tap → `Magpie.RecordScreen` with `%{pad,
+  reply_to: KitSession.whereis()}`: what it saves lands on that pad (the
+  session handles `{:recorded, pad, sample}`). With the old home screen
+  gone, the pads are the only way into the Record screen for now (the
+  Library screen comes later).
+- **Long press:** 600 ms on the BEAM from the `:down` (`{:long_press,
+  pointer_id, token}`), cancelled by the lift or by the finger leaving the
+  pad; the first to fire cancels the others, and none opens over the
+  sheet. Loaded pads always ask for moves (Mob takes a node's move rule at
+  the finger's down). Opens the PadSheet panel:
+  colour, play mode, choke group, velocity mode, pitch and MIDI note (drag
+  the field up or down, 6 pt a step), Replace (records into the pad),
+  Clear, Done; all through `Magpie.KitSession`.
+- **Inert until designed or built:** the menu (magpie button), the kit
+  name (save/load sheet), the tempo, Record pattern, Seq, and the sheet's
+  Edit sample. Play plays the bank's pattern (stop square while playing:
+  the board shows only play). Plain fallbacks: a pad whose sample isn't in
+  the library says "sample missing", one that failed to load "can't
+  load", one still loading "loading…".
+- **The magpie's mood** on the menu button (`Magpie.Bird.ops(mood, size:
+  0.5)` on a 32 × 28 canvas): `:play` while the sequencer plays, `:sleep`
+  with no audio output, else `:idle`.
+
+### Measured
+
+moto g power 5G 2024 (Android 15, 120 Hz panel running 60, AAudio 48 kHz,
+256-frame bursts), `scripts/pads_check.exs`, real input through a virtual
+`uinput` touchscreen (so the touch controller's own scan time isn't in
+these), 16 loaded pads (every one asking for moves), 40 rounds:
+
+| touch-down → | one finger p50 / p95 | four fingers together p50 / p95 |
+|---|---|---|
+| screen receives `:down` | 6.3 / 9.0 ms | 7.7 / 13.9 ms |
+| `Engine.trigger` call | 6.3 / 9.1 ms | 7.9 / 13.9 ms |
+| first frame heard (+ the engine's call → heard, 23 / 26 ms) | ≈ 29 ms | ≈ 31 ms |
+| tree committed (`set_root` returns) | 14.6 / 16.5 ms | 16.3 / 22.9 ms |
+| press frame's callbacks start | 20.5 / 25.4 ms | 22.8 / 30.5 ms |
+| press frame drawn | 48.7 / 55.3 ms | 54.3 / 96.2 ms |
+| press on the display (`DisplayPresentTime`) | 72.4 / 78.3 ms | 82.3 / 124.7 ms |
+
+- The audio callback takes a trigger at its next buffer, at most one burst
+  (5.3 ms) after the call. The output latency behind it depends on the
+  stream: 2 bursts after opening, a burst more per underrun (this run: no
+  underruns, call → heard 20–26 ms; an earlier run with 3 underruns at
+  startup, 1280 frames, heard 39 / 42 ms).
+- Long press on the phone (`adb shell input swipe` from pad A1, 1 s):
+  held still it opens the sheet; slid onto A4 it doesn't (the move off
+  the pad reaches the screen because the pad asked for moves before the
+  down).
+- Sound leads the picture by ~30 ms or more. Most of the picture's time is
+  Compose rebuilding the whole tree (~27 ms a frame in the run above, the
+  same with 4 loaded pads as with 16) and the display pipeline (~25 ms); a
+  smaller tree doesn't move it. The picture varies run to run more than
+  the sound: press on the display p50 70–137 ms over six runs (a run
+  against a hot-loaded, not restarted app was the slow one), touch →
+  trigger 5–11 ms in all of them.
+- Before coalescing queued `:down`s, fingers 2–4 of a chord waited ~5 ms
+  each for the previous finger's render.
+- `SERIAL=<serial> [ROUNDS=40] [PADS=16] mix run --no-start
+  scripts/pads_check.exs` after `mix mob.connect`: it puts test sounds on
+  bank A and removes them after. The shell user can't write the real
+  touchscreen's `/dev/input` node; `uinput` (the CTS tool) can register a
+  virtual one. It is an external device, so its coordinates are the
+  display's natural (portrait) frame, and the first event after
+  registering is stamped ~800 ms early (the script taps nothing first).
+
 ## Rules for Mob screens here (from Choir Coach and Humdinger)
 
 - **Every `on_tap` on a screen that re-renders on a timer** (pads while
@@ -476,6 +585,13 @@ starts the take on the frame captured when its downbeat is heard.
   screens keep 28 pt side gutters for the back gesture.
 - `Mob.Test.tap/2` skips the native tap path: only real touches (`adb shell
   input`) catch lost taps.
+- Lock the orientation a screen needs on mount and never unlock: Mob has
+  no "active again" callback, so a pushed screen that unlocked on leave
+  would leave the screen under it free to rotate.
+- On Android a `<Box>` stacks its children (overlays); `offset_x`/`offset_y`
+  wrap a node in another Box, which drops its `weight`, so offset a child
+  of the weighted node instead. `@name` inside a `~MOB` expression means
+  `assigns.name`, not a module attribute: bind attributes to locals first.
 
 ## Working on it
 

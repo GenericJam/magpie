@@ -167,12 +167,19 @@ defmodule Magpie.Engine do
   Set pad `index` (0..63) from a kit pad. Its sample must be loaded. A pad
   without a sample is silent. Takes effect on the pad's next trigger.
   `{:error, :unknown_sample}` or `{:error, {:invalid, field}}` otherwise.
-  """
-  @spec set_pad(Audio.pad(), Pad.t() | nil) :: :ok | {:error, term()}
-  def set_pad(index, pad) when index in 0..63 and (is_nil(pad) or is_struct(pad, Pad)),
-    do: GenServer.call(__MODULE__, {:set_pad, index, pad})
 
-  def clear_pad(index) when index in 0..63, do: set_pad(index, nil)
+  `stop: true`: the pad's sounding voices fade (each by its own release)
+  and its quantized launches still waiting are dropped, in the same step
+  as the change and with no output stream too, whatever the old or new
+  mode (a later `release/1` would go by the new mode, and a second trigger
+  would start a toggle that has already ended). An error changes nothing.
+  """
+  @spec set_pad(Audio.pad(), Pad.t() | nil, keyword()) :: :ok | {:error, term()}
+  def set_pad(index, pad, opts \\ [])
+      when index in 0..63 and (is_nil(pad) or is_struct(pad, Pad)),
+      do: GenServer.call(__MODULE__, {:set_pad, index, pad, Keyword.get(opts, :stop, false)})
+
+  def clear_pad(index, opts \\ []) when index in 0..63, do: set_pad(index, nil, opts)
 
   @doc "Pads set: `%{index => %Magpie.Kit.Pad{}}`."
   def pads, do: GenServer.call(__MODULE__, :pads)
@@ -380,8 +387,8 @@ defmodule Magpie.Engine do
   def handle_call(:memory, _from, s),
     do: {:reply, s.samples |> Map.values() |> Enum.map(& &1.bytes) |> Enum.sum(), s}
 
-  def handle_call({:set_pad, index, pad}, _from, s) do
-    case apply_pad(index, pad, s.samples) do
+  def handle_call({:set_pad, index, pad, stop}, _from, s) do
+    case apply_pad(index, pad, s.samples, stop) do
       :ok -> {:reply, :ok, %{s | pads: put_pad(s.pads, index, pad)}}
       {:error, _} = error -> {:reply, error, s}
     end
@@ -644,7 +651,7 @@ defmodule Magpie.Engine do
     samples = Map.put(s.samples, id, info)
 
     for {index, pad} <- s.pads, uses?(pad, id) do
-      with {:error, reason} <- apply_pad(index, pad, samples) do
+      with {:error, reason} <- apply_pad(index, pad, samples, false) do
         Logger.warning(
           "Magpie.Engine: pad #{index} after reloading #{inspect(id)}: #{inspect(reason)}"
         )
@@ -656,8 +663,8 @@ defmodule Magpie.Engine do
 
   defp loaded(s, _id, {:error, _}), do: s
 
-  defp apply_pad(index, pad, samples) do
-    with {:ok, params} <- pad_params(pad, samples), do: Audio.impl().set_pad(index, params)
+  defp apply_pad(index, pad, samples, stop) do
+    with {:ok, params} <- pad_params(pad, samples), do: Audio.impl().set_pad(index, params, stop)
   end
 
   defp pad_params(nil, _samples), do: {:ok, nil}

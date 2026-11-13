@@ -1841,21 +1841,24 @@ static bool get_mode(ErlNifEnv *env, ERL_NIF_TERM term, uint8_t *out) {
 }
 
 /* set_pad(Pad, {SampleId | nil, StartFrame, EndFrame, GainDb, PitchSt,
- * Reverse, FadeInMs, FadeOutMs, Mode, Choke, Root}) -> ok | {error,
- * not_owner | unknown_sample | busy}. EndFrame 0: to the sample's end. */
+ * Reverse, FadeInMs, FadeOutMs, Mode, Choke, Root}, Stop) -> ok | {error,
+ * not_owner | unknown_sample | busy}. EndFrame 0: to the sample's end.
+ * Stop: the pad's sounding voices fade and its waiting quantized launches
+ * go, in the same step as the change (with no stream too). */
 static ERL_NIF_TERM nif_set_pad(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     int pad, arity, choke, root;
     const ERL_NIF_TERM *t;
     ErlNifSInt64 start, end;
     double gain_db, pitch, fade_in, fade_out;
-    bool reverse;
+    bool reverse, stop;
     uint8_t mode;
     if (!get_range(env, argv[0], 0, SP_PADS - 1, &pad) || !enif_get_tuple(env, argv[1], &arity, &t) || arity != 11 ||
         !enif_get_int64(env, t[1], &start) || !enif_get_int64(env, t[2], &end) || !get_number(env, t[3], &gain_db) ||
         !get_number(env, t[4], &pitch) || !get_bool(env, t[5], &reverse) || !get_number(env, t[6], &fade_in) ||
         !get_number(env, t[7], &fade_out) || !get_mode(env, t[8], &mode) || !get_range(env, t[9], 0, 3, &choke) ||
-        !get_range(env, t[10], 0, 127, &root) || start < 0 || end < 0 || fade_in < 0 || fade_out < 0)
+        !get_range(env, t[10], 0, 127, &root) || !get_bool(env, argv[2], &stop) || start < 0 || end < 0 ||
+        fade_in < 0 || fade_out < 0)
         return enif_make_badarg(env);
     bool empty = enif_is_identical(t[0], atom(env, "nil"));
 
@@ -1871,6 +1874,7 @@ static ERL_NIF_TERM nif_set_pad(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     }
     sp_cmd c = {.type = SP_CMD_PAD,
                 .pad = (uint8_t)pad,
+                .stop = stop,
                 .u.pad = {.slot = slot,
                           .start = start,
                           .end = end,
@@ -2419,7 +2423,7 @@ static ErlNifFunc nif_funcs[] = {
     {"decode", 1, nif_decode, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"load_sample", 2, nif_load_sample, 0},
     {"unload_sample", 1, nif_unload_sample, 0},
-    {"set_pad", 2, nif_set_pad, 0},
+    {"set_pad", 3, nif_set_pad, 0},
     {"set_pattern", 3, nif_set_pattern, 0},
     {"set_tempo", 1, nif_set_tempo, 0},
     {"set_swing", 1, nif_set_swing, 0},

@@ -5,7 +5,7 @@ defmodule Magpie.App do
 
   @impl Mob.App
   def navigation(_platform) do
-    stack(:main, root: Magpie.HomeScreen)
+    stack(:main, root: Magpie.PadsScreen)
   end
 
   @impl Mob.App
@@ -32,9 +32,11 @@ defmodule Magpie.App do
     # The sampler: the audio stream and the sequencer live outside the
     # screens, so they keep time whichever screen is in front.
     {:ok, _} = Magpie.Engine.start_link()
+    # The kit being played: loads its samples into the engine, autosaves.
+    {:ok, _} = Magpie.KitSession.start_link()
 
     Mob.Theme.set(Magpie.Style.theme())
-    Mob.Screen.start_root(Magpie.HomeScreen)
+    Mob.Screen.start_root(Magpie.PadsScreen)
     Mob.Dist.ensure_started(node: :"magpie_android@127.0.0.1", cookie: :mob_secret)
   end
 
