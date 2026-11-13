@@ -525,22 +525,27 @@ locked on mount. Why it is built this way:
 moto g power 5G 2024 (Android 15, 120 Hz panel running 60, AAudio 48 kHz,
 256-frame bursts), `scripts/pads_check.exs`, real input through a virtual
 `uinput` touchscreen (so the touch controller's own scan time isn't in
-these), 16 loaded pads, 40 rounds:
+these), 16 loaded pads (every one asking for moves), 40 rounds:
 
 | touch-down → | one finger p50 / p95 | four fingers together p50 / p95 |
 |---|---|---|
-| screen receives `:down` | 5.5 / 9.8 ms | 8.2 / 12.5 ms |
-| `Engine.trigger` call | 5.6 / 9.9 ms | 8.5 / 12.9 ms |
-| first frame heard (+ the engine's call → heard, 39 / 42 ms) | ≈ 45 ms | ≈ 47 ms |
-| tree committed (`set_root` returns) | 13.3 / 17.4 ms | 16.5 / 20.2 ms |
-| press frame's callbacks start | 18.5 / 26.9 ms | 22.5 / 28.4 ms |
-| press frame drawn | 44.4 / 53.7 ms | 48.3 / 84.6 ms |
-| press on the display (`DisplayPresentTime`) | 70.8 / 79.7 ms | 76.2 / 113.5 ms |
+| screen receives `:down` | 6.3 / 9.0 ms | 7.7 / 13.9 ms |
+| `Engine.trigger` call | 6.3 / 9.1 ms | 7.9 / 13.9 ms |
+| first frame heard (+ the engine's call → heard, 23 / 26 ms) | ≈ 29 ms | ≈ 31 ms |
+| tree committed (`set_root` returns) | 14.6 / 16.5 ms | 16.3 / 22.9 ms |
+| press frame's callbacks start | 20.5 / 25.4 ms | 22.8 / 30.5 ms |
+| press frame drawn | 48.7 / 55.3 ms | 54.3 / 96.2 ms |
+| press on the display (`DisplayPresentTime`) | 72.4 / 78.3 ms | 82.3 / 124.7 ms |
 
 - The audio callback takes a trigger at its next buffer, at most one burst
   (5.3 ms) after the call. The output latency behind it depends on the
-  stream: 2 bursts after opening, a burst more per underrun (this run: 3
-  underruns at startup, 1280 frames, 39 ms; other runs 17–35 ms).
+  stream: 2 bursts after opening, a burst more per underrun (this run: no
+  underruns, call → heard 20–26 ms; an earlier run with 3 underruns at
+  startup, 1280 frames, heard 39 / 42 ms).
+- Long press on the phone (`adb shell input swipe` from pad A1, 1 s):
+  held still it opens the sheet; slid onto A4 it doesn't (the move off
+  the pad reaches the screen because the pad asked for moves before the
+  down).
 - Sound leads the picture by ~30 ms or more. Most of the picture's time is
   Compose rebuilding the whole tree (~27 ms a frame in the run above, the
   same with 4 loaded pads as with 16) and the display pipeline (~25 ms); a
