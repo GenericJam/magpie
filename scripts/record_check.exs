@@ -123,11 +123,16 @@ defmodule MagpieRecordCheck do
     end
   end
 
-  defp await(pattern_fun, ms) do
+  # The first message `pattern_fun` accepts within `ms` (meters keep
+  # arriving, so the deadline is fixed, not per message).
+  defp await(pattern_fun, ms), do: await_until(pattern_fun, System.monotonic_time(:millisecond) + ms)
+
+  defp await_until(pattern_fun, deadline) do
+    left = max(deadline - System.monotonic_time(:millisecond), 0)
     receive do
-      msg -> if pattern_fun.(msg), do: msg, else: await(pattern_fun, ms)
+      msg -> if pattern_fun.(msg), do: msg, else: await_until(pattern_fun, deadline)
     after
-      ms -> :timeout
+      left -> :timeout
     end
   end
 

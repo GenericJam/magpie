@@ -45,7 +45,7 @@ defmodule Magpie.RecordScreenTest do
   # The magpie on the card in `mood` (top-right, size 0.75).
   defp bird?(view, mood) do
     ops = canvas_ops(view, "wave")
-    Enum.all?(Bird.ops(mood, x: 512 - 60, y: 8, size: 0.75, trinket: :coral), &(&1 in ops))
+    Enum.all?(Bird.ops(mood, x: 496 - 60, y: 8, size: 0.75, trinket: :coral), &(&1 in ops))
   end
 
   defp coral_bars(view) do
@@ -170,6 +170,17 @@ defmodule Magpie.RecordScreenTest do
       assert bird?(view, :grab)
       # The whole sample fills the card.
       assert Enum.count(coral_bars(view)) == 120
+    end
+
+    test "recording into a pad names it and hands the saved sample back" do
+      view = RecordScreen |> mount_screen(%{pad: 14, reply_to: self()}) |> pump()
+      assert "Record into pad A15" in texts(view)
+
+      view = view |> press(:record) |> pump() |> feed(level(4800, 0.25))
+      _view = view |> press(:record) |> render_async()
+
+      assert [sample] = Library.list()
+      assert_received {:recorded, 14, ^sample}
     end
 
     test "reaching the length limit saves on its own, with a notice" do

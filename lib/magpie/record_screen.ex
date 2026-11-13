@@ -14,6 +14,12 @@ defmodule Magpie.RecordScreen do
   and closes the input: the mic is off once the screen is gone (the
   Engine also closes it when this process exits).
 
+  Params: `%{pad: 0..63, reply_to: pid}` records into a pad (the empty-pad
+  tap on the pads screen): the title names it ("Record into pad A15") and
+  every sample saved here (recorded or imported) is sent to `reply_to` as
+  `{:recorded, pad, %Magpie.Library.Sample{}}`. Without them it is "Record
+  a sample" into the library only.
+
   Phases (`phase`):
 
   - `:monitoring`: "READY" (input open), "OPENING…" (other apps: waiting
@@ -48,11 +54,17 @@ defmodule Magpie.RecordScreen do
 
   alias Magpie.{Audio, Bird, Engine, Import, Library, Style}
 
-  @card_w 512
-  @card_h 284
+  # Mob canvases have fixed sizes and a screen can't learn its window's
+  # width, so the board's 844 × 390 is laid out to fit the narrowest
+  # landscape phone tried: the moto g power 2021 leaves about 810 × 385 dp
+  # once its cutout, navigation bar and status bar are inset (28 + 236 +
+  # 12 + 496 + 28). Wider windows get room to the right.
+  @left_w 236
+  @card_w 496
+  @card_h 264
   @bars 120
   @bar_gap 2
-  @meter_w 434
+  @meter_w 404
   @meter_h 14
   @segments 30
   @window_s 6
@@ -76,9 +88,10 @@ defmodule Magpie.RecordScreen do
   # ── Mount ───────────────────────────────────────────────────────────────
 
   @impl true
-  def mount(_params, _session, socket) do
+  def mount(params, _session, socket) do
     socket =
       Mob.Socket.assign(socket,
+        target: target(params),
         mic: :asking,
         source: :mic,
         selected: :mic,
@@ -108,6 +121,18 @@ defmodule Magpie.RecordScreen do
 
   defp device_calls?, do: Application.get_env(:magpie, :device_calls, true)
 
+  defp target(%{pad: pad, reply_to: pid}) when pad in 0..63 and is_pid(pid), do: {pad, pid}
+  defp target(_params), do: nil
+
+  @doc false
+  # "Record into pad A15" (slots count from 1), else "Record a sample".
+  def title(nil), do: "Record a sample"
+
+  def title({pad, _pid}) do
+    {bank, slot} = Magpie.Kit.bank_slot(pad)
+    "Record into pad #{bank}#{slot + 1}"
+  end
+
   defp held, do: {self(), :held}
 
   # ── Render ──────────────────────────────────────────────────────────────
@@ -126,7 +151,7 @@ defmodule Magpie.RecordScreen do
       padding_top={8}
       padding_bottom={8}
     >
-      <Row gap={16} fill_width={true}>
+      <Row gap={12} fill_width={true}>
         {left(assigns)}
         <Column weight={1} gap={10}>
           <Canvas id="wave" width={card_w} height={card_h} draw={card_ops(assigns)} />
@@ -138,8 +163,10 @@ defmodule Magpie.RecordScreen do
   end
 
   defp left(assigns) do
+    left_w = @left_w
+
     ~MOB"""
-    <Column width={260} gap={6}>
+    <Column width={left_w} gap={6}>
       <Row align={:center} gap={8} height={44}>
         <Canvas
           id="back"
@@ -149,7 +176,12 @@ defmodule Magpie.RecordScreen do
           on_tap={{self(), :back}}
           on_press_out={held()}
         />
-        <Text text="Record a sample" font={:bold} text_size={16} text_color={Style.color(:text)} />
+        <Text
+          text={title(assigns.target)}
+          font={:bold}
+          text_size={16}
+          text_color={Style.color(:text)}
+        />
       </Row>
       <Text
         text="SOURCE"
@@ -189,8 +221,8 @@ defmodule Magpie.RecordScreen do
       fill_width={true}
       corner_radius={12}
       background={if(selected, do: Style.color(:raised_hi), else: Style.color(:surface))}
-      border_color={if(selected, do: Style.color(:fm))}
-      border_width={if(selected, do: 2)}
+      border_color={if(selected, do: Style.color(:fm), else: Style.color(:surface))}
+      border_width={if(selected, do: 2, else: 0)}
       padding_left={12}
       padding_right={12}
       padding_top={8}
@@ -260,7 +292,8 @@ defmodule Magpie.RecordScreen do
           font={:mono_semibold}
           text_size={11}
           text_color={Style.color(:text_2)}
-          width={44}
+          width={56}
+          max_lines={1}
           text_align="right"
         />
       </Row>
@@ -288,7 +321,7 @@ defmodule Magpie.RecordScreen do
       weight={1}
       height={40}
       corner_radius={9}
-      background={if(selected, do: Style.color(:selected))}
+      background={if(selected, do: Style.color(:selected), else: Style.color(:surface))}
       align={:center}
       on_tap={{self(), {:mode, mode}}}
       on_press_out={held()}
@@ -761,8 +794,10 @@ defmodule Magpie.RecordScreen do
     |> Mob.Socket.start_async(:import, fn -> Import.import(path, Path.rootname(name)) end)
   end
 
-  defp saved(socket, sample),
-    do: Mob.Socket.assign(socket, phase: :saved, saved: sample, peaks: sample.peaks || <<>>)
+  defp saved(socket, sample) do
+    with {pad, pid} <- socket.assigns.target, do: send(pid, {:recorded, pad, sample})
+    Mob.Socket.assign(socket, phase: :saved, saved: sample, peaks: sample.peaks || <<>>)
+  end
 
   defp monitoring(socket) do
     Mob.Socket.assign(socket,
@@ -807,11 +842,11 @@ defmodule Magpie.RecordScreen do
     Mob.Socket.assign(socket, :tick, token)
   end
 
-  # Off with the mic: a recording is dropped, the input closed.
+  # Off with the mic: a recording is dropped, the input closed. The
+  # landscape lock stays: each screen locks what it needs on mount.
   defp leave(socket) do
     if socket.assigns.phase in @busy, do: Engine.cancel_recording()
     Engine.close_input()
-    if device_calls?(), do: Mob.Device.unlock_orientation()
     :ok
   end
 end

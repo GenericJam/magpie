@@ -145,6 +145,19 @@ launcher masks keep the whole nest. Regenerate every launcher icon with
   `decode/1` → `{:ok, %{rate, channels, frames}, f32le}` from 8/16/24/32-bit
   integer or 32/64-bit float, mono or more, WAVE_FORMAT_EXTENSIBLE, unknown
   chunks skipped. Integer scale is ÷ 32768 both ways.
+- **`Magpie.Bird`**: the magpie (`design/creature.md`) as `Mob.Canvas` ops:
+  `ops(mood, x:, y:, size:, trinket:)`, moods `:idle | :listen | :grab |
+  :play | :proud | :sleep | :nomic` (`moods/0`); size 1 = 64 × 56 pt. No
+  rotation or gradients.
+- **`Magpie.Import`**: `import(path, name \\ nil)` → `Engine.decode/1` →
+  `Library.put_pcm(source: :imported)`. AIFF/AIFC (MediaCodec answers
+  `:unsupported` on Android) goes through **`Magpie.Aiff`** (`decode/1`
+  like `Magpie.Wav.decode/1`: big-endian integer, `sowt`, `fl32`, `fl64`),
+  then a float WAV under the library dir so the engine still makes the
+  peaks.
+- **`Magpie.RecordScreen`**: the Record board. Params `%{pad: 0..63,
+  reply_to: pid}` record into a pad: the title names it and each saved
+  sample goes to `reply_to` as `{:recorded, pad, %Magpie.Library.Sample{}}`.
 
 ## Architecture (planned)
 
@@ -314,7 +327,11 @@ On the moto g power 2021 (Android 11), `scripts/engine_check.exs`:
   the bar and edits now, choke and steal with a bounded sample-to-sample
   step, pitch to 0.5 ¢, reverse, loop, gate/one-shot/toggle/keys, fades and
   velocity, hit stamping with swing, quantized launch, unload while
-  playing, queue overflow, the limiter, resampler SNR and aliasing, peaks).
+  playing, queue overflow, the limiter, resampler SNR and aliasing, peaks;
+  the count-in's clicks and downbeat stopped and on the sequencer's bar,
+  the recorder's threshold, pre-roll, start time (ahead, late from the
+  ring, past it), length limit and peaks, and the whole count-in chain
+  through a latency loopback: the take starts on the downbeat's frame).
   Also with `-fsanitize=address,undefined`. `/tmp/sampler_host bench`
   (built with `-Os`, as the app is) for render cost.
 - The NIF for Android: `$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang
@@ -324,11 +341,79 @@ On the moto g power 2021 (Android 11), `scripts/engine_check.exs`:
   (also `armv7a-linux-androideabi28`, `x86_64-linux-android28`).
 - Host, Elixir: `mix test test/magpie/engine_test.exs` (the Fake: ownership,
   loading and errors, pads in seconds, pattern compile, swap at the bar,
-  edits now, hits as kit steps).
+  edits now, hits as kit steps), `engine_record_test.exs`,
+  `record_screen_test.exs`, `aiff_test.exs`, `bird_test.exs`.
 - Device: `mix mob.deploy --native --android --device <serial>`, `mix
   mob.connect --no-iex --android-only --device <serial>`, then
   `SERIAL=<serial> mix run --no-start scripts/engine_check.exs` (needs
-  ffmpeg; turn the volume down).
+  ffmpeg; turn the volume down); recording: `scripts/record_check.exs`
+  (grant RECORD_AUDIO first; `OTHER_APPS=1` also records Chrome).
+
+## Recording
+
+Why it is built this way: `decisions/2026-11-13-recording-other-apps.md`.
+`c_src/recorder.c` (plain C, in the host harness) is the recorder for every
+source: a buffer of the maximum length allocated when armed, a ring of the
+last ½ s while waiting, the meter, the peaks, and the start modes. The mic
+is an AAudio input stream of its own (mono, the output's rate, low latency
+requested, `UNPROCESSED`); other apps come from
+`plugins/magpie_capture` (Kotlin only: MediaProjection consent, a
+`mediaProjection` foreground service, `AudioRecord` on the playback
+capture, 16-bit stereo, Magpie's own UID excluded), whose read thread hands
+blocks to the NIF. Every block carries its capture time, so a count-in
+starts the take on the frame captured when its downbeat is heard.
+
+### `Magpie.Engine` recording API
+
+- `open_input(:mic | :apps)` (monitors the caller: the input closes when it
+  exits), `close_input/0`; `{:magpie_audio, :input, :started, %{source,
+  rate, channels}}` / `{:magpie_audio, :input, :closed, :denied | :stopped
+  | :disconnected | :error}`. `state/0`'s `input`.
+- `{:magpie_audio, :meter, level_db, %{state, frames, peaks}}` every 40 ms
+  while an input is open: peak dBFS since the last one, the recorder's state
+  (`:idle | :waiting | :counting | :recording | :full`), frames so far and
+  the new peak bytes (append them).
+- `record(mode: :now | :on_sound | :count_in, max_seconds: 60,
+  threshold_db: -30, pre_roll_ms: 150)`; `{:magpie_audio, :record,
+  :started, %{pre_roll_frames, late_frames}}`, `{:magpie_audio, :record,
+  :full, frames}`, `{:magpie_audio, :count_in, first_frame, downbeat_frame}`
+  (4 clicks, one bar at the tempo; while the sequencer plays, from its next
+  bar). `:count_in` needs the output stream.
+- `stop_recording/0` → `{:ok, %{pcm, rate, channels, frames, peaks,
+  peak_frames}}` (the recorder's own buffer as a resource binary, no copy)
+  or `{:error, :not_recording | :not_started}`; `cancel_recording/0`.
+- Changing `lib/magpie/audio/nif.ex` and hot-pushing (`mix mob.deploy`
+  without `--native`) reloads the module and drops the static NIF
+  (`:nif_not_loaded`): restart the app (`mix mob.connect`).
+
+### Measured (moto g power 2021, Android 11, `scripts/record_check.exs`)
+
+- **Mic:** 48 kHz mono, `UNPROCESSED` (preset 9), burst 960 frames (20 ms):
+  AAudio gives it the normal path, not low latency. `VOICE_RECOGNITION`
+  gets low latency (burst 192) but its input timestamp never succeeds and
+  its processing swallows the clicks, so it is only the fallback. Newest
+  frame 5–10 ms old when it reaches the recorder; no overruns.
+- **Playback while recording:** sequencer at 120 bpm, 5 s without and 5 s
+  with the mic recording: 0 underruns both, output callback mean 33.6 →
+  37.1 µs, max 206 → 330 µs (of 5 ms), CPU 0.74 → 0.82 %, nothing
+  dropped. The take: 240 000 frames for 5.00 s, the clicks 24 000 frames
+  apart within ±110 frames (acoustic onset detection through the speaker).
+- **Meters:** 25 a second, 39–43 ms apart.
+- **Count-in (playing, 120 bpm, speaker → mic):** the click on the downbeat
+  lands 2040–2050 frames (42.5–42.7 ms) into the take in every run, the
+  next ones 24 000 apart. The engine is exact to its clocks (the host
+  loopback test puts the downbeat on frame 0); the 42.5 ms is latency the
+  phone's output and input timestamps don't report. A per-phone offset
+  (measured by loopback) would remove it; not built yet. Stopped, the 4
+  clicks span exactly 2.00 s and none reach the take.
+- **When sound starts:** room −40 dBFS, threshold −28 dBFS, a pad click
+  1.5 s after arming: `pre_roll_frames` 7200, its onset at 149.9 ms into the
+  take (the full 150 ms pre-roll, attack intact).
+- **Length limit:** `max_seconds: 2` → `:full` at exactly 96 000 frames.
+- **Playback through a pad:** 5 s take → `load_pcm` 10–13 ms, `set_pad`,
+  `trigger`: the voice starts.
+- **Import:** wav and mp3 through MediaCodec; AIFF → `:unsupported` from
+  MediaCodec, imported through `Magpie.Aiff` (88 200 frames × 2, 44.1 kHz).
 
 ## Rules for Mob screens here (from Choir Coach and Humdinger)
 
