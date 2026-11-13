@@ -1642,11 +1642,12 @@ static void midi_drain_offline(void) {
     pthread_mutex_unlock(&E.ctl);
 }
 
-/* What input `source` held ends: a bit the renderer reads before its next
- * command (so before anything pushed after this), never lost to a full
- * command queue. */
+/* What input `source` held ends: SP_CMD_MIDI_GONE in the command queue, so
+ * after what the input sent before; if the full queue refuses it, a bit the
+ * renderer applies after the commands queued by then (never lost). */
 static void source_gone(int source) {
-    atomic_fetch_or(&SP.midi.gone, 1u << source);
+    sp_cmd c = {.type = SP_CMD_MIDI_GONE, .u.midi = {.src = (uint8_t)source}};
+    if (!push_cmd(&c)) atomic_fetch_or(&SP.midi.gone, 1u << source);
     midi_drain_offline();
 }
 

@@ -403,6 +403,29 @@ static void test_table_change(void) {
     collect(e);
     CHECK(voices_on(e, 13) == 0 && voices_on(e, 1) == 0, "no stream: a note-off releases its voice, a note-on plays "
                                                          "nothing");
+
+    /* An input gone with its note-on still queued (unplugged before the next
+     * block): the release goes after the note-on, in queue order, and a
+     * note-on its next port sends after that plays on. */
+    render(e, 256, 256);
+    midi_from(e, 3, 0x90, 38, 100);
+    push(e, (sp_cmd){.type = SP_CMD_MIDI_GONE, .u.midi = {.src = 3}});
+    midi_from(e, 3, 0x90, 67, 100);
+    render(e, 256, 256);
+    bool ordered = voices_on(e, 1) == 0 && voices_on(e, 13) == 1;
+    midi_from(e, 3, 0x80, 67, 0);
+    render(e, 256, 256);
+    ordered = ordered && voices_on(e, 13) == 0;
+    /* The full queue refused the gone, or a note-off (the bit): applied
+     * after what was queued, so a note-on still queued ends too. */
+    midi_from(e, 3, 0x90, 38, 100);
+    while (sp_push(e, &(sp_cmd){.type = SP_CMD_MIDI, .u.midi = {0xE0, 0, 64, 3}})) {
+    }
+    atomic_fetch_or(&e->midi.gone, 1u << 3);
+    render(e, 256, 256);
+    CHECK(ordered && voices_on(e, 1) == 0,
+          "an input gone with its note-on still queued: released after it (in queue order; as the bit with the queue "
+          "full); its next port's note-on after the gone plays");
     set_map(e, NULL);
     render(e, 256, 256);
     free_engine(e);
@@ -1096,13 +1119,16 @@ static void test_follow_two(void) {
     cmd(e, SP_CMD_TEMPO, 90);
     master_init(&a, (double)heard_ns(LAT + BLOCK), 120.0, 1.0);
     master_init(&b, (double)heard_ns(LAT + BLOCK) + 3e6, 75.0, 1.0);
+    /* The other input's time code first: it claims nothing. */
+    transport_from(e, SRC_B, 0xF1, (double)heard_ns(0));
 
     reset_log();
     for (int i = 0; i < 200; i++) two_block(e, &a, &b, SRC_B);
     double shown = last_tempo();
     CHECK(e->midi.follow_src == 0 && fabs(shown - 120.0) < 0.3,
-          "the first to send is followed: input %d, %.2f bpm while stopped (120; the other at 75)", e->midi.follow_src,
-          shown);
+          "the first to send a tick is followed (the other's time code came first): input %d, %.2f bpm while stopped "
+          "(120; the other at 75)",
+          e->midi.follow_src, shown);
 
     transport_from(e, 0, 0xFA, a.next_ns - 1e5);
     int64_t k_a = a.k;

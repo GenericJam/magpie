@@ -515,7 +515,10 @@ passes through the BEAM.
   in a row are losses, the sequencer at the gaps' pace from the second),
   so losses, clusters and dropouts keep the grid; position steered onto
   the fit half a beat ahead; downbeat late by the write-ahead, then on the
-  master's grid. Kotlin: one C parser per output port, under its source's
+  master's grid. One input's clock is followed (`follow_src`: the first
+  to send; another's Start, or song position / Continue while stopped,
+  takes over from a fresh fit; its going away frees it).
+  Kotlin: one C parser per output port, under its source's
   lock; a source gets a new generation when a port takes it, it is given
   back or the port's service is created, made current in C
   (`nativeActivate`) before the port delivers: a fresh parser, and the

@@ -108,9 +108,14 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
     }
 
     // A sender opened or closed the port's input: the next one gets a fresh
-    // parser, and what the last one held ends (renew).
+    // parser, and what the last one held ends (renew). With no sender left the
+    // receiver keeps its old generation, so a closed client's bytes still in
+    // the port's socket are dropped; the next sender's open (before it gets
+    // the port) gives it the new one. The receiver is shared, so one client
+    // of several closing renews it at once (a late message of that client's
+    // would be parsed).
     internal fun portStatus(senders: Int, listeners: Int) {
-        if (senders != portSenders) synchronized(sourceLock) { renew(0) }
+        if (senders != portSenders) synchronized(sourceLock) { renew(0, receiver = senders > 0) }
         portSenders = senders
         portListeners = listeners
         event("port", JSONObject().put("inputs", senders).put("outputs", listeners))
@@ -352,12 +357,12 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
 
     // Under sourceLock: source `i`'s next generation, made current in C (or
     // by attach, if the natives aren't there yet). The port's receiver sends
-    // with it from now on (before C hears: its next sender's first message
-    // isn't dropped).
-    private fun renew(i: Int): Long {
+    // with it from now on unless `receiver` is false (before C hears: its
+    // next sender's first message isn't dropped).
+    private fun renew(i: Int, receiver: Boolean = true): Long {
         val g = ++lastGeneration
         generations[i] = g
-        if (i == 0) portRx?.generation = g
+        if (i == 0 && receiver) portRx?.generation = g
         if (attached) nativeActivate(i, g)
         return g
     }

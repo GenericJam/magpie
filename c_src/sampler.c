@@ -157,6 +157,7 @@ enum {
     SP_CMD_RESET,
     SP_CMD_COUNT_IN,
     SP_CMD_MIDI,
+    SP_CMD_MIDI_GONE,
     SP_CMD_MIDI_MAP,
 };
 
@@ -366,7 +367,7 @@ typedef struct {
         _Atomic uint64_t in_messages;
         _Atomic int64_t follow_bpm_milli; /* 0: no clock to follow yet */
         double bpm_shown;                 /* the followed tempo as reported */
-        _Atomic uint32_t gone;            /* a bit per input gone (any thread): its voices end before the next command */
+        _Atomic uint32_t gone;            /* a bit per input gone whose MIDI_GONE the full queue refused */
     } midi;
 
     /* Counters for info (relaxed). */
@@ -1313,17 +1314,29 @@ static void midi_in_release(sp_engine *e, const sp_cmd *c) {
     else if (kind == 0xB0 && (d1 == 120 || d1 == 123)) midi_release(e, c->u.midi.src, st & 0x0F, -1, d1 == 120);
 }
 
-/* The inputs gone since the last look (midi.gone, set by any thread): the
- * voices they started end as on their note-offs, and a followed clock from
- * one of them is free to be taken by the next input that sends one. */
-static void midi_gone_apply(sp_engine *e) {
-    if (!atomic_load_explicit(&e->midi.gone, memory_order_acquire)) return;
-    uint32_t gone = atomic_exchange_explicit(&e->midi.gone, 0, memory_order_acq_rel);
+/* Input `src` closed (unplugged, its port gone): the voices it started end
+ * as on their note-offs, and a followed clock from it is free to be taken
+ * by the next input that sends one. */
+static void midi_input_gone(sp_engine *e, int src) {
+    midi_release(e, src, -1, -1, false);
+    if (src == e->midi.follow_src) e->midi.follow_src = -1;
+}
+
+/* The inputs gone (midi.gone) whose SP_CMD_MIDI_GONE the full command
+ * queue refused. Taken before a render's or drain's commands and applied
+ * after them: everything an input sent before its bit was set has been
+ * applied by then, so a note-on still queued can't outlive the release
+ * (one sent after it, by the input's next port, may end early). */
+static uint32_t midi_gone_take(sp_engine *e) {
+    if (!atomic_load_explicit(&e->midi.gone, memory_order_relaxed)) return 0;
+    return atomic_exchange_explicit(&e->midi.gone, 0, memory_order_acq_rel);
+}
+
+static void midi_gone_apply(sp_engine *e, uint32_t gone) {
     while (gone) {
         int src = __builtin_ctz(gone);
         gone &= gone - 1;
-        midi_release(e, src, -1, -1, false);
-        if (src == e->midi.follow_src) e->midi.follow_src = -1;
+        midi_input_gone(e, src);
     }
 }
 
@@ -1566,12 +1579,14 @@ static void follow_tick(sp_engine *e, double f) {
 
 /* Clock follow: ticks, Start, Continue (from the song position), Stop, from
  * one input: the last to start its transport (Start; song position or
- * Continue while stopped), else the first to send anything (two masters'
- * ticks merged would be one at twice the tempo). Another input taking over
+ * Continue while stopped), else the first to send a tick or transport
+ * message (two masters' ticks merged would be one at twice the tempo; time
+ * code, Song Select and the like claim nothing). Another input taking over
  * starts from a fresh fit. */
 static void follow_realtime(sp_engine *e, const sp_cmd *c) {
     int src = c->u.midi.src;
     uint8_t st = c->u.midi.status;
+    if (st != 0xF8 && st != 0xFA && st != 0xFB && st != 0xFC && st != 0xF2) return;
     if (src != e->midi.follow_src) {
         bool takes = st == 0xFA || (!e->seq.playing && (st == 0xFB || st == 0xF2));
         if (e->midi.follow_src >= 0 && !takes) return;
@@ -1879,16 +1894,17 @@ static void apply(sp_engine *e, const sp_cmd *c, bool live) {
         else e->click.beats = 0;
         break;
     case SP_CMD_MIDI:
-        /* An input gone before this message arrived ends what it held
-         * first; with no stream (offline) only releases: a note held across
-         * a route change still ends. */
-        midi_gone_apply(e);
+        /* With no stream (offline) only releases: a note held across a
+         * route change still ends. */
         if (live) {
             atomic_fetch_add_explicit(&e->midi.in_messages, 1, memory_order_relaxed);
             midi_in(e, c);
         } else {
             midi_in_release(e, c);
         }
+        break;
+    case SP_CMD_MIDI_GONE:
+        midi_input_gone(e, c->u.midi.src);
         break;
     case SP_CMD_MIDI_MAP:
         set_midi_map(e, c->u.map);
@@ -1916,8 +1932,9 @@ static void sp_render(sp_engine *e, float *out, int frames) {
     e->offline = false;
     e->at = e->frame;
     sp_cmd c;
-    midi_gone_apply(e);
+    uint32_t gone = midi_gone_take(e);
     while (sp_pop_cmd(e, &c)) apply(e, &c, true);
+    midi_gone_apply(e, gone);
 
     sequence(e, frames);
     int cursor = 0;
@@ -1974,8 +1991,9 @@ static void sp_drain(sp_engine *e, bool live) {
     e->offline = true;
     e->at = e->frame;
     sp_cmd c;
-    midi_gone_apply(e);
+    uint32_t gone = midi_gone_take(e);
     while (sp_pop_cmd(e, &c)) apply(e, &c, live);
+    midi_gone_apply(e, gone);
     reclaim(e);
     publish_counts(e);
 }
