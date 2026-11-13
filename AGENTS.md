@@ -510,8 +510,9 @@ passes through the BEAM.
   in a row are losses, the sequencer at the gaps' pace from the second),
   so losses, clusters and dropouts keep the grid; position steered onto
   the fit half a beat ahead; downbeat late by the write-ahead, then on the
-  master's grid. Kotlin: one C parser per output port (each delivers on
-  its own thread), reset when a slot is reused.
+  master's grid. Kotlin: one C parser per output port, under its source's
+  lock; a port that takes a reused source has a higher generation, which
+  resets the parser and drops the closed port's late bytes.
 - **Elixir:** `Magpie.Midi.Map.config/1` / `route/2` (the table and the
   rule), `Engine.set_midi/1` (KitSession pushes it on every kit change),
   `KitSession.set_midi(%{in_channel, clock})`, `Magpie.Midi` (devices:

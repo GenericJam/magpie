@@ -240,9 +240,10 @@ defmodule Magpie.Audio.Fake do
   @doc "The count-in's downbeat: a counting recorder starts recording."
   def downbeat, do: call(:downbeat)
 
-  @doc "Make the next `n` `call` (`:set_pad` or `:unload_sample`) fail with `:busy`, as with a full command queue."
-  def busy(call, n) when call in [:set_pad, :unload_sample] and is_integer(n) and n >= 0,
-    do: call({:busy, call, n})
+  @doc "Make the next `n` `call` (`:set_pad`, `:unload_sample` or `:set_midi`) fail with `:busy`, as with a full command queue."
+  def busy(call, n)
+      when call in [:set_pad, :unload_sample, :set_midi] and is_integer(n) and n >= 0,
+      do: call({:busy, call, n})
 
   @doc "A MIDI message `{status, data1, data2}` arrives (needs the stream and a table)."
   def midi_in({status, d1, d2} = message) when status in 0..255 and d1 in 0..127 and d2 in 0..127,
@@ -466,6 +467,9 @@ defmodule Magpie.Audio.Fake do
     do: {:reply, {:error, :not_owner}, s}
 
   def handle_call(:close, _from, s), do: {:reply, :ok, %{s | open: false}}
+
+  def handle_call({:set_midi, _config}, _from, %{busy: %{set_midi: n}} = s) when n > 0,
+    do: busy_reply(s, :set_midi)
 
   def handle_call({:set_midi, config}, _from, s), do: {:reply, :ok, %{s | midi: config}}
 

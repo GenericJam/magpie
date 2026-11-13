@@ -58,6 +58,19 @@ defmodule Magpie.KitSessionMidiTest do
     assert %{midi: %{in_channel: 10, clock: :follow}} = KitSession.snapshot().kit
   end
 
+  test "a MIDI table the engine refuses (queue full) reaches it once it can" do
+    start_session!(drums())
+    :ok = Fake.busy(:set_midi, 1)
+    :ok = KitSession.set_midi(%{in_channel: 10})
+    assert %{in_channel: :all} = Fake.state().midi
+
+    # No further kit change: the retry alone brings the table.
+    assert Enum.find_value(1..50, fn _ ->
+             Process.sleep(20)
+             match?(%{in_channel: 10}, Fake.state().midi)
+           end)
+  end
+
   test "notes in play the kit's pads through the engine; subscribers see the voices" do
     start_session!(drums())
     :ok = KitSession.set_midi(%{in_channel: 2})

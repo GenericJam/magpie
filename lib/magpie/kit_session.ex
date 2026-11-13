@@ -42,9 +42,9 @@ defmodule Magpie.KitSession do
 
   @wave_bars Style.pad().wave_bars
   @autosave_ms 1_000
-  # A sample the engine couldn't unload yet (its command queue full) is
-  # tried again after this.
-  @unload_retry_ms 200
+  # A sample the engine couldn't unload yet, or a MIDI table it refused
+  # (its command queue full), is tried again after this.
+  @retry_ms 200
 
   defmodule Snapshot do
     @moduledoc """
@@ -279,6 +279,8 @@ defmodule Magpie.KitSession do
 
   def handle_info({:unload, id}, s), do: {:noreply, drop_unused(s, id)}
 
+  def handle_info(:sync_midi, s), do: {:noreply, sync_midi(s)}
+
   # Magpie.RecordScreen's reply: a sample saved for a pad.
   def handle_info({:recorded, index, %Library.Sample{id: id}}, s) when index in 0..63 do
     {result, s} = put_sample_on(s, index, id)
@@ -363,7 +365,7 @@ defmodule Magpie.KitSession do
         s
 
       match?({:ok, _}, s.samples[id]) and Engine.unload_sample(id) == {:error, :busy} ->
-        Process.send_after(self(), {:unload, id}, @unload_retry_ms)
+        Process.send_after(self(), {:unload, id}, @retry_ms)
         s
 
       true ->
@@ -517,7 +519,8 @@ defmodule Magpie.KitSession do
   end
 
   # The engine plays MIDI by the kit's pads and settings: a change to either
-  # gives it the table again. One it refused is tried with the next change.
+  # gives it the table again. One it refused is tried again after a delay,
+  # with the kit's table as it is then. It stops once the engine takes it.
   defp sync_midi(s) do
     config = Magpie.Midi.Map.config(s.kit)
 
@@ -530,6 +533,7 @@ defmodule Magpie.KitSession do
 
       true ->
         Logger.warning("Magpie.KitSession: the engine refused the MIDI table")
+        Process.send_after(self(), :sync_midi, @retry_ms)
         %{s | midi: nil}
     end
   end

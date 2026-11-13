@@ -1585,8 +1585,8 @@ static void deliver_input(ErlNifEnv *env, int64_t now) {
 
 /* Kotlin (plugins/magpie_midi) holds the ports and devices; no MIDI byte
  * passes through the BEAM. In: each receiver hands its bytes and their
- * timestamp to native_in, which parses them (one parser per source, each
- * source on its own thread) and queues one SP_CMD_MIDI per message. Out:
+ * timestamp to native_in, which parses them (one parser per source, under
+ * the source's lock) and queues one SP_CMD_MIDI per message. Out:
  * the renderer stamps messages with engine frames into SP.midi.out; the
  * sending thread turns each frame into CLOCK_MONOTONIC through the output
  * timestamp, sleeps until then and calls MagpieMidi.send with that time.
@@ -1599,13 +1599,21 @@ static void deliver_input(ErlNifEnv *env, int64_t now) {
 #define MIDI_SEND_MAX 256
 #define MIDI_STATS 512
 
+/* A source's parser, fed only by the port with the highest generation seen
+ * on it so far (see native_in). */
+typedef struct {
+    pthread_mutex_t lock;
+    int64_t generation;
+    mi_parser parser;
+} midi_source;
+
 static struct {
     pthread_mutex_t lock; /* the class and its methods once bound, the listener */
     jclass cls;
     jmethodID attach, send, devices, open, close, ble_scan, ble_connect, ble_disconnect;
     ErlNifPid listener;
     bool has_listener;
-    mi_parser parsers[MIDI_SOURCES];
+    midi_source sources[MIDI_SOURCES];
     /* The sending thread: started and joined under E.lock. */
     pthread_t out;
     bool out_started;
@@ -1631,32 +1639,37 @@ static void midi_emit(void *ctx, mi_msg m) {
     push_cmd(&c);
 }
 
-/* MagpieMidi.nativeIn(source, data, offset, count, timestamp): a receiver's
- * thread. A timestamp of 0 (senders that don't stamp) or more than a
- * second off isn't System.nanoTime: the message counts as arriving now. */
-static void JNICALL native_in(JNIEnv *j, jclass cls, jint source, jbyteArray data, jint offset, jint count,
-                              jlong timestamp) {
+/* MagpieMidi.nativeIn(source, generation, data, offset, count, timestamp): a
+ * receiver's thread. Kotlin gives each port that takes a source a higher
+ * generation than the one before it. Under the source's lock, a newer
+ * generation starts a fresh parser (no running status or SysEx left by the
+ * port that had the source before) and an older one's bytes are dropped (a
+ * closed port's thread delivering a last message after its source was taken
+ * again). So two threads never parse on one source at once, and one port's
+ * bytes never land in another's stream. A timestamp of 0 (senders that
+ * don't stamp) or more than a second off isn't System.nanoTime: the message
+ * counts as arriving now. */
+static void JNICALL native_in(JNIEnv *j, jclass cls, jint source, jlong generation, jbyteArray data, jint offset,
+                              jint count, jlong timestamp) {
     (void)cls;
     if (source < 0 || source >= MIDI_SOURCES || count <= 0 || !data) return;
     int64_t now = now_ns();
     midi_ctx ctx = {.t_ns = timestamp > now - 1000000000LL && timestamp < now + 1000000000LL ? timestamp : now};
     uint8_t buf[256];
-    for (jint done = 0; done < count;) {
+    midi_source *s = &MI.sources[source];
+    pthread_mutex_lock(&s->lock);
+    if (generation > s->generation) {
+        s->generation = generation;
+        s->parser = (mi_parser){0};
+    }
+    for (jint done = 0; generation == s->generation && done < count;) {
         jint n = count - done > (jint)sizeof(buf) ? (jint)sizeof(buf) : count - done;
         (*j)->GetByteArrayRegion(j, data, offset + done, n, (jbyte *)buf);
-        if (jni_failed(j)) return;
-        mi_parse(&MI.parsers[source], buf, n, midi_emit, &ctx);
+        if (jni_failed(j)) break;
+        mi_parse(&s->parser, buf, n, midi_emit, &ctx);
         done += n;
     }
-}
-
-/* MagpieMidi.nativeReset(source): a source taken by a newly opened port
- * starts with a fresh parser (no running status or SysEx left by the port
- * that had it before). */
-static void JNICALL native_reset(JNIEnv *j, jclass cls, jint source) {
-    (void)j;
-    (void)cls;
-    if (source >= 0 && source < MIDI_SOURCES) MI.parsers[source] = (mi_parser){0};
+    pthread_mutex_unlock(&s->lock);
 }
 
 /* MagpieMidi.nativeEvent(tag, json): a device event for the listener. */
@@ -1707,9 +1720,8 @@ static bool midi_bind(JNIEnv *j) {
         if (jni_failed(j)) cls = NULL;
         if (cls) {
             JNINativeMethod natives[] = {
-                {"nativeIn", "(I[BIIJ)V", (void *)native_in},
+                {"nativeIn", "(IJ[BIIJ)V", (void *)native_in},
                 {"nativeEvent", "(Ljava/lang/String;[B)V", (void *)native_event},
-                {"nativeReset", "(I)V", (void *)native_reset},
             };
             MI.attach = static_method(j, cls, "attach", "()V");
             MI.send = static_method(j, cls, "send", "([BIJ)V");
@@ -1720,7 +1732,7 @@ static bool midi_bind(JNIEnv *j) {
             MI.ble_connect = static_method(j, cls, "bleConnect", "(Ljava/lang/String;)Ljava/lang/String;");
             MI.ble_disconnect = static_method(j, cls, "bleDisconnect", "(Ljava/lang/String;)V");
             if (MI.attach && MI.send && MI.devices && MI.open && MI.close && MI.ble_scan && MI.ble_connect &&
-                MI.ble_disconnect && (*j)->RegisterNatives(j, cls, natives, 3) == 0 && !jni_failed(j)) {
+                MI.ble_disconnect && (*j)->RegisterNatives(j, cls, natives, 2) == 0 && !jni_failed(j)) {
                 MI.cls = (jclass)(*j)->NewGlobalRef(j, cls);
                 ok = MI.cls != NULL;
             }
@@ -2948,6 +2960,7 @@ static int on_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     pthread_mutex_init(&E.lock, NULL);
     pthread_mutex_init(&IN.lock, NULL);
     pthread_mutex_init(&MI.lock, NULL);
+    for (int i = 0; i < MIDI_SOURCES; i++) pthread_mutex_init(&MI.sources[i].lock, NULL);
     pcm_type = enif_open_resource_type(env, NULL, "magpie_pcm", pcm_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!pcm_type) return 1;
     pthread_mutex_init(&E.ctl, NULL);

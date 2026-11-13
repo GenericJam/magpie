@@ -59,14 +59,14 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
     private const val TAG = "MagpieMidi"
 
     // Registered by magpie_audio.c. `source` picks the C parser (0: the port,
-    // 1..15: an opened device's output ports, one each: every MidiOutputPort
-    // delivers on its own thread), so one source's bytes are never parsed on
-    // two threads at once.
-    @JvmStatic external fun nativeIn(source: Int, data: ByteArray, offset: Int, count: Int, timestamp: Long)
+    // 1..15: an opened device's output ports, one each). Each port that takes
+    // a source gets a higher `generation` than the one before it; C parses
+    // under the source's lock, starts a fresh parser for a newer generation
+    // and drops an older one's bytes (a closed port's thread may still deliver
+    // a last message after its source is taken again).
+    @JvmStatic external fun nativeIn(source: Int, generation: Long, data: ByteArray, offset: Int, count: Int, timestamp: Long)
 
     @JvmStatic external fun nativeEvent(tag: String, json: ByteArray)
-
-    @JvmStatic external fun nativeReset(source: Int)
 
     private const val SOURCES = 16
 
@@ -108,9 +108,9 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
         event("port", JSONObject().put("inputs", senders).put("outputs", listeners))
     }
 
-    internal class Receiver(private val source: Int) : MidiReceiver() {
+    internal class Receiver(val source: Int, private val generation: Long) : MidiReceiver() {
         override fun onSend(msg: ByteArray, offset: Int, count: Int, timestamp: Long) {
-            if (attached && count > 0) nativeIn(source, msg, offset, count, timestamp)
+            if (attached && count > 0) nativeIn(source, generation, msg, offset, count, timestamp)
         }
     }
 
@@ -182,6 +182,7 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
     private val sourceLock = Any()
     private val sourcesUsed = BooleanArray(SOURCES).also { it[0] = true }
     private var lastSource = 0 // under sourceLock
+    private var lastGeneration = 0L // under sourceLock; the Magpie port's receiver has 0
 
     private fun midiManager(): MidiManager? =
         appContext?.getSystemService(Context.MIDI_SERVICE) as? MidiManager
@@ -261,15 +262,15 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
         var outOfSources = false
         for (i in 0 until device.info.outputPortCount) {
             val port = device.openOutputPort(i) ?: continue
-            val source = takeSource()
-            if (source < 0) {
+            val receiver = takeSource()
+            if (receiver == null) {
                 closeQuietly(port)
                 outOfSources = true
                 break
             }
-            port.connect(Receiver(source))
+            port.connect(receiver)
             outputs.add(port)
-            sources.add(source)
+            sources.add(receiver.source)
         }
         if (input == null && outputs.isEmpty()) {
             closeQuietly(device)
@@ -304,17 +305,17 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
         destinations = opened.values.mapNotNull { it.input }.toTypedArray()
     }
 
-    // Round robin from the last one taken, so a slot just given back (its
-    // closed port's thread may still be delivering a last message) is taken
-    // again only when no other is free; its parser starts afresh.
-    private fun takeSource(): Int {
+    // A receiver for the next free source. Round robin from the last one
+    // taken, so a source just given back is taken again only when no other is
+    // free: its closed port's thread may still deliver a last message, which
+    // C drops once the source's new port has delivered (see nativeIn).
+    private fun takeSource(): Receiver? {
         synchronized(sourceLock) {
             val i = (1 until SOURCES).map { (lastSource + it - 1) % (SOURCES - 1) + 1 }.firstOrNull { !sourcesUsed[it] }
-                ?: return -1
+                ?: return null
             sourcesUsed[i] = true
             lastSource = i
-            if (attached) nativeReset(i)
-            return i
+            return Receiver(i, ++lastGeneration)
         }
     }
 
@@ -514,7 +515,7 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
 // one input port and one output port, "Magpie". Android creates it when an
 // app opens a port.
 class MagpieMidiService : MidiDeviceService() {
-    private val receivers: Array<MidiReceiver> = arrayOf(MagpieMidi.Receiver(0))
+    private val receivers: Array<MidiReceiver> = arrayOf(MagpieMidi.Receiver(0, 0))
 
     override fun onCreate() {
         super.onCreate()

@@ -467,10 +467,11 @@ static void test_clock_send(void) {
 #define CLOCK0 1000000000LL
 
 /* The master: ticks at `bpm` from time `t0` (ns), each arriving with a
- * uniform jitter of ±`jit_ms`; ticks drop_lo..drop_hi − 1, and those marked
- * in `lost`, are lost on the way; ticks stall_lo..stall_hi − 1 are held up
- * by a stalled sender and go out together, stamped 50 µs apart from the
- * last one's time. The engine hears frame f at CLOCK0 + f/RATE. */
+ * uniform jitter of ±`jit_ms` and `shift_ms` late; ticks drop_lo..drop_hi
+ * − 1, and those marked in `lost`, are lost on the way; ticks
+ * stall_lo..stall_hi − 1 are held up by a stalled sender and go out
+ * together, stamped 50 µs apart from the last one's time. The engine
+ * hears frame f at CLOCK0 + f/RATE. */
 typedef struct {
     double t0, period_ns, jit_ms;
     int64_t k;          /* the next tick */
@@ -479,6 +480,7 @@ typedef struct {
     double period2_ns;
     int64_t drop_lo, drop_hi, stall_lo, stall_hi;
     bool lost[1 << 14];
+    double shift_ms[1 << 14];
     double nominal[1 << 14]; /* nominal arrival of tick k */
 } master_t;
 
@@ -496,6 +498,7 @@ static void master_init(master_t *m, double t0, double bpm, double jit_ms) {
     m->next_ns = t0;
     m->drop_lo = m->drop_hi = m->stall_lo = m->stall_hi = -1;
     memset(m->lost, 0, sizeof(m->lost));
+    memset(m->shift_ms, 0, sizeof(m->shift_ms));
 }
 
 /* Render one burst; before it, every tick that has arrived by the time the
@@ -509,7 +512,7 @@ static void follow_block(sp_engine *e, master_t *m) {
             for (int64_t j = m->stall_lo; j < m->stall_hi; j++)
                 midi(e, 0xF8, 0, 0, (int64_t)(m->next_ns + 5e4 * (double)(j - m->stall_lo)));
         else if (!stalled && (m->k < m->drop_lo || m->k >= m->drop_hi) && !(m->k < (1 << 14) && m->lost[m->k]))
-            midi(e, 0xF8, 0, 0, (int64_t)(m->next_ns + m->jit_ms * 1e6 * unit()));
+            midi(e, 0xF8, 0, 0, (int64_t)(m->next_ns + (m->shift_ms[m->k] + m->jit_ms * unit()) * 1e6));
         m->k++;
         m->next_ns += m->next_ns >= m->change_ns ? m->period2_ns : m->period_ns;
     }
@@ -828,18 +831,24 @@ static void test_follow_loss(void) {
         int run_at, run;                 /* ticks run_at .. run_at + run − 1 lost */
         int at[4];                       /* and these (0: none) */
         int stall_at, stall;             /* ticks stall_at .. + stall − 1 go out together */
+        int shift_at;                    /* ticks shift_at, shift_at + 1 stamped shift ms late */
+        double shift[2];
     } cases[] = {
-        {"two ticks lost two apart (gaps of 2, 2, then 1 tick)", 120, 0, 1, 4, 0, 0, {5, 7}, 0, 0},
-        {"four lost, every other tick", 120, 0, 1, 4, 0, 0, {5, 7, 9, 11}, 0, 0},
-        {"a 1 s dropout, then a tick lost 4 ticks after it", 120, 0, 1, 4, 5, 48, {57}, 0, 0},
-        {"120 → 130 bpm, a tick lost 3 ticks after the change", 120, 130, 1, 4, 0, 0, {3}, 0, 0},
-        {"120 → 130 bpm, a tick lost 8 ticks after the change", 120, 130, 1, 4, 0, 0, {8}, 0, 0},
-        {"jitter ±2 ms: a tick lost", 120, 0, 2, 4, 0, 0, {5}, 0, 0},
-        {"jitter ±2 ms: a 1 s dropout, then a tick lost 4 ticks after it", 120, 0, 2, 4, 5, 48, {57}, 0, 0},
-        {"150 → 45 bpm (gaps of 3.3 ticks)", 150, 45, 1, 5, 0, 0, {0}, 0, 0},
-        {"150 → 40 bpm (gaps of 3.75 ticks)", 150, 40, 1, 5, 0, 0, {0}, 0, 0},
-        {"a sender stalled a tick (gaps of 2, then 0 ticks)", 120, 0, 1, 4, 0, 0, {0}, 5, 2},
-        {"a sender stalled 3 ticks, twice, then a tick lost", 120, 0, 1, 4, 0, 0, {30}, 5, 4},
+        {"two ticks lost two apart (gaps of 2, 2, then 1 tick)", 120, 0, 1, 4, 0, 0, {5, 7}, 0, 0, 0, {0}},
+        {"four lost, every other tick", 120, 0, 1, 4, 0, 0, {5, 7, 9, 11}, 0, 0, 0, {0}},
+        {"a 1 s dropout, then a tick lost 4 ticks after it", 120, 0, 1, 4, 5, 48, {57}, 0, 0, 0, {0}},
+        {"120 → 130 bpm, a tick lost 3 ticks after the change", 120, 130, 1, 4, 0, 0, {3}, 0, 0, 0, {0}},
+        {"120 → 130 bpm, a tick lost 8 ticks after the change", 120, 130, 1, 4, 0, 0, {8}, 0, 0, 0, {0}},
+        {"jitter ±2 ms: a tick lost", 120, 0, 2, 4, 0, 0, {5}, 0, 0, 0, {0}},
+        {"jitter ±2 ms: a 1 s dropout, then a tick lost 4 ticks after it", 120, 0, 2, 4, 5, 48, {57}, 0, 0, 0, {0}},
+        {"150 → 45 bpm (gaps of 3.3 ticks)", 150, 45, 1, 5, 0, 0, {0}, 0, 0, 0, {0}},
+        {"150 → 40 bpm (gaps of 3.75 ticks)", 150, 40, 1, 5, 0, 0, {0}, 0, 0, 0, {0}},
+        {"a sender stalled a tick (gaps of 2, then 0 ticks)", 120, 0, 1, 4, 0, 0, {0}, 5, 2, 0, {0}},
+        {"a sender stalled 3 ticks, twice, then a tick lost", 120, 0, 1, 4, 0, 0, {30}, 5, 4, 0, {0}},
+        {"240 bpm, a tick lost, the next two 2.7 ms early, then late (gaps of 1.5 ticks)", 240, 0, 0, 4, 0, 0, {5}, 0,
+         0, 6, {-2.7, 2.7}},
+        {"240 bpm, a tick lost, the next two 2.7 ms late, then early (gaps of 0.5 ticks)", 240, 0, 0, 4, 0, 0, {5}, 0,
+         0, 6, {2.7, -2.7}},
     };
     for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
         e = follow_run(&m, cases[ci].bpm, &k_start);
@@ -853,6 +862,8 @@ static void test_follow_loss(void) {
         for (int i = 0; i < cases[ci].run; i++) m.lost[base + cases[ci].run_at + i] = true;
         for (int i = 0; i < 4; i++)
             if (cases[ci].at[i] > 0) m.lost[base + cases[ci].at[i]] = true;
+        if (cases[ci].shift_at > 0)
+            for (int i = 0; i < 2; i++) m.shift_ms[base + cases[ci].shift_at + i] = cases[ci].shift[i];
         if (cases[ci].stall > 0) {
             m.stall_lo = base + cases[ci].stall_at;
             m.stall_hi = m.stall_lo + cases[ci].stall;
