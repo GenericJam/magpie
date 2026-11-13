@@ -1267,6 +1267,77 @@ static void test_follow_silent(void) {
         free_engine(e);
     }
 
+    /* A stalled sender just after a restart at the same tempo (ticks 2..5
+     * after Start held up, sent 50 µs apart): a burst, not ticks for the
+     * new line, so the sequencer doesn't race and the count holds. */
+    {
+        static master_t r;
+        rng = 1;
+        sp_engine *e = new_engine();
+        sp_set_clock(e, 0, CLOCK0);
+        set_map(e, map_new(0, 1, SP_CLOCK_FOLLOW));
+        master_init(&r, (double)heard_ns(LAT + BLOCK), 120.0, 1.0);
+        midi(e, 0xFA, 0, 0, (int64_t)r.next_ns - 100000);
+        for (int i = 0; i < 600; i++) follow_block(e, &r);
+        midi(e, 0xFC, 0, 0, (int64_t)r.next_ns - 1000000);
+        r.next_ns = INFINITY;
+        for (int i = 0; i < 200; i++) follow_block(e, &r);
+        int64_t k0 = r.k;
+        r.next_ns = (double)heard_ns(e->frame - LAT) + 7.3e6;
+        r.stall_lo = k0 + 2;
+        r.stall_hi = k0 + 6;
+        midi(e, 0xFA, 0, 0, (int64_t)r.next_ns - 100000);
+        reset_log();
+        for (int i = 0; i < 200; i++) follow_block(e, &r);
+        int first = playheads();
+        reset_log();
+        for (int i = 0; i < 1400; i++) follow_block(e, &r);
+        int n;
+        double worst = worst_from(&r, k0 + 6 * first, r.nominal[k0] + 5e9, &n);
+        CHECK(first <= 10 && e->midi.ticks == r.k - k0 && n >= 20 && worst < 1.0,
+              "a sender stalled for 4 ticks just after a restart: %d steps in the first second (8), ticks %lld / %lld, "
+              "worst %.3f ms over %d steps",
+              first, (long long)e->midi.ticks, (long long)(r.k - k0), worst, n);
+        free_engine(e);
+    }
+
+    /* A stalled sender draining its backlog one packet every 7.5 ms (a
+     * Bluetooth connection interval): the ticks come back to the line from
+     * behind, so their alike gaps aren't a faster tempo. */
+    {
+        static master_t r;
+        rng = 7919u + 7;
+        int64_t k_start;
+        sp_engine *e = follow_run(&r, 60.0, &k_start);
+        r.stall_lo = r.k + 5;
+        r.stall_hi = r.stall_lo + 7;
+        double prev = 0;
+        for (int i = 0; i < 1600; i++) {
+            double now = (double)heard_ns(e->frame - LAT);
+            while (r.next_ns <= now) {
+                r.nominal[r.k] = r.next_ns;
+                if (r.k == r.stall_hi - 1) {
+                    double s = r.next_ns;
+                    for (int64_t j = r.stall_lo; j < r.stall_hi; j++, s += 7.5e6) midi(e, 0xF8, 0, 0, (int64_t)(prev = s));
+                } else if (r.k < r.stall_lo || r.k >= r.stall_hi) {
+                    double s = r.next_ns + r.jit_ms * unit() * 1e6;
+                    if (r.k >= r.stall_hi) s = fmax(s, prev + 7.5e6);
+                    midi(e, 0xF8, 0, 0, (int64_t)(prev = s));
+                }
+                r.k++;
+                r.next_ns += r.period_ns;
+            }
+            sp_render(e, scratch, BLOCK);
+            collect(e);
+        }
+        int n;
+        double worst = worst_from(&r, k_start, r.nominal[r.stall_hi] + 4e9, &n);
+        CHECK(e->midi.ticks == r.k && n > 5 && worst < 1.0,
+              "60 bpm, a 7-tick stall drained 7.5 ms apart: ticks %lld / %lld, worst %.3f ms over %d steps",
+              (long long)e->midi.ticks, (long long)r.k, worst, n);
+        free_engine(e);
+    }
+
     /* A clock running on while stopped, 6 ticks lost just before Start (a
      * dropout: taken as silence) and tick 2 after it: renumbered. */
     static master_t m;

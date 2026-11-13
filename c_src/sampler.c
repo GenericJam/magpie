@@ -1486,11 +1486,11 @@ static void follow_settle(sp_engine *e, bool lost, int refit) {
  *   From the second, the sequencer goes at the gaps' pace meanwhile, so a
  *   halved tempo doesn't leave it far ahead (lost ticks: it catches up).
  * - less than half a tick after the last (a burst: a stalled sender
- *   catching up): they were late; counted, left out of the fit. Judged so
- *   only by a fit of 6 ticks or more (not the last tempo alone: a restart
- *   at more than twice it would be all bursts). Three in a row with alike
- *   gaps, well apart (a stalled sender's go out together), are a tempo
- *   more than doubled: the fit restarts from the last of them.
+ *   catching up): they were late; counted, left out of the fit. Three in a
+ *   row with alike gaps, well apart (a stalled sender's go out together)
+ *   and ahead of an established line (a stall's catch-up only comes back
+ *   to it from behind), are a tempo more than doubled: the fit restarts
+ *   from the last of them.
  * - anything else: after 2–3 tick gaps a tempo change (counted, the fit
  *   restarts); after a long gap the master played on at some new tempo
  *   (numbered by the time at the old one, the fit restarts).
@@ -1553,8 +1553,10 @@ static void follow_tick(sp_engine *e, double f) {
             on = true;
         }
         bool small = !big && on;
-        burst = raw < 0.5 * P && !next && fit && e->midi.fit.n >= 6;
-        double apart = fmax(0.15 * P, 2.0 * e->rate / 1000.0);
+        burst = raw < 0.5 * P && !next;
+        bool ahead = fit && e->midi.fit.n >= 6 &&
+                     f < fc + P * ((double)(e->midi.ticks + 1 + follow_pending(e)) - kc) - tol;
+        double apart = ahead ? fmax(0.15 * P, 2.0 * e->rate / 1000.0) : INFINITY;
         if (burst && raw > apart && e->midi.bursts > 0 && fabs(raw - e->midi.burst_gap) <= 0.5 * raw)
             e->midi.bursts++;
         else
