@@ -57,6 +57,28 @@ offers, and no PCM leaves it. AudioPlaybackCapture exists only as a Java
   AIFF on Android; `Magpie.Import` falls back to `Magpie.Aiff` (AIFF and
   AIFC: integer PCM, `sowt`, `fl32`, `fl64`) and decodes the result as a
   float WAV, so peaks still come from the engine.
+- **Every input and every take has an id, and every message carries
+  it.** `input_open` answers `{ok, Input}` (the same number Kotlin's calls
+  carry as their session), `record_start` `{ok, Take}` (the recorder's
+  arm generation); `:input`, `:meter`, `:record` and `:count_in`
+  messages name theirs. A message can still be in a mailbox when the
+  input closes or the next take starts (the event thread, the Kotlin
+  callbacks and the Engine all run apart), so the Engine forwards only
+  the current input's and take's, and the screen matches the ids it was
+  given. The count-in's start time goes to the recorder tagged with its
+  take too (`rc_start_at`), so a late one never starts the next take.
+- **Producers write through the input's gate.** The mic callback and
+  Kotlin's read thread call the recorder only between `rc_enter(id)` and
+  `rc_leave`, which admits the open input alone; closing shuts the gate
+  and waits out a producer inside before anything else. A mic stream that
+  wouldn't stop, or a capture thread that outlived its one-second join,
+  can then never write into the next input's recorder.
+- **A close that fails is the Engine's to finish.** A mic stream that
+  won't stop (`input_stuck`) is closed to everyone but still allocated;
+  the Engine keeps it as `:closing` and closes it again on its own (1 s,
+  doubling to 30 s), whichever path failed (a screen leaving, the
+  system's `:closed`, the opener exiting, the next open). A failed open
+  leaves no input: the old one was closed first, on both sides.
 
 ## Consequences
 
@@ -71,3 +93,18 @@ offers, and no PCM leaves it. AudioPlaybackCapture exists only as a Java
   calls and DRM-protected audio record silence (the meter says so).
 - The event thread (started with the output) sends the meters: with no
   output stream there are no meters either.
+- Which apps record (moto g power 2021, Android 11): an `AudioTrack`
+  player on the normal mixer path (a throwaway app, `USAGE_MEDIA`, 997 Hz
+  at amplitude 0.5) arrives exactly (997.0 Hz, −6.02 dBFS peak, all of
+  the energy in the tone, whatever the speaker volume: the capture is
+  pre-volume); Chrome arrives too once it is really playing (1499 Hz
+  through its AAudio player on the deep-buffer mixer). Chrome looked like
+  a failure at first: a URL sent to it by intent is held paused by its
+  autoplay policy while its AAudio stream runs silent for ~10 s, and
+  `dumpsys audio` lists that stream as `started`. The screen needs no
+  notice for it: a silent source shows −∞ dB on the meter. Magpie's own
+  output records as silence. Not tried: apps that opt out of capture,
+  calls, DRM (silent by the platform's rules).
+- Sound from other apps starts about 200–240 ms after `:started` (the
+  remote submix comes up): a take started at once begins with that much
+  silence.

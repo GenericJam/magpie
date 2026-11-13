@@ -354,7 +354,10 @@ On the moto g power 2021 (Android 11), `scripts/engine_check.exs`:
   mob.connect --no-iex --android-only --device <serial>`, then
   `SERIAL=<serial> mix run --no-start scripts/engine_check.exs` (needs
   ffmpeg; turn the volume down); recording: `scripts/record_check.exs`
-  (grant RECORD_AUDIO first; `OTHER_APPS=1` also records Chrome).
+  (grant RECORD_AUDIO first; media volume 12 of 15 on the moto 2021 for
+  the "when sound starts" click; `OTHER_APPS=1` also records Chrome
+  playing a tone, measured, and Magpie's own sequencer, which must be
+  silence).
 
 ## Recording
 
@@ -419,8 +422,9 @@ starts the take on the frame captured when its downbeat is heard.
 - **Playback while recording:** sequencer at 120 bpm, 5 s without and 5 s
   with the mic recording: 0 underruns both, output callback mean 33.6 →
   37.1 µs, max 206 → 330 µs (of 5 ms), CPU 0.74 → 0.82 %, nothing
-  dropped. The take: 240 000 frames for 5.00 s, the clicks 24 000 frames
-  apart within ±110 frames (acoustic onset detection through the speaker).
+  dropped (after the round-3 fixes: 35.8 → 37.7 µs, 0 underruns). The
+  take: 240 000 frames for 5.00 s, the clicks 24 000 frames apart within
+  ±13 frames at volume 12 (±110 at volume 6).
 - **Meters:** 25 a second, 39–43 ms apart.
 - **Count-in (playing, 120 bpm, speaker → mic):** the click on the downbeat
   lands 2040–2050 frames (42.5–42.7 ms) into the take in every run, the
@@ -438,13 +442,21 @@ starts the take on the frame captured when its downbeat is heard.
 - **Import:** wav and mp3 through MediaCodec; AIFF → `:unsupported` from
   MediaCodec, imported through `Magpie.Aiff` (88 200 frames × 2, 44.1 kHz).
 - **Other apps:** the consent dialog ("Start now", tapped over adb), the
-  `mediaProjection` service and the playback-capture `AudioRecord` all
-  start (`:started`, 48 kHz stereo; the system registers the
-  remote-submix mix), and PCM arrives at the real rate (480 000 frames in
-  10 s). But Chrome playing a tone (its own AAudio player, usage MEDIA,
-  capture policy unset) came through as digital silence in three tries,
-  playing in front and behind. Not yet explained; a player on the plain
-  AudioTrack/mixer path (a music app, YouTube) is the next thing to try.
+  `mediaProjection` service and the playback-capture `AudioRecord` start
+  (`:started`, 48 kHz stereo); sound arrives about 200–240 ms after
+  `:started` (the first 5–6 meters are silent). What it captures is the
+  mix before the device volume:
+  - a throwaway `AudioTrack` app (`USAGE_MEDIA`, stream mode, deep
+    buffer, 997 Hz at amplitude 0.5): 997.0 Hz, peak −6.02 dBFS, RMS
+    −9.03 dBFS, 100 % of the energy, L = R, with the speaker at 12 of 15;
+  - Chrome (an AAudio player on the deep-buffer mixer thread, usage MEDIA,
+    no capture flags) playing a 1499 Hz mp3 at −6 dBFS: 1499.00 Hz, peak
+    −9.30 dBFS (Chrome's own gain), 100 % of the energy. The earlier
+    "silence" was Chrome not playing: a media URL sent to Chrome by
+    intent is held at 0:00 by its autoplay policy, yet Chrome opens an
+    AAudio stream (a `started` player in `dumpsys audio`) and feeds it
+    silence for ~10 s. A tap or `KEYCODE_MEDIA_PLAY` starts it;
+  - Magpie's own sequencer: digital silence (its UID is excluded).
 
 ## Rules for Mob screens here (from Choir Coach and Humdinger)
 

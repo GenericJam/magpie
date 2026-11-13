@@ -11,10 +11,13 @@
 #   adb -s <serial> shell pm grant com.genericjam.magpie android.permission.RECORD_AUDIO
 #   SERIAL=<serial> mix run --no-start scripts/record_check.exs
 #
-# The phone's speaker plays clicks the mic records (volume about half, no
-# headphones, a quiet room). Needs ffmpeg on the Mac. With OTHER_APPS=1 it
-# also serves a tone over `adb reverse`, opens it in Chrome, answers the
-# capture consent dialog with a tap, and records what Chrome plays.
+# The phone's speaker plays clicks the mic records (no headphones, a quiet
+# room; volume 12 of 15 on the moto g power 2021, so a pad click clears
+# "when sound starts"'s 12 dB over the room). Needs ffmpeg on the Mac.
+# With OTHER_APPS=1 it also serves a 1499 Hz tone over `adb reverse`,
+# opens it in Chrome and starts it with a media key, answers the capture
+# consent dialog with a tap, records what Chrome plays (RMS, frequency),
+# then records again while Magpie's own sequencer plays (excluded: silence).
 
 serial = System.fetch_env!("SERIAL")
 app = "com.genericjam.magpie"
@@ -199,11 +202,13 @@ defmodule MagpieRecordCheck do
     Process.sleep(1500)
     waiting = Engine.info().input.recorder
     Engine.trigger(0, 127)
-    started = await(&match?({:magpie_audio, :record, ^take, :started, _}, &1), 5000)
-    Process.sleep(1000)
-    {:ok, rec} = Engine.stop_recording()
+    heard = collect(1500)
+    started = Enum.find_value(heard, :timeout, fn {_, {:magpie_audio, :record, ^take, :started, _} = m} -> m; _ -> nil end)
+    click_db = heard |> Enum.flat_map(fn {_, {:magpie_audio, :meter, _, db, _}} -> [db]; _ -> [] end) |> Enum.max(fn -> nil end)
+    rec = case Engine.stop_recording() do {:ok, rec} -> rec; error -> error end
     close()
-    %{ambient_max: Enum.max(ambient, fn -> nil end), threshold: threshold, waiting: waiting, started: started, rec: rec}
+    %{ambient_max: Enum.max(ambient, fn -> nil end), threshold: threshold, waiting: waiting, started: started,
+      click_db: click_db, rec: rec}
   end
 
   def full do
@@ -226,11 +231,14 @@ defmodule MagpieRecordCheck do
     %{loaded: Map.drop(loaded, [:peaks]), voice: voice}
   end
 
-  def apps(seconds) do
+  # Other apps for `seconds`; with `play?`, Magpie's own sequencer plays meanwhile.
+  def apps(seconds, play?) do
     info = open(:apps)
     meters = collect(1000)
     {:ok, _take} = Engine.record(mode: :now, max_seconds: 30)
+    if play?, do: :ok = Engine.play()
     Process.sleep(seconds * 1000)
+    if play?, do: :ok = Engine.stop()
     {:ok, rec} = Engine.stop_recording()
     close()
     %{info: info, meters: meters, rec: rec}
@@ -340,13 +348,24 @@ IO.puts(
 
 IO.puts("\n== When sound starts (a click 1.5 s after arming, 150 ms pre-roll)")
 s = rpc.(MagpieRecordCheck, :on_sound, [nil])
-lv = levels.(s.rec)
-{at, peak} = onsets.(lv, div(rate, 20))
 
 IO.puts(
-  "  ambient max #{fmt.(s.ambient_max)} dBFS, threshold #{fmt.(s.threshold)} dBFS, recorder #{s.waiting} while quiet; started #{inspect(s.started)}; " <>
-    "the click's onset in the take at frame #{inspect(List.first(at))} (#{if at != [], do: fmt.(hd(at) * 1000 / rate), else: "-"} ms), peak #{fmt.(db.(peak))} dBFS"
+  "  ambient max #{fmt.(s.ambient_max)} dBFS, threshold #{fmt.(s.threshold)} dBFS, recorder #{s.waiting} while quiet; " <>
+    "the click metered at #{fmt.(s.click_db)} dBFS; started #{inspect(s.started)}"
 )
+
+case s.rec do
+  %{pcm: _} = rec ->
+    {at, peak} = onsets.(levels.(rec), div(rate, 20))
+
+    IO.puts(
+      "  the click's onset in the take at frame #{inspect(List.first(at))} " <>
+        "(#{if at != [], do: fmt.(hd(at) * 1000 / rate), else: "-"} ms), peak #{fmt.(db.(peak))} dBFS"
+    )
+
+  error ->
+    IO.puts("  FAIL: no take (#{inspect(error)})")
+end
 
 IO.puts("\n== The length limit (2 s)")
 f = rpc.(MagpieRecordCheck, :full, [])
@@ -359,50 +378,106 @@ for name <- ~w(chord.wav chord.mp3 chord.aiff) do
 end
 
 if System.get_env("OTHER_APPS") == "1" do
-  IO.puts("\n== Other apps (Chrome playing a 440 Hz tone)")
-  ffmpeg.(~w(-f lavfi -i sine=frequency=440:duration=30:sample_rate=48000 -af volume=0.5 -c:a libmp3lame -b:a 128k #{tmp}/tone.mp3))
+  IO.puts("\n== Other apps: Chrome playing a 1499 Hz tone (-6 dBFS), then Magpie's own sequencer")
+  ffmpeg.(~w(-f lavfi -i sine=frequency=1499:duration=60:sample_rate=48000 -af volume=4 -ac 2 -c:a libmp3lame -b:a 192k #{tmp}/tone.mp3))
   port = 8765
-  server = Port.open({:spawn_executable, System.find_executable("python3")}, [:binary, args: ["-m", "http.server", "#{port}", "--directory", tmp]])
+  server = Port.open({:spawn_executable, System.find_executable("python3")}, [:binary, args: ["-m", "http.server", "#{port}", "--bind", "127.0.0.1", "--directory", tmp]])
   adb.(["reverse", "tcp:#{port}", "tcp:#{port}"])
   Process.sleep(500)
-  adb.(["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", "http://127.0.0.1:#{port}/tone.mp3", "com.android.chrome"])
-  Process.sleep(4000)
-  adb.(["shell", "am", "start", "-n", "#{app}/.MainActivity"])
-  Process.sleep(1500)
-  task = Task.async(fn -> rpc.(MagpieRecordCheck, :apps, [3]) end)
 
-  # The consent dialog: tap "Start now".
-  tap =
-    Enum.find_value(1..20, fn _ ->
-      Process.sleep(500)
-      adb.(["shell", "uiautomator", "dump", "/sdcard/rc_ui.xml"])
-      xml = adb.(["shell", "cat", "/sdcard/rc_ui.xml"])
+  [_, chrome_uid] = Regex.run(~r/uid:(\d+)/, adb.(["shell", "pm", "list", "packages", "-U", "com.android.chrome"]))
+  chrome_playing = fn -> adb.(["shell", "dumpsys", "audio"]) =~ ~r"u/pid:#{chrome_uid}/\d+ state:started" end
 
-      case Regex.run(~r/text="Start now"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/i, xml) do
-        [_, x1, y1, x2, y2] ->
-          [x1, y1, x2, y2] = Enum.map([x1, y1, x2, y2], &String.to_integer/1)
-          adb.(["shell", "input", "tap", "#{div(x1 + x2, 2)}", "#{div(y1 + y2, 2)}"])
-          {div(x1 + x2, 2), div(y1 + y2, 2)}
+  # The same tab every run (the application id); Chrome blocks autoplay
+  # for a URL it is sent, so a media key starts it.
+  adb.(["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", "http://127.0.0.1:#{port}/tone.mp3",
+        "--es", "com.android.browser.application_id", "magpie_record_check", "com.android.chrome"])
+  Process.sleep(3000)
+  adb.(["shell", "input", "keyevent", "KEYCODE_MEDIA_PLAY"])
+  Process.sleep(1000)
+  IO.puts("  Chrome's player started: #{chrome_playing.()}")
 
-        _ ->
-          nil
+  # Magpie in front, the input opened, the consent dialog's "Start now" tapped.
+  capture = fn seconds, play? ->
+    adb.(["shell", "am", "start", "-n", "#{app}/.MainActivity"])
+    Process.sleep(1500)
+    task = Task.async(fn -> rpc.(MagpieRecordCheck, :apps, [seconds, play?]) end)
+
+    tap =
+      Enum.find_value(1..20, fn _ ->
+        Process.sleep(500)
+        adb.(["shell", "uiautomator", "dump", "/sdcard/rc_ui.xml"])
+        xml = adb.(["shell", "cat", "/sdcard/rc_ui.xml"])
+
+        case Regex.run(~r/text="Start now"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/i, xml) do
+          [_, x1, y1, x2, y2] ->
+            [x1, y1, x2, y2] = Enum.map([x1, y1, x2, y2], &String.to_integer/1)
+            adb.(["shell", "input", "tap", "#{div(x1 + x2, 2)}", "#{div(y1 + y2, 2)}"])
+            {div(x1 + x2, 2), div(y1 + y2, 2)}
+
+          _ ->
+            nil
+        end
+      end)
+
+    IO.puts("  consent: #{if tap, do: "tapped Start now at #{inspect(tap)}", else: "dialog not found"}")
+    Task.await(task, 120_000)
+  end
+
+  # The take's left channel: RMS, the strongest frequency near the
+  # zero-crossing estimate (Goertzel, 1 Hz then 0.05 Hz steps over the
+  # middle second), its level and share of the energy; L against R.
+  tone = fn rec ->
+    size = 4 * rec.channels
+    frames = for <<f::binary-size(^size) <- rec.pcm>>, do: for(<<x::float-32-little <- f>>, do: x)
+    left = Enum.map(frames, &hd/1)
+    lr = frames |> Enum.map(fn [l | rest] -> abs(l - List.first(rest, l)) end) |> Enum.max(fn -> 0.0 end)
+    n = length(left)
+    rms = :math.sqrt(Enum.reduce(left, 0.0, &(&1 * &1 + &2)) / max(n, 1))
+    win = left |> Enum.drop(max(div(n - rec.rate, 2), 0)) |> Enum.take(rec.rate)
+    m = max(length(win), 1)
+    energy = Enum.reduce(win, 0.0, &(&1 * &1 + &2)) / m
+    guess = (win |> Enum.chunk_every(2, 1, :discard) |> Enum.count(fn [x, y] -> x < 0 and y >= 0 end)) * rec.rate / m
+
+    amp = fn f ->
+      c = 2 * :math.cos(2 * :math.pi() * f / rec.rate)
+      {s1, s2} = Enum.reduce(win, {0.0, 0.0}, fn x, {s1, s2} -> {x + c * s1 - s2, s1} end)
+      2 * :math.sqrt(max(s1 * s1 + s2 * s2 - c * s1 * s2, 0.0)) / m
+    end
+
+    {hz, a} =
+      if rms > 1.0e-6 and guess > 25 do
+        coarse = Enum.max_by(for(k <- -20..20, do: guess + k), amp)
+        fine = Enum.max_by(for(k <- -20..20, do: coarse + k * 0.05), amp)
+        {fine, amp.(fine)}
+      else
+        {nil, 0.0}
       end
-    end)
 
-  IO.puts("  consent: #{if tap, do: "tapped Start now at #{inspect(tap)}", else: "dialog not found"}")
-  a = Task.await(task, 120_000)
-  lv = levels.(a.rec)
-  peak = Enum.max(Tuple.to_list(lv), fn -> 0.0 end)
-  left = for <<x::float-32-little, _::float-32-little <- a.rec.pcm>>, do: x
-  crossings = left |> Enum.chunk_every(2, 1, :discard) |> Enum.count(fn [x, y] -> x < 0 and y >= 0 end)
-  hz = crossings * a.rec.rate / max(a.rec.frames, 1)
-  levels_db = for {_, {:magpie_audio, :meter, d, _}} <- a.meters, do: Float.round(d, 1)
+    %{peak: Enum.max(Enum.map(left, &abs/1), fn -> 0.0 end), rms: rms, hz: hz, tone_rms: a / :math.sqrt(2),
+      share: if(energy > 0, do: a * a / 2 / energy, else: 0.0), lr: lr}
+  end
 
-  IO.puts(
-    "  #{inspect(a.info)}; meters #{inspect(Enum.take(levels_db, 8))}; take #{a.rec.frames} frames × #{a.rec.channels}, " <>
-      "peak #{fmt.(db.(peak))} dBFS, ≈ #{fmt.(hz * 1.0)} Hz"
-  )
+  report = fn label, a ->
+    t = tone.(a.rec)
+    meters = for {_, {:magpie_audio, :meter, _, d, _}} <- a.meters, do: Float.round(d, 1)
+    silent = meters |> Enum.take_while(&(&1 <= -119.0)) |> length()
+
+    IO.puts(
+      "  #{label}: #{inspect(a.info)}; the first #{silent} of #{length(meters)} meters after :started silent; take #{a.rec.frames} frames × #{a.rec.channels}, " <>
+        "peak #{fmt.(db.(t.peak))} dBFS, RMS #{fmt.(db.(t.rms))} dBFS; " <>
+        if(t.hz, do: "#{fmt.(t.hz)} Hz at #{fmt.(db.(t.tone_rms))} dBFS RMS, #{fmt.(100 * t.share)} % of the energy", else: "no tone") <>
+        "; max |L − R| #{fmt.(t.lr)}"
+    )
+  end
+
+  report.("Chrome", capture.(4, false))
+  adb.(["shell", "input", "keyevent", "KEYCODE_MEDIA_PAUSE"])
+  Process.sleep(1000)
+  report.("Magpie's sequencer (its own UID is excluded)", capture.(4, true))
 
   adb.(["reverse", "--remove", "tcp:#{port}"])
+  {:os_pid, server_pid} = Port.info(server, :os_pid)
   Port.close(server)
+  System.cmd("kill", ["#{server_pid}"])
 end
