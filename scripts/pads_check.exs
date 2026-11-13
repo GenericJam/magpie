@@ -83,20 +83,29 @@ probe = """
 defmodule MagpiePadsCheck.Probe do
   alias Magpie.{KitSession, Library}
 
-  # n short decaying tones on bank A's pads 0..n-1, one-shot.
+  # n short decaying tones on bank A's pads 0..n-1, one-shot. Returns what
+  # cleanup/1 needs: the pads there before, and the sounds new to the library.
   def setup(n) do
-    for i <- 0..(n - 1) do
-      freq = 500 + 170 * i
-      pcm =
-        for f <- 0..5759, into: <<>> do
-          v = 0.5 * :math.sin(2 * :math.pi() * freq * f / 48000) * :math.exp(-f / 1200)
-          <<v::float-32-little>>
-        end
+    before = KitSession.snapshot().kit
+    originals = for i <- 0..(n - 1), do: {i, get_in(before.banks, ["A", i])}
 
-      {:ok, s} = Library.put_pcm(pcm, %{name: "CHECK \#{i + 1}", rate: 48000, channels: 1, source: :imported})
-      :ok = KitSession.put_sample(i, s.id)
-      s.id
-    end
+    new =
+      for i <- 0..(n - 1) do
+        freq = 500 + 170 * i
+        pcm =
+          for f <- 0..5759, into: <<>> do
+            v = 0.5 * :math.sin(2 * :math.pi() * freq * f / 48000) * :math.exp(-f / 1200)
+            <<v::float-32-little>>
+          end
+
+        id = :sha256 |> :crypto.hash(pcm) |> Base.encode16(case: :lower)
+        known = Library.get(id) != nil
+        {:ok, s} = Library.put_pcm(pcm, %{name: "CHECK \#{i + 1}", rate: 48000, channels: 1, source: :imported})
+        :ok = KitSession.put_sample(i, s.id)
+        if known, do: nil, else: s.id
+      end
+
+    {originals, Enum.reject(new, &is_nil/1)}
   end
 
   def ready?(n) do
@@ -104,10 +113,11 @@ defmodule MagpiePadsCheck.Probe do
     Enum.all?(0..(n - 1), &match?(%{status: :ready}, pads[&1]))
   end
 
-  def cleanup(ids) do
-    for i <- 0..(length(ids) - 1), do: :ok = KitSession.clear_pad(i)
+  # The pads as they were, and only the sounds this check added deleted.
+  def cleanup({originals, new_ids}) do
+    for {i, pad} <- originals, do: :ok = KitSession.update_pad(i, fn _ -> pad end)
     :ok = KitSession.flush()
-    Enum.map(ids, &Library.delete/1)
+    Enum.map(new_ids, &Library.delete/1)
   end
 
   # BEAM monotonic ns minus CLOCK_MONOTONIC ns.
@@ -173,7 +183,9 @@ probe = MagpiePadsCheck.Probe
 
 # ── Pads, fingers and the touchscreen ────────────────────────────────────────
 
-ids = rpc.(probe, :setup, [loaded])
+state = rpc.(probe, :setup, [loaded])
+# Put the kit back however the script ends.
+System.at_exit(fn _ -> rpc.(probe, :cleanup, [state]) end)
 
 Enum.reduce_while(1..200, nil, fn _, _ ->
   if rpc.(probe, :ready?, [loaded]), do: {:halt, :ok}, else: {:cont, Process.sleep(50)}
@@ -367,9 +379,5 @@ run = fn label, prefix ->
   """)
 end
 
-try do
-  run.("One finger (pad A1)", "one")
-  run.("Four fingers landing together (pads A1–A4)", "four")
-after
-  rpc.(probe, :cleanup, [ids])
-end
+run.("One finger (pad A1)", "one")
+run.("Four fingers landing together (pads A1–A4)", "four")

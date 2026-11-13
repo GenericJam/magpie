@@ -531,10 +531,13 @@ these), 16 loaded pads, 40 rounds:
   (5.3 ms) after the call. The output latency behind it depends on the
   stream: 2 bursts after opening, a burst more per underrun (this run: 3
   underruns at startup, 1280 frames, 39 ms; other runs 17–35 ms).
-- Sound leads the picture by ~30 ms. Most of the picture's time is Compose
-  rebuilding the whole tree (~27 ms a frame, the same with 4 loaded pads
-  as with 16) and the display pipeline (~25 ms); a smaller tree doesn't
-  move it.
+- Sound leads the picture by ~30 ms or more. Most of the picture's time is
+  Compose rebuilding the whole tree (~27 ms a frame in the run above, the
+  same with 4 loaded pads as with 16) and the display pipeline (~25 ms); a
+  smaller tree doesn't move it. The picture varies run to run more than
+  the sound: press on the display p50 70–137 ms over six runs (a run
+  against a hot-loaded, not restarted app was the slow one), touch →
+  trigger 5–11 ms in all of them.
 - Before coalescing queued `:down`s, fingers 2–4 of a chord waited ~5 ms
   each for the previous finger's render.
 - `SERIAL=<serial> [ROUNDS=40] [PADS=16] mix run --no-start

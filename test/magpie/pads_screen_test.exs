@@ -209,21 +209,23 @@ defmodule Magpie.PadsScreenTest do
       refute_received {:touch, _, _}
     end
 
-    test "a waiting down from a pointer id still held stays queued behind that id's up" do
-      view = mount() |> down(0, 1, 0.0)
-      # Pointer 1 lifts and lands on pad 1 while pad 2's down (fixed 90) is handled.
-      up_msg = touch_message(0, :up, 1)
-      down_msg = touch_message(1, :down, 1)
-      send(self(), up_msg)
-      send(self(), down_msg)
-      view = down(view, 2, 2, 0.0)
-      assert triggers() == [{0, 127, 0}, {2, 90, 0}]
+    test "queued touches are handled in their order: an up before a down on the same gate pad releases first" do
+      # Pointer 1 holds gate pad 1; it lifts, then pointer 3 lands on pad 1,
+      # both queued while pad 0's down is handled.
+      view = mount() |> down(1, 1, 0.0)
+      send(self(), touch_message(1, :up, 1))
+      send(self(), touch_message(1, :down, 3))
+      view = down(view, 0, 2, 0.0)
 
-      assert_received ^up_msg
-      assert_received ^down_msg
-      view = view |> render_info(up_msg) |> render_info(down_msg)
-      assert triggers() == [{0, 127, 0}, {2, 90, 0}, {1, 127, 0}]
-      assert %{1 => %{pad: 1}, 2 => %{pad: 2}} = assigns(view).fingers
+      calls =
+        for c <- Fake.calls(),
+            match?({:trigger, _, _, _}, c) or match?({:release, _}, c),
+            do: with({:trigger, p, v, _} <- c, do: {:trigger, p, v})
+
+      assert calls == [{:trigger, 1, 127}, {:trigger, 0, 127}, {:release, 1}, {:trigger, 1, 127}]
+
+      assert %{2 => %{pad: 0}, 3 => %{pad: 1}} = assigns(view).fingers
+      refute_received {:touch, _, _}
     end
 
     test "fingers are independent: each releases its own pad" do
@@ -257,8 +259,10 @@ defmodule Magpie.PadsScreenTest do
 
     test "one-shot and toggle pads ignore the lift" do
       :ok = KitSession.update_pad(3, &%{&1 | mode: :toggle})
+      # The mode change itself let pad 3's (silent) loop voices go.
+      assert releases() == [3]
       view = mount() |> down(0, 1, 50.0) |> up(0, 1) |> down(3, 2, 50.0) |> up(3, 2)
-      assert releases() == []
+      assert releases() == [3]
       assert [{0, _, 0}, {3, _, 0}] = triggers()
       assert_renderable(view)
     end

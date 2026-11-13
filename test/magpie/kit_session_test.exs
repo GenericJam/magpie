@@ -162,11 +162,28 @@ defmodule Magpie.KitSessionTest do
       assert %Pad{} = KitSession.snapshot().kit.banks["A"][0]
     end
 
-    test "clearing a pad empties it in the engine and the kit" do
+    test "clearing a pad lets its held voices go, empties it and unloads its now unused sample",
+         %{kick: kick} do
+      :ok = KitSession.update_pad(0, &%{&1 | mode: :gate})
+      Magpie.Engine.trigger(0, 100)
       assert :ok = KitSession.clear_pad(0)
+
+      assert {:release, 0} in Fake.calls()
       assert Fake.state().pads == %{}
+      refute Map.has_key?(Fake.state().samples, kick.id)
       assert KitSession.snapshot().kit.banks["A"] == %{}
       assert KitSession.snapshot().pads == %{}
+    end
+
+    test "a pad the engine refuses after its sample loads is marked, not ready" do
+      long = sample!("Long", 0.5)
+      # Schema-valid, but past the sound's end.
+      :ok =
+        KitSession.update_pad(5, fn _ ->
+          %Pad{slot: 5, sample: %Region{id: long.id, start: 2.0}}
+        end)
+
+      assert %{5 => %{status: {:error, {:refused, {:invalid, :start}}}}} = await_loaded().pads
     end
 
     test "put_sample/2 makes a new pad of a library sample, named after it" do

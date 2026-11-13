@@ -68,6 +68,7 @@ defmodule Magpie.KitSession do
     :save_token,
     autosave_ms: @autosave_ms,
     samples: %{},
+    refused: %{},
     queue: [],
     subscribers: %{}
   ]
@@ -217,7 +218,10 @@ defmodule Magpie.KitSession do
   def handle_call({:snap, on}, _from, s),
     do: {:reply, :ok, s |> put_kit(%{s.kit | snap: on}) |> publish()}
 
-  def handle_call(:flush, _from, s), do: {:reply, :ok, save(s)}
+  def handle_call(:flush, _from, s) do
+    {result, s} = save(s)
+    {:reply, result, s}
+  end
 
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{loader: {ref, id}} = s) do
@@ -228,7 +232,9 @@ defmodule Magpie.KitSession do
       end
 
     s = %{s | loader: nil, samples: Map.put(s.samples, id, sample_state(result))}
-    if match?({:ok, _}, result), do: apply_pads_of(s.kit, id)
+    s = if match?({:ok, _}, result), do: apply_pads_of(s, id), else: s
+    # Unused by the time it loaded (its pad was cleared or replaced).
+    s = drop_unused(s, id)
     {:noreply, s |> next_load() |> publish()}
   end
 
@@ -239,7 +245,9 @@ defmodule Magpie.KitSession do
     end
   end
 
-  def handle_info({:autosave, token}, %{save_token: token} = s), do: {:noreply, save(s)}
+  def handle_info({:autosave, token}, %{save_token: token} = s),
+    do: {:noreply, s |> save() |> elem(1)}
+
   def handle_info({:autosave, _stale}, s), do: {:noreply, s}
 
   # Magpie.RecordScreen's reply: a sample saved for a pad.
@@ -278,8 +286,11 @@ defmodule Magpie.KitSession do
   end
 
   # Pad `index` becomes `pad` (nil: empty) in the engine, then in the kit.
+  # The old pad's held voices (gate, loop, keys) are let go when its sound
+  # or mode changes, and a sample no pad uses any more is unloaded.
   defp set_pad(s, index, pad) do
     id = with %Pad{sample: %Region{id: id}} <- pad, do: id
+    old = pad_at(s.kit, index)
 
     result =
       case Map.get(s.samples, id) do
@@ -290,11 +301,40 @@ defmodule Magpie.KitSession do
 
     case result do
       :ok ->
-        s = s |> put_kit(put_pad(s.kit, index, pad)) |> enqueue(List.wrap(id)) |> next_load()
+        if old && (pad == nil or old.sample != pad.sample or old.mode != pad.mode),
+          do: Engine.release(index)
+
+        old_id = with %Pad{sample: %Region{id: old_id}} <- old, do: old_id
+
+        s =
+          %{s | refused: Map.delete(s.refused, index)}
+          |> put_kit(put_pad(s.kit, index, pad))
+          |> drop_unused(old_id)
+          |> enqueue(List.wrap(id))
+          |> next_load()
+
         {:ok, publish(s)}
 
       {:error, _} = error ->
         {error, s}
+    end
+  end
+
+  # Unload sample `id` (and forget it) once no pad of the kit uses it. One
+  # still loading is dropped when its load ends.
+  defp drop_unused(s, nil), do: s
+
+  defp drop_unused(s, id) do
+    cond do
+      pads_on(s.kit, id) != [] ->
+        s
+
+      match?({_ref, ^id}, s.loader) ->
+        s
+
+      true ->
+        if match?({:ok, _}, s.samples[id]), do: Engine.unload_sample(id)
+        %{s | samples: Map.delete(s.samples, id), queue: List.delete(s.queue, id)}
     end
   end
 
@@ -312,11 +352,19 @@ defmodule Magpie.KitSession do
     %{kit | banks: Map.put(kit.banks, bank, pads)}
   end
 
-  # Every pad on sample `id` to the engine, now that it has loaded.
-  defp apply_pads_of(kit, id) do
-    for {index, pad} <- pads_on(kit, id), {:error, reason} <- [Engine.set_pad(index, pad)] do
-      Logger.warning("Magpie.KitSession: pad #{index} refused: #{inspect(reason)}")
-    end
+  # Every pad on sample `id` to the engine, now that it has loaded; a pad
+  # the engine refuses (a region past the sound's end) is marked so.
+  defp apply_pads_of(s, id) do
+    Enum.reduce(pads_on(s.kit, id), s, fn {index, pad}, s ->
+      case Engine.set_pad(index, pad) do
+        :ok ->
+          %{s | refused: Map.delete(s.refused, index)}
+
+        {:error, reason} ->
+          Logger.warning("Magpie.KitSession: pad #{index} refused: #{inspect(reason)}")
+          %{s | refused: Map.put(s.refused, index, reason)}
+      end
+    end)
   end
 
   defp pads_on(kit, id) do
@@ -373,8 +421,15 @@ defmodule Magpie.KitSession do
     pads =
       for {bank, pads} <- s.kit.banks,
           {slot, %Pad{sample: %Region{id: id} = region}} <- pads,
+          index = Kit.pad_index(bank, slot),
           into: %{} do
-        {Kit.pad_index(bank, slot), pad_info(Map.get(s.samples, id, :loading), region)}
+        state =
+          case s.refused do
+            %{^index => reason} -> {:error, {:refused, reason}}
+            _ -> Map.get(s.samples, id, :loading)
+          end
+
+        {index, pad_info(state, region)}
       end
 
     %Snapshot{kit: s.kit, pads: pads}
@@ -428,15 +483,18 @@ defmodule Magpie.KitSession do
     %{s | kit: kit, save_token: token}
   end
 
-  defp save(%{save_token: nil} = s), do: s
+  defp save(%{save_token: nil} = s), do: {:ok, s}
 
+  # A failed save stays pending and is tried again after the delay.
   defp save(s) do
     case Library.save_kit(s.kit) do
-      {:ok, _} -> :ok
-      {:error, reason} -> Logger.warning("Magpie.KitSession: autosave failed: #{inspect(reason)}")
-    end
+      {:ok, _} ->
+        {:ok, %{s | save_token: nil}}
 
-    %{s | save_token: nil}
+      {:error, reason} = error ->
+        Logger.warning("Magpie.KitSession: autosave failed: #{inspect(reason)}")
+        {error, put_kit(s, s.kit)}
+    end
   end
 
   defp saved_or_start_kit do

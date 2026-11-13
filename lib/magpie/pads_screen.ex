@@ -145,7 +145,7 @@ defmodule Magpie.PadsScreen do
         {:noreply, socket}
 
       finger.vel != nil ->
-        release(socket.assigns, index, fingers)
+        release(finger, index, fingers)
         {:noreply, socket}
 
       phase == :up and not finger.off and inside?(t) ->
@@ -262,8 +262,12 @@ defmodule Magpie.PadsScreen do
   def handle_info({:tap, {:color, color}}, socket),
     do: {:noreply, edit(socket, &%{&1 | color: color})}
 
-  def handle_info({:tap, {:mode, mode}}, socket),
-    do: {:noreply, edit(socket, &%{&1 | mode: mode})}
+  def handle_info({:tap, {:mode, mode}}, socket) do
+    if match?(%Pad{mode: m} when m != mode, sheet_pad(socket.assigns)),
+      do: stop_toggle(socket.assigns)
+
+    {:noreply, edit(socket, &%{&1 | mode: mode})}
+  end
 
   def handle_info({:tap, {:choke, group}}, socket),
     do: {:noreply, edit(socket, &%{&1 | choke: group})}
@@ -272,12 +276,15 @@ defmodule Magpie.PadsScreen do
     do: {:noreply, edit(socket, &%{&1 | velocity: mode})}
 
   def handle_info({:tap, :clear}, %{assigns: %{sheet: index}} = socket) when index != nil do
+    stop_toggle(socket.assigns)
     :ok = KitSession.clear_pad(index)
     {:noreply, Mob.Socket.assign(socket, sheet: nil, drag: nil)}
   end
 
-  def handle_info({:tap, :replace}, %{assigns: %{sheet: index}} = socket) when index != nil,
-    do: {:noreply, socket |> Mob.Socket.assign(sheet: nil, drag: nil) |> record(index)}
+  def handle_info({:tap, :replace}, %{assigns: %{sheet: index}} = socket) when index != nil do
+    stop_toggle(socket.assigns)
+    {:noreply, socket |> Mob.Socket.assign(sheet: nil, drag: nil) |> record(index)}
+  end
 
   def handle_info({:press_out, :held}, socket), do: {:noreply, socket}
 
@@ -296,39 +303,42 @@ defmodule Magpie.PadsScreen do
   end
 
   defp press(socket, index, t) do
-    vel =
+    {vel, release} =
       case socket.assigns.trig do
-        %{^index => {velocity, quantize, _release}} ->
+        %{^index => {velocity, quantize, release}} ->
           vel = if velocity == :position, do: Style.velocity(t.y, t.height), else: velocity
           _ = Engine.trigger(index, vel, quantize: quantize)
-          vel
+          {vel, release}
 
         _empty ->
-          nil
+          {nil, false}
       end
 
-    finger_down(socket, index, t, vel)
+    finger_down(socket, index, t, vel, release)
   end
 
-  # A `:down` from a pointer id still held here is left in the mailbox: that
-  # id's `:up` is queued before it (Android reuses ids), and must go first.
+  # Pad touches already queued, in their order: downs trigger, the rest are
+  # handled as usual; one render follows for all of them.
   defp press_waiting(socket) do
-    fingers = socket.assigns.fingers
-
     receive do
-      {:touch, {:pad, index}, %{phase: :down, pointer_id: id} = t}
-      when not is_map_key(fingers, id) ->
+      {:touch, {:pad, index}, %{phase: :down} = t} ->
         socket |> press(index, t) |> press_waiting()
+
+      {:touch, {:pad, _index}, _t} = touch ->
+        {:noreply, socket} = handle_info(touch, socket)
+        press_waiting(socket)
     after
       0 -> socket
     end
   end
 
-  defp finger_down(socket, index, t, vel) do
+  # `release`: the pad's mode at the press wants a release on the lift
+  # (gate, loop, keys), whatever it has been changed to since.
+  defp finger_down(socket, index, t, vel, release) do
     token = if vel, do: make_ref()
     if token, do: Process.send_after(self(), {:long_press, t.pointer_id, token}, @long_press_ms)
 
-    finger = %{pad: index, x: t.x, y: t.y, vel: vel, token: token, off: false}
+    finger = %{pad: index, x: t.x, y: t.y, vel: vel, release: release, token: token, off: false}
     socket = put_finger(socket, t.pointer_id, finger)
 
     if vel,
@@ -340,11 +350,18 @@ defmodule Magpie.PadsScreen do
     do: Mob.Socket.update(socket, :fingers, &Map.put(&1, pointer_id, finger))
 
   # Gate, loop and keys pads stop when the last finger on them lifts.
-  defp release(assigns, index, fingers_left) do
-    with %{^index => {_vel, _q, true}} <- assigns.trig,
-         false <- Enum.any?(fingers_left, fn {_, f} -> f.pad == index end) do
-      Engine.release(index)
-    end
+  defp release(%{release: true}, index, fingers_left) do
+    if not Enum.any?(fingers_left, fn {_, f} -> f.pad == index end), do: Engine.release(index)
+  end
+
+  defp release(_finger, _index, _fingers_left), do: :ok
+
+  # A sounding toggle pad about to be cleared, replaced or change mode: a
+  # trigger toggles it off (its loop would otherwise run on, unreachable).
+  defp stop_toggle(%{sheet: index, voices: voices} = assigns) do
+    with %Pad{mode: :toggle} <- sheet_pad(assigns),
+         true <- Map.has_key?(voices, index),
+         do: Engine.trigger(index, 1)
   end
 
   defp inside?(%{x: x, y: y, width: w, height: h}), do: x >= 0 and x <= w and y >= 0 and y <= h
