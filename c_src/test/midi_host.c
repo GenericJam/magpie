@@ -5,8 +5,9 @@
  * voice's first frame, note-off when it stops sounding at full), clock
  * send (every tick on its exact frame through tempo changes, Start / song
  * position / Stop, the free-running clock while stopped) and clock follow
- * (lock and jitter on a clock with jittery timestamps, a tempo change,
- * Stop, Continue from a song position, a gap).
+ * (lock and jitter on a clock with jittery timestamps, tempo changes,
+ * Stop, Continue from a song position, a gap; lost ticks alone, in
+ * clusters and soon after the fit restarts, dropouts, tempo drops).
  *
  *   cc -O2 -Wall -Wextra -o /tmp/midi_host c_src/test/midi_host.c -lm && /tmp/midi_host
  *   cc -g -O1 -fsanitize=address,undefined -o /tmp/midi_host_asan c_src/test/midi_host.c -lm && /tmp/midi_host_asan
@@ -466,8 +467,9 @@ static void test_clock_send(void) {
 #define CLOCK0 1000000000LL
 
 /* The master: ticks at `bpm` from time `t0` (ns), each arriving with a
- * uniform jitter of ±`jit_ms`; ticks drop_lo..drop_hi − 1 are lost on the
- * way. The engine hears frame f at CLOCK0 + f/RATE. */
+ * uniform jitter of ±`jit_ms`; ticks drop_lo..drop_hi − 1, and those marked
+ * in `lost`, are lost on the way. The engine hears frame f at CLOCK0 +
+ * f/RATE. */
 typedef struct {
     double t0, period_ns, jit_ms;
     int64_t k;          /* the next tick */
@@ -475,6 +477,7 @@ typedef struct {
     double change_ns;   /* from here at `bpm2` */
     double period2_ns;
     int64_t drop_lo, drop_hi;
+    bool lost[1 << 14];
     double nominal[1 << 14]; /* nominal arrival of tick k */
 } master_t;
 
@@ -491,6 +494,7 @@ static void master_init(master_t *m, double t0, double bpm, double jit_ms) {
     m->k = 0;
     m->next_ns = t0;
     m->drop_lo = m->drop_hi = -1;
+    memset(m->lost, 0, sizeof(m->lost));
 }
 
 /* Render one burst; before it, every tick that has arrived by the time the
@@ -499,7 +503,7 @@ static void follow_block(sp_engine *e, master_t *m) {
     double now = (double)heard_ns(e->frame - LAT);
     while (m->next_ns <= now) {
         if (m->k < (1 << 14)) m->nominal[m->k] = m->next_ns;
-        if (m->k < m->drop_lo || m->k >= m->drop_hi)
+        if ((m->k < m->drop_lo || m->k >= m->drop_hi) && !(m->k < (1 << 14) && m->lost[m->k]))
             midi(e, 0xF8, 0, 0, (int64_t)(m->next_ns + m->jit_ms * 1e6 * unit()));
         m->k++;
         m->next_ns += m->next_ns >= m->change_ns ? m->period2_ns : m->period_ns;
@@ -768,9 +772,10 @@ static void test_follow_loss(void) {
         free_engine(e);
     }
 
-    /* The tempo halved: gaps of two ticks, twice in a row, are a tempo
-     * change, not lost ticks (the sequencer, ahead of the slower grid, slows
-     * onto it over two beats: it never goes back). */
+    /* The tempo halved: gaps of two ticks, more in a row than
+     * SP_FOLLOW_HELD, are a tempo change, not lost ticks (the sequencer,
+     * at the gaps' pace from the second, then ahead of the slower grid,
+     * slows onto it: it never goes back). */
     sp_engine *e = follow_run(&m, 120.0, &k_start);
     m.change_ns = m.next_ns;
     m.period2_ns = 2 * m.period_ns;
@@ -783,6 +788,46 @@ static void test_follow_loss(void) {
           "120 → 60 bpm: followed tempo %.2f; %d steps from 2.5 s (2.5 beats) after the change, worst %.3f ms",
           tempo ? tempo->a / 1000.0 : 0, n, worst);
     free_engine(e);
+
+    /* Lost ticks soon after the fit restarts, in clusters, with more
+     * jitter; tempo drops to under a third. Ticks are offsets from the
+     * scenario's start (the tempo change, if any). Whatever happens, the
+     * ticks end numbered as the master's and the steps back on its grid. */
+    static const struct {
+        const char *what;
+        double bpm, bpm2, jit, settle_s; /* bpm2 > 0: the master goes to it at the start */
+        int run_at, run;                 /* ticks run_at .. run_at + run − 1 lost */
+        int at[4];                       /* and these (0: none) */
+    } cases[] = {
+        {"two ticks lost two apart (gaps of 2, 2, then 1 tick)", 120, 0, 1, 4, 0, 0, {5, 7}},
+        {"four lost, every other tick", 120, 0, 1, 4, 0, 0, {5, 7, 9, 11}},
+        {"a 1 s dropout, then a tick lost 4 ticks after it", 120, 0, 1, 4, 5, 48, {57}},
+        {"120 → 130 bpm, a tick lost 3 ticks after the change", 120, 130, 1, 4, 0, 0, {3}},
+        {"120 → 130 bpm, a tick lost 8 ticks after the change", 120, 130, 1, 4, 0, 0, {8}},
+        {"jitter ±2 ms: a tick lost", 120, 0, 2, 4, 0, 0, {5}},
+        {"jitter ±2 ms: a 1 s dropout, then a tick lost 4 ticks after it", 120, 0, 2, 4, 5, 48, {57}},
+        {"150 → 45 bpm (gaps of 3.3 ticks)", 150, 45, 1, 5, 0, 0, {0}},
+        {"150 → 40 bpm (gaps of 3.75 ticks)", 150, 40, 1, 5, 0, 0, {0}},
+    };
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        e = follow_run(&m, cases[ci].bpm, &k_start);
+        int64_t base = m.k;
+        m.jit_ms = cases[ci].jit;
+        if (cases[ci].bpm2 > 0) {
+            m.change_ns = m.next_ns;
+            m.period2_ns = 60e9 / (cases[ci].bpm2 * 24.0);
+        }
+        for (int i = 0; i < cases[ci].run; i++) m.lost[base + cases[ci].run_at + i] = true;
+        for (int i = 0; i < 4; i++)
+            if (cases[ci].at[i] > 0) m.lost[base + cases[ci].at[i]] = true;
+        for (int i = 0; i < 1600; i++) follow_block(e, &m);
+        worst = worst_from(&m, k_start, m.nominal[base] + cases[ci].settle_s * 1e9, &n);
+        double bound = 0.5 + 0.5 * cases[ci].jit; /* as for lock above */
+        CHECK(e->midi.ticks == m.k && n > 5 && worst <= bound,
+              "%s: ticks numbered as the master's (%lld / %lld), %d steps from %.0f s on, worst %.3f ms (≤ %.1f)",
+              cases[ci].what, (long long)e->midi.ticks, (long long)m.k, n, cases[ci].settle_s, worst, bound);
+        free_engine(e);
+    }
 }
 
 /* ── Notes out: one note open per channel and note; note-offs always out ── */

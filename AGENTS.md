@@ -504,11 +504,14 @@ passes through the BEAM.
   restart); MIDI voices don't echo. Out channel = `in_channel` or 1.
   Clock `send`: tick every 4 seq ticks, SPP 0 + Start on play, Stop,
   free-running while stopped. `follow`: LS fit over 24 ticks (reset after
-  two same-side misses > 3 ms), ticks numbered by time (lost ticks and
-  dropouts keep the grid), position steered onto it half a beat ahead;
-  downbeat late by the write-ahead, then on the master's grid. Kotlin: one
-  C parser per output port (each delivers on its own thread), reset when
-  a slot is reused.
+  two same-side misses > 3 ms), ticks numbered by time: a tick after a gap
+  of ~2–3 ticks or > 3.5 is held out of the fit until the next gap says
+  lost ticks (renumbered) or a slower tempo (counted; up to 4 such gaps
+  in a row are losses, the sequencer at the gaps' pace from the second),
+  so losses, clusters and dropouts keep the grid; position steered onto
+  the fit half a beat ahead; downbeat late by the write-ahead, then on the
+  master's grid. Kotlin: one C parser per output port (each delivers on
+  its own thread), reset when a slot is reused.
 - **Elixir:** `Magpie.Midi.Map.config/1` / `route/2` (the table and the
   rule), `Engine.set_midi/1` (KitSession pushes it on every kit change),
   `KitSession.set_midi(%{in_channel, clock})`, `Magpie.Midi` (devices:
@@ -527,7 +530,8 @@ passes through the BEAM.
   `plugins/magpie_midi/tools/MidiProbe.java`, a client of the "Magpie"
   port run as the shell user (`app_process`; `midi_probe.sh` builds and
   runs it by hand), against test tones on bank A pads 0..4, and puts the
-  kit back. `MIDI_SERIES=1` prints every followed step's error.
+  kit back; `MidiProbe ... clock <s> <plan> <spp> <jitter> <lost>` can
+  leave ticks out. `MIDI_SERIES=1` prints every followed step's error.
 
 ### Measured (moto e 2020, Android 10, `scripts/midi_check.exs`)
 

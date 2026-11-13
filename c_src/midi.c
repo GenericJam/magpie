@@ -106,10 +106,13 @@ static void mi_fit_add(mi_fit *t, int64_t k, double f) {
     if (t->n < MI_FIT) t->n++;
 }
 
-/* The newest tick turns out to be `by` ticks later than counted (ticks were
- * lost before it). */
-static void mi_fit_renumber_newest(mi_fit *t, int64_t by) {
-    if (t->n > 0) t->k[(t->head + MI_FIT - 1) % MI_FIT] += by;
+/* The newest tick in the fit; false when it is empty. */
+static bool mi_fit_newest(const mi_fit *t, int64_t *k, double *f) {
+    if (t->n == 0) return false;
+    int i = (t->head + MI_FIT - 1) % MI_FIT;
+    *k = t->k[i];
+    *f = t->f[i];
+    return true;
 }
 
 /* Least squares f = fc + P·(k − kc): the centroid (kc, fc) and the slope P

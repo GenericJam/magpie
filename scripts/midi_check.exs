@@ -15,8 +15,8 @@
 # heard; clock send (tick spacing of the stamps and of the arrivals, arrival
 # − stamp, `out_late_us`, song position / Start / Stop, notes on the tick
 # grid); clock follow (followed tempo, lock time and step error against the
-# probe's ticks, a tempo change, jittered ticks); song position + Continue
-# and Stop while following.
+# probe's ticks, a tempo change, jittered ticks, ticks lost on the way);
+# song position + Continue and Stop while following.
 #
 # It puts short test tones on bank A pads 0..4 (notes 36, 38, 42, 46 and a
 # keys pad rooted at 60) and its own pattern in the engine, then puts the
@@ -102,6 +102,9 @@ parse = fn text ->
 
       ["GRID", t] ->
         [{:grid, String.to_integer(t)}]
+
+      ["LOST", t] ->
+        [{:lost, String.to_integer(t)}]
 
       ["RECV", arrival, stamp | hex] ->
         a = String.to_integer(arrival)
@@ -440,7 +443,8 @@ try do
     first_step = Enum.find_value(beam, fn {_, {:playhead, step, _}} -> step; _ -> nil end)
 
     IO.puts(
-      "  probe: #{length(sent_ticks)} ticks (#{length(step_ticks)} steps); Magpie: #{length(ons)} step notes + #{length(at_stop)} at the Stop, " <>
+      "  probe: #{length(sent_ticks)} ticks (#{length(step_ticks)} steps, #{length(for {:lost, _} <- events, do: 1)} not sent); " <>
+        "Magpie: #{length(ons)} step notes + #{length(at_stop)} at the Stop, " <>
         "transport #{inspect(Enum.map(playing, &elem(&1, 0)))}, first playhead step #{inspect(first_step)}"
     )
 
@@ -502,6 +506,24 @@ try do
 
   {errs, tempos, start_t} = follow.("120 bpm, ticks ±2 ms jitter", ["14", "120:24", "-1", "2"])
   report_follow.(errs, tempos, start_t, [{"jittered", 8, 96, 1, 1.5}])
+
+  # Ticks lost on the way (the probe doesn't send them): one; two, two
+  # apart; four, every other one; a 1 s dropout, then one 4 ticks after it.
+  {errs, tempos, start_t} =
+    follow.("120 bpm, ticks lost: 96; 192, 194; 288..294 every other; 400..447, then 452", [
+      "20",
+      "120:32",
+      "-1",
+      "0",
+      "96,192,194,288,290,292,294,400-447,452"
+    ])
+
+  report_follow.(errs, tempos, start_t, [
+    {"one lost (tick 96, step 16)", 16, 32, 16, 1.0},
+    {"two lost two apart (ticks 192, 194; step 32)", 32, 48, 32, 1.0},
+    {"four lost, every other tick (ticks 288..294; step 48)", 48, 66, 48, 1.0},
+    {"a 1 s dropout (ticks 400..447), then tick 452 lost (steps 66..75)", 66, 128, 66, 1.0}
+  ])
 
   {errs, _, _} = follow.("song position 8 + Continue at 120 bpm", ["8", "120:8", "8", "0"])
   IO.puts("  first step note error: #{fmt.(errs |> List.first() |> elem(2))} ms; from its 8th step: #{stats.(for {k, _, e} <- errs, k >= 8, do: e)} ms")

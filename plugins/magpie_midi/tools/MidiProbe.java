@@ -11,12 +11,14 @@
 //   MidiProbe <name> notes <seconds> <count> <gap ms> <channel 1-16> <note>[,<note>...]
 //       count note-ons (velocity 100) gap ms apart, cycling through the
 //       notes, each note-off half a gap later; starts after 500 ms.
-//   MidiProbe <name> clock <seconds> <plan> <spp> <jitter ms>
+//   MidiProbe <name> clock <seconds> <plan> <spp> <jitter ms> [<lost>]
 //       plan: <bpm>:<beats>[,<bpm>:<beats>...]. After 500 ms: Start (spp
 //       < 0) or song position spp + Continue, then a tick every 1/24 beat
 //       through the plan (each tick sent ±jitter ms off its grid time and
 //       stamped with the time it is sent; GRID gives the grid time), then
-//       Stop; listens until seconds are up.
+//       Stop; listens until seconds are up. lost: ticks not sent (their
+//       GRID is still given, then LOST), as <i> or <i>-<j> (inclusive)
+//       separated by commas, counted from 0 at the first tick.
 //
 // Output, one line each (times in ns, CLOCK_MONOTONIC):
 //
@@ -24,6 +26,7 @@
 //   OPEN id=.. sending=true|false listening=true|false
 //   SENT <stamp> <hex bytes>
 //   GRID <grid time of the tick just sent>
+//   LOST <grid time of a tick not sent>
 //   RECV <arrival> <stamp> <hex bytes>
 //   DONE
 //
@@ -40,7 +43,9 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import java.lang.reflect.Constructor;
+import java.util.HashSet;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
@@ -51,7 +56,7 @@ public final class MidiProbe {
     @SuppressWarnings("deprecation") // MidiManager.getDevices: getDevicesForTransport is API 33+
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.out.println("usage: MidiProbe <name> devices | listen <s> | notes <s> <count> <gap ms> <ch> <notes> | clock <s> <plan> <spp> <jitter ms>");
+            System.out.println("usage: MidiProbe <name> devices | listen <s> | notes <s> <count> <gap ms> <ch> <notes> | clock <s> <plan> <spp> <jitter ms> [<lost>]");
             System.exit(1);
         }
         String wanted = args[0];
@@ -121,7 +126,7 @@ public final class MidiProbe {
                 notes(send, Integer.parseInt(args[3]), Long.parseLong(args[4]), Integer.parseInt(args[5]), args[6]);
                 break;
             case "clock":
-                clock(send, args[3], Integer.parseInt(args[4]), Double.parseDouble(args[5]));
+                clock(send, args[3], Integer.parseInt(args[4]), Double.parseDouble(args[5]), lostTicks(args.length > 6 ? args[6] : ""));
                 break;
             default:
                 say("UNKNOWN_MODE " + mode);
@@ -151,7 +156,7 @@ public final class MidiProbe {
         }
     }
 
-    private static void clock(MidiInputPort port, String plan, int spp, double jitterMs) throws Exception {
+    private static void clock(MidiInputPort port, String plan, int spp, double jitterMs, Set<Integer> lost) throws Exception {
         Random random = new Random(1);
         long jitter = (long) (jitterMs * 1_000_000.0);
         long t = System.nanoTime();
@@ -162,21 +167,35 @@ public final class MidiProbe {
             send(port, (byte) 0xfb);
         }
         double grid = t;
+        int tick = 0;
         for (String segment : plan.split(",")) {
             String[] bb = segment.split(":");
             double bpm = Double.parseDouble(bb[0]);
             int ticks = (int) Math.round(Double.parseDouble(bb[1]) * 24);
             double period = 60e9 / bpm / 24;
-            for (int i = 0; i < ticks; i++) {
+            for (int i = 0; i < ticks; i++, tick++) {
                 long off = jitter > 0 ? (long) ((random.nextDouble() * 2 - 1) * jitter) : 0;
                 waitUntil((long) grid + off);
-                send(port, (byte) 0xf8);
+                if (!lost.contains(tick)) send(port, (byte) 0xf8);
                 say("GRID " + (long) grid);
+                if (lost.contains(tick)) say("LOST " + (long) grid);
                 grid += period;
             }
         }
         waitUntil((long) grid);
         send(port, (byte) 0xfc);
+    }
+
+    // "3,10-12" → {3, 10, 11, 12}.
+    private static Set<Integer> lostTicks(String spec) {
+        Set<Integer> lost = new HashSet<>();
+        for (String part : spec.split(",")) {
+            if (part.isEmpty()) continue;
+            String[] ends = part.split("-");
+            int lo = Integer.parseInt(ends[0]), hi = Integer.parseInt(ends[ends.length - 1]);
+            for (int i = lo; i <= hi; i++) lost.add(i);
+        }
+        return lost;
     }
 
     // Sleep to 1 ms before, then spin (Thread.onSpinWait is missing on

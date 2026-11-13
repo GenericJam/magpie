@@ -78,6 +78,7 @@
 #define SP_DECLICK_OUT_MS 1.0   /* and out at its region's end */
 #define SP_FRAME_TOL 1e-6       /* frames: a position on a frame sounds on it */
 #define SP_FOLLOW_MISS_MS 3.0   /* an incoming tick this far off the fitted line is a tempo change, not jitter */
+#define SP_FOLLOW_HELD 4        /* incoming ticks after 2–3 tick gaps held in a row before the gaps are a slower tempo */
 #define SP_SEG_EPS 1e-7         /* ticks: just before a change point */
 
 #define SP_PEAK_FRAMES 256      /* frames per peak byte */
@@ -265,6 +266,14 @@ typedef struct {
     uint64_t serial; /* … if it is still the one that was there */
 } sp_action;
 
+/* Clock follow: a tick after a gap that may be lost ticks or a slower
+ * tempo, until the next gap says which. */
+typedef struct {
+    double f, gap;  /* heard frame; the gap before it (frames) */
+    int64_t lost;   /* ticks lost in that gap, if they were */
+    bool big;       /* the gap was more than 3.5 ticks */
+} sp_held_tick;
+
 typedef struct {
     /* Commands: producers serialised by the caller. */
     sp_cmd cmds[SP_CMDS];
@@ -345,7 +354,8 @@ typedef struct {
         int spp;          /* song position (16ths) for Continue */
         bool armed, following;
         int misses;       /* ticks in a row off the fitted line (signed: which way) */
-        int64_t lost;     /* ticks the last gap says were lost, if the next tick confirms it */
+        sp_held_tick held[SP_FOLLOW_HELD]; /* out of the fit until the next gap says what they were */
+        int n_held;
         _Atomic uint64_t in_messages;
         _Atomic int64_t follow_bpm_milli; /* 0: no clock to follow yet */
         double bpm_shown;                 /* the followed tempo as reported */
@@ -1301,68 +1311,147 @@ static void follow_steer(sp_engine *e) {
     e->seq.tpf = tpf;
 }
 
+/* While following: the sequencer goes on at `tpf` from this block. */
+static void follow_pace(sp_engine *e, double tpf) {
+    e->seq.base_m = m_at(e, e->frame);
+    e->seq.base_frame = e->frame;
+    e->seq.tpf = tpf;
+}
+
+enum { SP_REFIT_NONE, SP_REFIT_KEEP_NEWEST, SP_REFIT_ALL };
+
+/* Settle the held ticks into the fit: `lost` numbers each by the gap
+ * before it (the ticks lost there count; the run's first tick, if held,
+ * moves with it), else they are counted. `refit`: keep the fit; start it
+ * afresh from its newest tick (the tempo changed at the held ticks); or
+ * from the held ticks alone (the tempo is unknown across a dropout). */
+static void follow_settle(sp_engine *e, bool lost, int refit) {
+    int64_t first = e->midi.ticks - e->midi.n_held + 1, shift = 0, k0 = e->midi.k0;
+    if (refit != SP_REFIT_NONE) {
+        int64_t kn = 0;
+        double fn = 0;
+        bool newest = refit == SP_REFIT_KEEP_NEWEST && mi_fit_newest(&e->midi.fit, &kn, &fn);
+        mi_fit_reset(&e->midi.fit);
+        if (newest) mi_fit_add(&e->midi.fit, kn, fn);
+    }
+    for (int i = 0; i < e->midi.n_held; i++) {
+        if (lost) {
+            shift += e->midi.held[i].lost;
+            if (k0 >= first + i) e->midi.k0 += e->midi.held[i].lost;
+        }
+        mi_fit_add(&e->midi.fit, first + i + shift, e->midi.held[i].f);
+    }
+    e->midi.ticks += shift;
+    e->midi.n_held = 0;
+    e->midi.misses = 0;
+}
+
 /* An incoming clock tick, heard at frame `f`. Ticks are numbered by the
  * time between them, not only counted, so the sequencer keeps the master's
- * phase when ticks don't arrive while the master plays on (a cable, a
- * Bluetooth dropout, a stalled sender, a full command queue):
+ * phase when ticks don't reach us while the master plays on (a cable, a
+ * Bluetooth dropout, a stalled sender, a full command queue). One gap
+ * can't tell lost ticks from a tempo slowed 2, 3 or more times, so a tick
+ * after a gap of about 2 or 3 ticks (to a quarter tick, or the miss
+ * tolerance if more) or of more than 3.5 is held: out of the fit, counted
+ * for now, and the sequencer goes on as it was. Gaps are measured from
+ * where the fit puts the last tick (the held ones taken as after lost
+ * ticks) when it holds a dozen and the last tick was on it, else from the
+ * last tick: the jitter of one tick, not of two; a gap of 2–3 ticks by
+ * either measure counts. The next tick says what the held ones were:
  *
- * - A gap of more than 3 ticks (or half a second before there is a tempo):
- *   this tick is numbered by the time gone by at the fitted tempo (the
- *   sequencer ran on at it meanwhile, so it stays on the grid) and the fit
- *   starts afresh.
- * - A gap of n ≥ 2 ticks to within the miss tolerance, then a tick one
- *   tick later: n − 1 ticks were lost; the earlier tick is renumbered (in
- *   the fit too). Without that second tick (two such gaps in a row: a
- *   tempo halved) nothing is renumbered and the miss rule below sees a
- *   tempo change.
- * - Two ticks in a row off the line the same way, by more than jitter
- *   explains: the tempo changed; fit from those two on.
+ * - about one tick after the last: ticks were lost before each; they are
+ *   numbered so, into the fit as it was.
+ * - two long gaps alike in a row (or a 2–3 tick gap, then one alike but
+ *   long): the tempo dropped that much; counted, the fit restarts at the
+ *   change.
+ * - another long gap: those before it are numbered by the time; it is held.
+ * - another 2–3 tick gap: held too (losses come in clusters), up to
+ *   SP_FOLLOW_HELD; one more is a slower tempo (counted, the fit restarts).
+ *   From the second, the sequencer goes at the gaps' pace meanwhile, so a
+ *   halved tempo doesn't leave it far ahead (lost ticks: it catches up).
+ * - on the line as counted: they were late (a stalled sender); counted,
+ *   left out of the fit.
+ * - anything else: after 2–3 tick gaps a tempo change (counted, the fit
+ *   restarts); after a long gap the master played on at some new tempo
+ *   (numbered by the time at the old one, the fit restarts).
  *
- * Once a beat the followed tempo goes to the BEAM. */
+ * Without a tempo (a fit of fewer than 2 ticks) ticks are counted; a gap of
+ * half a second restarts the fit. A tick that isn't held: two in a row off
+ * the line the same way, by more than jitter explains, are a tempo change;
+ * fit from those two on. Once a beat the followed tempo goes to the BEAM. */
 static void follow_tick(sp_engine *e, double f) {
-    double kc, fc, P;
-    bool have = mi_fit_line(&e->midi.fit, &kc, &fc, &P);
-    double gap = f - e->midi.last_tick;
-    int64_t lost = e->midi.lost;
-    e->midi.lost = 0;
-    if (e->midi.ticks > 0 && gap > (have ? 3.0 * P : 0.5 * e->rate)) {
-        if (have) e->midi.ticks += llround(gap / P) - 1;
-        mi_fit_reset(&e->midi.fit);
-        e->midi.misses = 0;
-    } else if (have && e->midi.fit.n >= 12) {
-        double tol = fmax(SP_FOLLOW_MISS_MS * e->rate / 1000.0, 0.15 * P);
-        int64_t n = llround(gap / P);
-        if (lost > 0 && fabs(gap - P) <= tol) {
-            /* The run's first tick keeps being its first. */
-            if (e->midi.k0 == e->midi.ticks) e->midi.k0 += lost;
-            e->midi.ticks += lost;
-            mi_fit_renumber_newest(&e->midi.fit, lost);
-            have = mi_fit_line(&e->midi.fit, &kc, &fc, &P);
-        } else if (n >= 2 && fabs(gap - (double)n * P) <= tol && lost == 0) {
-            e->midi.lost = n - 1;
+    double kc, fc, P = 0;
+    bool have = mi_fit_line(&e->midi.fit, &kc, &fc, &P), line = have && e->midi.fit.n >= 12;
+    double raw = f - e->midi.last_tick, gap = raw;
+    double tol = fmax(SP_FOLLOW_MISS_MS * e->rate / 1000.0, have ? 0.15 * P : 0);
+    int held = e->midi.n_held;
+    bool hold = false, settled = false, hedge = false;
+    if (e->midi.ticks > 0 && have) {
+        int64_t pending = 0;
+        bool any_big = false;
+        for (int i = 0; i < held; i++) {
+            pending += e->midi.held[i].lost;
+            any_big = any_big || e->midi.held[i].big;
         }
-        if (have) {
-            int64_t k = e->midi.ticks + 1;
-            double miss = f - (fc + P * ((double)k - kc));
-            bool off = fabs(miss) > tol;
-            int sign = miss > 0 ? 1 : -1;
-            e->midi.misses = off ? (e->midi.misses * sign > 0 ? e->midi.misses + sign : sign) : 0;
-            if (abs(e->midi.misses) >= 2) {
-                mi_fit_reset(&e->midi.fit);
-                mi_fit_add(&e->midi.fit, k - 1, e->midi.last_tick);
+        if (line && e->midi.misses == 0) gap = f - (fc + P * ((double)(e->midi.ticks + pending) - kc));
+        double stol = fmax(tol, 0.25 * P);
+        int64_t n = llround(gap / P), nr = llround(raw / P);
+        bool big = gap > 3.5 * P, on = n >= 2 && fabs(gap - (double)n * P) <= stol;
+        if (!on && !big && nr >= 2 && fabs(raw - (double)nr * P) <= stol) {
+            n = nr;
+            on = true;
+        }
+        bool small = !big && on;
+        if (held > 0) {
+            const sp_held_tick *last = &e->midi.held[held - 1];
+            settled = true;
+            if (llround(raw / P) == 1) {
+                follow_settle(e, true, SP_REFIT_NONE);
+            } else if ((last->big || big) && fabs(raw - last->gap) <= fmax(tol, 0.15 * last->gap)) {
+                follow_settle(e, false, SP_REFIT_KEEP_NEWEST);
+            } else if (big) {
+                follow_settle(e, true, SP_REFIT_NONE);
+                settled = false;
+            } else if (small && held < SP_FOLLOW_HELD) {
+                settled = false;
+            } else if (!any_big && line && fabs(f - (fc + P * ((double)e->midi.ticks + 1 - kc))) <= tol) {
+                e->midi.n_held = 0;
                 e->midi.misses = 0;
-                e->midi.lost = 0;
+            } else {
+                follow_settle(e, any_big, any_big ? SP_REFIT_ALL : SP_REFIT_KEEP_NEWEST);
             }
         }
+        /* After held ticks were settled, this one is judged by what they
+         * were (after a tempo just found wrong it is the new tempo's). */
+        hold = !settled && (big || small);
+        if (hold) e->midi.held[e->midi.n_held++] = (sp_held_tick){.f = f, .gap = raw, .lost = n - 1, .big = big};
+        hedge = hold && small && !any_big && e->midi.n_held >= 2;
+    } else if (e->midi.ticks > 0 && raw > 0.5 * e->rate) {
+        mi_fit_reset(&e->midi.fit);
+        e->midi.misses = 0;
     }
+
     int64_t k = e->midi.ticks + 1;
+    have = mi_fit_line(&e->midi.fit, &kc, &fc, &P);
+    if (!hold && have && e->midi.fit.n >= 12) {
+        double miss = f - (fc + P * ((double)k - kc));
+        bool off = fabs(miss) > tol;
+        int sign = miss > 0 ? 1 : -1;
+        e->midi.misses = off ? (e->midi.misses * sign > 0 ? e->midi.misses + sign : sign) : 0;
+        if (abs(e->midi.misses) >= 2) {
+            mi_fit_reset(&e->midi.fit);
+            mi_fit_add(&e->midi.fit, k - 1, e->midi.last_tick);
+            e->midi.misses = 0;
+        }
+    }
     e->midi.ticks = k;
     e->midi.last_tick = f;
-    mi_fit_add(&e->midi.fit, k, f);
+    if (!hold) mi_fit_add(&e->midi.fit, k, f);
     have = mi_fit_line(&e->midi.fit, &kc, &fc, &P);
     if (e->midi.armed) follow_start(e, f, have ? P : 4.0 / sp_tpf(e->seq.bpm, e->rate));
-    else if (e->midi.following && e->seq.playing) follow_steer(e);
-    if (have && k % 24 == 0) {
+    else if (!hold && e->midi.following && e->seq.playing) follow_steer(e);
+    else if (hedge && e->midi.following && e->seq.playing) follow_pace(e, 4.0 / raw);
+    if (!hold && have && k % 24 == 0) {
         /* Shown, smoothed over a few beats (a step of more than 1.5 % is
          * taken at once). */
         double bpm = 60.0 * e->rate / (24.0 * P), shown = e->midi.bpm_shown;
@@ -1447,7 +1536,7 @@ static void set_midi_map(sp_engine *e, sp_midi_map *map) {
         atomic_store_explicit(&e->midi.follow_bpm_milli, 0, memory_order_relaxed);
         e->midi.bpm_shown = 0;
         e->midi.misses = 0;
-        e->midi.lost = 0;
+        e->midi.n_held = 0;
     }
     if (!map || map->clock != SP_CLOCK_SEND) e->midi.free_next = -1;
 }
