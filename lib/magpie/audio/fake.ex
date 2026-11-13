@@ -24,6 +24,26 @@ defmodule Magpie.Audio.Fake do
     (`:pattern`, then step 0), steps start voices (gate, loop and keys pads
     for one step; stopping ends them). Swing isn't modelled: frames and
     gates follow the tempo in straight time.
+
+  ## Input and recording
+
+  `input_open/1` sends `:started` at once (48 kHz; the mic mono, other
+  apps stereo) unless `fail_input/1` armed a failure, which closes it
+  instead (`{:input, :closed, reason}`, as a refused consent does);
+  `end_input/1` closes it as the system would. Audio arrives only through
+  `feed/1`: interleaved f32le at the input's channels. Each call is one
+  meter period: it runs the recorder over the frames and sends one
+  `:meter` (the fed frames' peak dBFS; new peak bytes, one per 256
+  recorded frames, the partial block flushed on stop, as the C does).
+
+  The recorder: `:now` records from the next fed frame; `:on_sound`
+  starts at the first frame with any |x| ≥ 10^(threshold_db / 20),
+  keeping up to `pre_roll_ms` of what was fed since arming; `:count_in`
+  needs the output (`{:error, :not_running}` without it), sends
+  `:count_in` from the current frame to four beats later at the fake's
+  tempo and records only after `downbeat/0` (no pre-roll). At
+  `max_seconds` it sends `:full` and takes no more. `record_stop/0`
+  without a recorded frame is `{:error, :not_started}`.
   """
 
   @behaviour Magpie.Audio
@@ -110,6 +130,22 @@ defmodule Magpie.Audio.Fake do
   @impl Magpie.Audio
   def info, do: call(:info)
 
+  @impl Magpie.Audio
+  def input_open(source) when source in [:mic, :apps], do: call({:input_open, source})
+
+  @impl Magpie.Audio
+  def input_close, do: call(:input_close)
+
+  @impl Magpie.Audio
+  def record_start(%{mode: _, max_seconds: _, threshold_db: _, pre_roll_ms: _} = opts),
+    do: call({:record_start, opts})
+
+  @impl Magpie.Audio
+  def record_stop, do: call(:record_stop)
+
+  @impl Magpie.Audio
+  def record_cancel, do: call(:record_cancel)
+
   # ── Driving it from a test ────────────────────────────────────────────────
 
   @doc "Run the sequencer `steps` 16th notes on."
@@ -130,6 +166,21 @@ defmodule Magpie.Audio.Fake do
   @doc "Make the next `open/1` fail with `reason` (nil: succeed again)."
   def fail_open(reason), do: call({:fail_open, reason})
 
+  @doc "Make the next `input_open/1` close at once with `reason` (`:denied`: the consent refused)."
+  def fail_input(reason), do: call({:fail_input, reason})
+
+  @doc "The system closes the open input with `reason` (`:stopped`, `:disconnected`, …)."
+  def end_input(reason), do: call({:end_input, reason})
+
+  @doc """
+  Audio into the open input: interleaved f32le at its channels (mic 1,
+  apps 2). One meter period: runs the recorder, then sends one `:meter`.
+  """
+  def feed(pcm) when is_binary(pcm), do: call({:feed, pcm})
+
+  @doc "The count-in's downbeat: a counting recorder starts recording."
+  def downbeat, do: call(:downbeat)
+
   # ── Server ────────────────────────────────────────────────────────────────
 
   defp call(request) do
@@ -147,6 +198,9 @@ defmodule Magpie.Audio.Fake do
       owner: owner,
       open: open,
       fail_open: fail_open,
+      fail_input: nil,
+      input: nil,
+      rec: nil,
       samples: %{},
       pads: %{},
       pattern: nil,
@@ -196,12 +250,80 @@ defmodule Magpie.Audio.Fake do
 
   def handle_call({:advance, ticks}, _from, s), do: {:reply, :ok, advance(s, ticks)}
 
+  def handle_call({:fail_input, reason}, _from, s), do: {:reply, :ok, %{s | fail_input: reason}}
+
+  def handle_call({:end_input, _reason}, _from, %{input: nil} = s),
+    do: {:reply, {:error, :no_input}, s}
+
+  def handle_call({:end_input, reason}, _from, s) do
+    send(s.owner, {:magpie_audio, :input, :closed, reason})
+    {:reply, :ok, %{s | input: nil, rec: nil}}
+  end
+
+  def handle_call({:feed, _pcm}, _from, %{input: nil} = s), do: {:reply, {:error, :no_input}, s}
+  def handle_call({:feed, pcm}, _from, s), do: {:reply, :ok, feed(s, pcm)}
+
+  def handle_call(:downbeat, _from, %{rec: %{state: :counting} = rec} = s) do
+    send(s.owner, {:magpie_audio, :record, :started, %{pre_roll_frames: 0, late_frames: 0}})
+    {:reply, :ok, %{s | rec: %{rec | state: :recording}}}
+  end
+
+  def handle_call(:downbeat, _from, s), do: {:reply, {:error, :not_counting}, s}
+
   def handle_call(_request, {pid, _}, %{owner: owner} = s) when pid != owner,
     do: {:reply, {:error, :not_owner}, s}
 
   def handle_call(:close, _from, s), do: {:reply, :ok, %{s | open: false}}
 
-  def handle_call(:reset, _from, s), do: {:reply, :ok, fresh(s.owner, s.open, s.fail_open)}
+  def handle_call(:reset, _from, s),
+    do: {:reply, :ok, %{fresh(s.owner, s.open, s.fail_open) | fail_input: s.fail_input}}
+
+  def handle_call({:input_open, source}, _from, %{fail_input: nil} = s) do
+    channels = if source == :mic, do: 1, else: 2
+    info = %{source: source, rate: @rate, channels: channels}
+    send(s.owner, {:magpie_audio, :input, :started, info})
+    {:reply, :ok, %{s | input: info, rec: nil}}
+  end
+
+  def handle_call({:input_open, _source}, _from, s) do
+    send(s.owner, {:magpie_audio, :input, :closed, s.fail_input})
+    {:reply, :ok, %{s | input: nil, rec: nil, fail_input: nil}}
+  end
+
+  def handle_call(:input_close, _from, s), do: {:reply, :ok, %{s | input: nil, rec: nil}}
+
+  def handle_call({:record_start, _opts}, _from, %{input: nil} = s),
+    do: {:reply, {:error, :no_input}, s}
+
+  def handle_call({:record_start, _opts}, _from, %{rec: %{}} = s),
+    do: {:reply, {:error, :recording}, s}
+
+  def handle_call({:record_start, %{mode: :count_in}}, _from, %{open: false} = s),
+    do: {:reply, {:error, :not_running}, s}
+
+  def handle_call({:record_start, opts}, _from, s), do: {:reply, :ok, arm(s, opts)}
+
+  def handle_call(:record_stop, _from, %{rec: nil} = s), do: {:reply, {:error, :not_recording}, s}
+
+  def handle_call(:record_stop, _from, %{rec: %{frames: 0}} = s),
+    do: {:reply, {:error, :not_started}, %{s | rec: nil}}
+
+  def handle_call(:record_stop, _from, %{rec: rec} = s) do
+    tail = if rec.acc_n > 0, do: <<peak_byte(rec.acc_peak)>>, else: <<>>
+
+    recording = %{
+      pcm: rec.pcm,
+      rate: @rate,
+      channels: s.input.channels,
+      frames: rec.frames,
+      peaks: rec.peaks <> tail,
+      peak_frames: @peak_frames
+    }
+
+    {:reply, {:ok, recording}, %{s | rec: nil}}
+  end
+
+  def handle_call(:record_cancel, _from, s), do: {:reply, :ok, %{s | rec: nil}}
 
   def handle_call({:load, id, source}, _from, s) do
     result = load(source)
@@ -492,6 +614,122 @@ defmodule Magpie.Audio.Fake do
       to = min(div((p + 1) * @peak_frames * source_frames, frames), source_frames)
       peak = Enum.reduce(from..(to - 1)//1, 0.0, &max(elem(per_frame, &1), &2))
       <<min(round(peak * 255), 255)>>
+    end
+  end
+
+  # ── The recorder ──────────────────────────────────────────────────────────
+
+  defp arm(s, opts) do
+    rec = %{
+      mode: opts.mode,
+      state: :recording,
+      max_frames: round(opts.max_seconds * @rate),
+      threshold: :math.pow(10, opts.threshold_db / 20),
+      pre_roll: round(opts.pre_roll_ms * @rate / 1000),
+      ring: <<>>,
+      pcm: <<>>,
+      frames: 0,
+      acc_peak: 0.0,
+      acc_n: 0,
+      peaks: <<>>,
+      new: <<>>
+    }
+
+    case opts.mode do
+      :now ->
+        send(s.owner, {:magpie_audio, :record, :started, %{pre_roll_frames: 0, late_frames: 0}})
+        %{s | rec: rec}
+
+      :on_sound ->
+        %{s | rec: %{rec | state: :waiting}}
+
+      :count_in ->
+        first = frame(s)
+        send(s.owner, {:magpie_audio, :count_in, first, first + round(4 * 60 * @rate / s.tempo)})
+        %{s | rec: %{rec | state: :counting}}
+    end
+  end
+
+  defp feed(s, pcm) do
+    size = 4 * s.input.channels
+    pcm = binary_part(pcm, 0, byte_size(pcm) - rem(byte_size(pcm), size))
+    rec = if s.rec, do: record(s, s.rec, pcm, size)
+
+    meter =
+      case rec do
+        nil -> %{state: :idle, frames: 0, peaks: <<>>}
+        rec -> %{state: rec.state, frames: rec.frames, peaks: rec.new}
+      end
+
+    send(s.owner, {:magpie_audio, :meter, level_db(pcm), meter})
+    %{s | rec: rec && %{rec | new: <<>>}}
+  end
+
+  defp record(s, %{state: :waiting} = rec, pcm, size) do
+    case first_loud(pcm, rec.threshold, size) do
+      nil ->
+        %{rec | ring: last_bytes(rec.ring <> pcm, rec.pre_roll * size)}
+
+      at ->
+        bytes = at * size
+        <<before::binary-size(^bytes), rest::binary>> = pcm
+        pre = last_bytes(rec.ring <> before, rec.pre_roll * size)
+        started = %{pre_roll_frames: div(byte_size(pre), size), late_frames: 0}
+        send(s.owner, {:magpie_audio, :record, :started, started})
+        append(s, %{rec | state: :recording, ring: <<>>}, pre <> rest, size)
+    end
+  end
+
+  defp record(s, %{state: :recording} = rec, pcm, size), do: append(s, rec, pcm, size)
+  defp record(_s, rec, _pcm, _size), do: rec
+
+  # Up to max_frames; reaching it sends :full once and takes no more.
+  defp append(s, rec, pcm, size) do
+    take = min(rec.max_frames - rec.frames, div(byte_size(pcm), size))
+    chunk = binary_part(pcm, 0, take * size)
+    rec = add_peaks(%{rec | pcm: rec.pcm <> chunk, frames: rec.frames + take}, chunk, size)
+
+    if rec.frames >= rec.max_frames do
+      send(s.owner, {:magpie_audio, :record, :full, rec.frames})
+      %{rec | state: :full}
+    else
+      rec
+    end
+  end
+
+  defp add_peaks(rec, chunk, size) do
+    {peak, n, bytes} =
+      for <<frame::binary-size(^size) <- chunk>>, reduce: {rec.acc_peak, rec.acc_n, []} do
+        {peak, n, bytes} ->
+          peak = max(peak, frame_peak(frame))
+
+          if n + 1 == @peak_frames,
+            do: {0.0, 0, [peak_byte(peak) | bytes]},
+            else: {peak, n + 1, bytes}
+      end
+
+    new = bytes |> Enum.reverse() |> :binary.list_to_bin()
+    %{rec | acc_peak: peak, acc_n: n, peaks: rec.peaks <> new, new: rec.new <> new}
+  end
+
+  defp first_loud(pcm, threshold, size) do
+    Enum.find_index(for(<<frame::binary-size(^size) <- pcm>>, do: frame), fn frame ->
+      frame_peak(frame) >= threshold
+    end)
+  end
+
+  defp frame_peak(frame),
+    do: Enum.reduce(for(<<x::float-32-little <- frame>>, do: abs(x)), 0.0, &max/2)
+
+  defp peak_byte(peak), do: min(round(peak * 255), 255)
+
+  defp last_bytes(bin, n) when byte_size(bin) <= n, do: bin
+  defp last_bytes(bin, n), do: binary_part(bin, byte_size(bin) - n, n)
+
+  defp level_db(pcm) do
+    case frame_peak(pcm) do
+      peak when peak > 0 -> max(20 * :math.log10(peak), -120.0)
+      _ -> -120.0
     end
   end
 

@@ -121,6 +121,7 @@ enum {
     SP_CMD_STOP,
     SP_CMD_RATE,
     SP_CMD_RESET,
+    SP_CMD_COUNT_IN,
 };
 
 typedef struct {
@@ -139,18 +140,23 @@ typedef struct {
         } pattern;
         double value;
         int rate;
+        struct {
+            uint32_t id; /* reported with the count-in's event */
+            int beats;   /* 0: cancel the count-in */
+        } count_in;
     } u;
 } sp_cmd;
 
-enum { SP_EV_PLAYHEAD, SP_EV_VOICE_START, SP_EV_VOICE_END, SP_EV_HIT, SP_EV_PATTERN, SP_EV_TRIGGERED };
+enum { SP_EV_PLAYHEAD, SP_EV_VOICE_START, SP_EV_VOICE_END, SP_EV_HIT, SP_EV_PATTERN, SP_EV_TRIGGERED, SP_EV_COUNT_IN };
 
 typedef struct {
     uint8_t type, pad, vel;
     int16_t note;  /* hit: −1 unless a keys pad */
-    int32_t a;     /* playhead, hit: step; pattern: id */
-    int32_t b;     /* hit: tick (−12..12) */
-    int64_t frame; /* engine frame */
+    int32_t a;     /* playhead, hit: step; pattern: id; count-in: id */
+    int32_t b;     /* hit: tick (−12..12); count-in: beats */
+    int64_t frame; /* engine frame; count-in: its first click */
     int64_t t_ns;  /* triggered: when the call was made */
+    int64_t until; /* count-in: the downbeat after its last click */
 } sp_event;
 
 enum { SP_GB_SAMPLE = 1, SP_GB_PATTERN = 2 };
@@ -250,6 +256,17 @@ typedef struct {
         int n_pending;
         uint32_t play; /* bumps on every play */
     } seq;
+
+    /* The count-in: `beats` clicks, beat k on frame ceil(origin + k ·
+     * interval), accented on the first. */
+    struct {
+        double origin, interval;
+        int beats, next;
+        int64_t next_frame;
+        int t;          /* frames into the sounding click; < 0 silent */
+        double phase, step;
+        float gain;
+    } click;
 
     sp_mark marks[SP_MARKS];
     uint32_t n_marks;
@@ -441,6 +458,7 @@ static void sp_init(sp_engine *e, int rate) {
     e->seq.swing = 0.5;
     e->seq.pending_swing = -1;
     e->seq.tpf = sp_tpf(120.0, rate);
+    e->click.t = -1;
     atomic_store(&e->step_now, -1);
 }
 
@@ -1041,6 +1059,64 @@ static void cancel_pending(sp_engine *e, int pad) {
     }
 }
 
+/* ── The count-in ─────────────────────────────────────────────────────────── */
+
+#define SP_CLICK_MS 30.0
+
+/* `beats` clicks a beat apart at the tempo: from this block's first frame,
+ * or while the sequencer plays from its next bar (so a recording that
+ * starts on the downbeat after them lines up with the pattern). Reports
+ * the first click and the downbeat after the last. */
+static void start_count_in(sp_engine *e, uint32_t id, int beats) {
+    double origin, interval;
+    if (e->seq.playing) {
+        double bar = grid_target(e, m_at(e, e->frame), SP_BAR);
+        origin = (double)e->seq.base_frame + (bar - e->seq.base_m) / e->seq.tpf;
+        interval = (double)SP_PPQN / e->seq.tpf;
+    } else {
+        origin = (double)e->frame;
+        interval = 60.0 * e->rate / e->seq.bpm;
+    }
+    e->click.origin = origin;
+    e->click.interval = interval;
+    e->click.beats = beats;
+    e->click.next = 0;
+    e->click.next_frame = (int64_t)ceil(origin - SP_FRAME_TOL);
+    sp_emit(e, &(sp_event){
+                   .type = SP_EV_COUNT_IN,
+                   .a = (int32_t)id,
+                   .b = beats,
+                   .frame = e->click.next_frame,
+                   .until = (int64_t)ceil(origin + beats * interval - SP_FRAME_TOL),
+               });
+}
+
+/* The count-in's clicks into `out`: a short sine blip on each beat, the
+ * first higher and louder. */
+static void clicks(sp_engine *e, float *out, int frames) {
+    if (e->click.t < 0 && e->click.next >= e->click.beats) return;
+    const int length = (int)(SP_CLICK_MS * e->rate / 1000.0);
+    const double attack = e->rate / 1000.0, decay = 0.006 * e->rate;
+    for (int i = 0; i < frames; i++) {
+        if (e->click.next < e->click.beats && e->frame + i >= e->click.next_frame) {
+            bool accent = e->click.next == 0;
+            e->click.t = 0;
+            e->click.phase = 0;
+            e->click.step = 2.0 * M_PI * (accent ? 1760.0 : 1320.0) / e->rate;
+            e->click.gain = accent ? 0.5f : 0.35f;
+            e->click.next++;
+            e->click.next_frame = (int64_t)ceil(e->click.origin + e->click.next * e->click.interval - SP_FRAME_TOL);
+        }
+        if (e->click.t < 0) continue;
+        double env = (e->click.t < attack ? e->click.t / attack : 1.0) * exp(-e->click.t / decay);
+        float x = e->click.gain * (float)(env * sin(e->click.phase));
+        out[2 * i] += x;
+        out[2 * i + 1] += x;
+        e->click.phase += e->click.step;
+        if (++e->click.t >= length) e->click.t = -1;
+    }
+}
+
 static void apply(sp_engine *e, const sp_cmd *c, bool live) {
     switch (c->type) {
     case SP_CMD_TRIGGER:
@@ -1127,6 +1203,11 @@ static void apply(sp_engine *e, const sp_cmd *c, bool live) {
         e->seq.bpm = 120.0;
         e->seq.swing = 0.5;
         e->seq.tpf = sp_tpf(120.0, e->rate);
+        e->click.beats = 0;
+        break;
+    case SP_CMD_COUNT_IN:
+        if (live && c->u.count_in.beats > 0) start_count_in(e, c->u.count_in.id, c->u.count_in.beats);
+        else e->click.beats = 0;
         break;
     }
     if (c->type == SP_CMD_PATTERN || c->type == SP_CMD_RESET || c->type == SP_CMD_STOP)
@@ -1190,6 +1271,7 @@ static void sp_render(sp_engine *e, float *out, int frames) {
         }
     }
     mix(e, out, cursor, frames);
+    clicks(e, out, frames);
 
     for (int i = 0; i < 2 * frames; i++) out[i] = sp_soft_clip(out[i]);
     e->frame += frames;

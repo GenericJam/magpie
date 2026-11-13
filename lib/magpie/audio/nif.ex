@@ -73,4 +73,28 @@ defmodule Magpie.Audio.Nif do
 
   @doc "Start callback timing, trigger latency, the voice peak, steals and hard cuts over."
   def reset_stats, do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Open input `source` (`:mic` | `:apps`), closing any other (owner only,
+  dirty IO). The outcome arrives as `{:magpie_audio, :input, :started,
+  info}` or `{:magpie_audio, :input, :closed, reason}`.
+  """
+  def input_open(_source), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Close the input; a recording in progress is dropped (owner only, dirty IO)."
+  def input_close, do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Arm the recorder on the open input: `mode` `:now | :on_sound |
+  :count_in`, `max_seconds`, `threshold_db` (`:on_sound`), `pre_roll_ms`
+  (`:on_sound`) (owner only).
+  """
+  def record_start(_mode, _max_seconds, _threshold_db, _pre_roll_ms),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Stop recording: `{:ok, %{pcm, rate, channels, frames, peaks, peak_frames}}` (owner only, dirty IO)."
+  def record_stop, do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Drop the recording (owner only, dirty IO)."
+  def record_cancel, do: :erlang.nif_error(:nif_not_loaded)
 end

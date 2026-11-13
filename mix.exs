@@ -30,6 +30,8 @@ defmodule Magpie.MixProject do
       # mix mob.icon renders the launcher icons with it.
       {:image, "~> 0.54", only: :dev, runtime: false},
       {:ecto_sqlite3, "~> 0.18"},
+      # The "Other apps" recording source (Kotlin; see mob.exs).
+      {:magpie_capture, path: "plugins/magpie_capture"},
       # Tests check kit files against design/kit.schema.json itself.
       {:jsv, "~> 0.27.0", only: :test},
       # Code quality — Credo + ex_slop (catches AI-generated patterns

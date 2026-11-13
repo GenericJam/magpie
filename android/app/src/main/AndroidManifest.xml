@@ -71,6 +71,10 @@
         </intent>
     </queries>
 
+    <!-- mob:plugin-permissions BEGIN (managed — regenerated each build; do not edit) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- mob:plugin-permissions END -->
     <application
         android:label="Magpie"
         android:icon="@mipmap/ic_launcher"
@@ -119,5 +123,11 @@
                 android:resource="@xml/file_provider_paths" />
         </provider>
 
+        <!-- mob:plugin-components BEGIN (managed — regenerated each build; do not edit) -->
+        <service
+            android:name="com.genericjam.magpie.capture.MagpieCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+        <!-- mob:plugin-components END -->
     </application>
 </manifest>

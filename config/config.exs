@@ -17,4 +17,8 @@ config :magpie,
 if config_env() == :test do
   # Host tests use a fresh in-memory database each time the Repo starts.
   config :magpie, Magpie.Repo, database: ":memory:", log: false
+
+  # Screens skip the phone's own calls (permission dialogs, the file picker,
+  # orientation): tests drive their results as messages.
+  config :magpie, device_calls: false
 end

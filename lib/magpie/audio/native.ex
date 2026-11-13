@@ -88,4 +88,20 @@ defmodule Magpie.Audio.Native do
 
   @doc "Start callback timing, trigger latency, the voice peak, steals and hard cuts over (for measuring a stretch)."
   def reset_stats, do: Nif.reset_stats()
+
+  @impl true
+  def input_open(source) when source in [:mic, :apps], do: Nif.input_open(source)
+
+  @impl true
+  def input_close, do: Nif.input_close()
+
+  @impl true
+  def record_start(%{mode: mode, max_seconds: max, threshold_db: db, pre_roll_ms: ms}),
+    do: Nif.record_start(mode, max / 1, db / 1, ms / 1)
+
+  @impl true
+  def record_stop, do: Nif.record_stop()
+
+  @impl true
+  def record_cancel, do: Nif.record_cancel()
 end
