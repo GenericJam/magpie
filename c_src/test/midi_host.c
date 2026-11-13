@@ -794,6 +794,29 @@ static void test_follow_loss(void) {
           tempo ? tempo->a / 1000.0 : 0, n, worst);
     free_engine(e);
 
+    /* Stop right after a tick held after a lost one, then Continue with no
+     * song position: it resumes on the 16th after the master's last tick
+     * (the held tick taken as after the lost one). The lost tick is placed
+     * so that counting it or not changes that 16th. */
+    e = follow_run(&m, 120.0, &k_start);
+    int64_t lost_k = m.k + 2;
+    while ((lost_k + 1 - k_start) % 6 != 0) lost_k++;
+    m.lost[lost_k] = true;
+    while (m.k < lost_k + 2) follow_block(e, &m);
+    midi(e, 0xFC, 0, 0, (int64_t)(m.next_ns - 1e6));
+    for (int i = 0; i < 40; i++) follow_block(e, &m);
+    int want = (int)((lost_k + 2 - k_start + 5) / 6);
+    reset_log();
+    midi(e, 0xFB, 0, 0, (int64_t)m.next_ns);
+    for (int i = 0; i < 40; i++) follow_block(e, &m);
+    const sp_event *cont = NULL;
+    for (int i = 0; i < n_evs && !cont; i++)
+        if (evs[i].type == SP_EV_PLAYHEAD) cont = &evs[i];
+    CHECK(cont && cont->a == want % 16,
+          "Stop just after a tick held after a lost one, Continue: resumes at step %d (%d, the next 16th)",
+          cont ? cont->a : -1, want % 16);
+    free_engine(e);
+
     /* Lost ticks soon after the fit restarts, in clusters, with more
      * jitter; tempo drops to under a third; a stalled sender. Ticks are
      * offsets from the scenario's start (the tempo change, if any).
