@@ -1,0 +1,184 @@
+/*
+ * c_src/midi.c — the plain-C pieces of Magpie's MIDI: the byte-stream
+ * parser, the line fit the clock follower steers by, and the out queue
+ * between the renderer and the thread that sends. sampler.c includes it
+ * (the renderer maps notes, follows and sends clock; see "MIDI" there), so
+ * it builds on the Mac for the host tests too.
+ *
+ * Time: incoming messages carry CLOCK_MONOTONIC nanoseconds (Android's
+ * MIDI timestamps are System.nanoTime); outgoing ones carry the engine
+ * frame they belong to, which the sending thread turns into nanoseconds
+ * through the output timestamp.
+ */
+
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+
+/* Not every includer uses every helper (the host tests, the NIF). */
+#define MI_UNUSED __attribute__((unused))
+
+/* ── Parser ───────────────────────────────────────────────────────────────── */
+
+/* One complete message: `n` bytes (1..3). */
+typedef struct {
+    uint8_t status, d1, d2, n;
+} mi_msg;
+
+/* Per source: a stream of bytes may split a message anywhere. */
+typedef struct {
+    uint8_t status;  /* the message being assembled (running status for channel messages); 0 none */
+    uint8_t data[2];
+    uint8_t have, need;
+    bool sysex;
+} mi_parser;
+
+static int mi_data_len(uint8_t status) {
+    if (status < 0xF0) {
+        uint8_t type = status & 0xF0;
+        return type == 0xC0 || type == 0xD0 ? 1 : 2;
+    }
+    if (status == 0xF1 || status == 0xF3) return 1;
+    if (status == 0xF2) return 2;
+    return 0;
+}
+
+/* Feed `n` bytes; each complete message goes to `emit`. Real-time bytes
+ * (0xF8–0xFF) pass through wherever they fall, even inside another message,
+ * without disturbing it (active sensing and the undefined ones are
+ * dropped). Channel messages keep running status; system common messages
+ * cancel it. SysEx is skipped up to its end (or the next status byte).
+ * Data bytes with no status are dropped. */
+MI_UNUSED static void mi_parse(mi_parser *p, const uint8_t *in, int n, void (*emit)(void *ctx, mi_msg m), void *ctx) {
+    for (int i = 0; i < n; i++) {
+        uint8_t b = in[i];
+        if (b >= 0xF8) {
+            if (b != 0xF9 && b != 0xFD && b != 0xFE) emit(ctx, (mi_msg){b, 0, 0, 1});
+            continue;
+        }
+        if (b == 0xF0) {
+            p->sysex = true;
+            p->status = 0;
+            continue;
+        }
+        if (b == 0xF7) {
+            p->sysex = false;
+            continue;
+        }
+        if (b & 0x80) {
+            p->sysex = false;
+            p->have = 0;
+            p->need = (uint8_t)mi_data_len(b);
+            p->status = b;
+            if (p->need == 0) {
+                if (b != 0xF4 && b != 0xF5) emit(ctx, (mi_msg){b, 0, 0, 1});
+                p->status = 0;
+            }
+            continue;
+        }
+        if (p->sysex || !p->status) continue;
+        p->data[p->have++] = b;
+        if (p->have < p->need) continue;
+        emit(ctx, (mi_msg){p->status, p->data[0], p->need > 1 ? p->data[1] : 0, (uint8_t)(1 + p->need)});
+        p->have = 0;
+        if (p->status >= 0xF0) p->status = 0;
+    }
+}
+
+/* ── The follower's line ──────────────────────────────────────────────────── */
+
+#define MI_FIT 24 /* ticks the fit looks back over: one beat */
+
+/* Tick k arrived at (heard) engine frame f: the last MI_FIT of them. */
+typedef struct {
+    int64_t k[MI_FIT];
+    double f[MI_FIT];
+    int n, head;
+} mi_fit;
+
+static void mi_fit_reset(mi_fit *t) { t->n = t->head = 0; }
+
+static void mi_fit_add(mi_fit *t, int64_t k, double f) {
+    t->k[t->head] = k;
+    t->f[t->head] = f;
+    t->head = (t->head + 1) % MI_FIT;
+    if (t->n < MI_FIT) t->n++;
+}
+
+/* Least squares f = fc + P·(k − kc): the centroid (kc, fc) and the slope P
+ * (frames per tick). False with fewer than two ticks or a slope that isn't
+ * positive. Sums relative to the newest tick, so large frame counts keep
+ * their precision. */
+static bool mi_fit_line(const mi_fit *t, double *kc, double *fc, double *P) {
+    if (t->n < 2) return false;
+    int newest = (t->head + MI_FIT - 1) % MI_FIT;
+    int64_t k0 = t->k[newest];
+    double f0 = t->f[newest], sk = 0, sf = 0;
+    for (int i = 0; i < t->n; i++) {
+        sk += (double)(t->k[i] - k0);
+        sf += t->f[i] - f0;
+    }
+    double mk = sk / t->n, mf = sf / t->n, skk = 0, skf = 0;
+    for (int i = 0; i < t->n; i++) {
+        double dk = (double)(t->k[i] - k0) - mk, df = t->f[i] - f0 - mf;
+        skk += dk * dk;
+        skf += dk * df;
+    }
+    if (skk <= 0 || skf <= 0) return false;
+    *P = skf / skk;
+    *kc = (double)k0 + mk;
+    *fc = f0 + mf;
+    return true;
+}
+
+/* ── The out queue (renderer → sending thread) ────────────────────────────── */
+
+#define MO_RING 1024 /* power of two */
+
+enum { MO_NOTE, MO_CLOCK, MO_TRANSPORT };
+
+/* A message for engine frame `frame`. */
+typedef struct {
+    int64_t frame;
+    uint8_t len, kind;
+    uint8_t b[3];
+} mo_event;
+
+typedef struct {
+    mo_event ev[MO_RING];
+    _Atomic uint32_t head, tail;
+    _Atomic uint64_t dropped;
+} mo_ring;
+
+static bool mo_push(mo_ring *r, const mo_event *ev) {
+    uint32_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
+    uint32_t head = atomic_load_explicit(&r->head, memory_order_acquire);
+    if (tail - head >= MO_RING) {
+        atomic_fetch_add_explicit(&r->dropped, 1, memory_order_relaxed);
+        return false;
+    }
+    r->ev[tail & (MO_RING - 1)] = *ev;
+    atomic_store_explicit(&r->tail, tail + 1, memory_order_release);
+    return true;
+}
+
+/* The oldest message without taking it; false when empty. */
+MI_UNUSED static bool mo_peek(mo_ring *r, mo_event *ev) {
+    uint32_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
+    if (head == tail) return false;
+    *ev = r->ev[head & (MO_RING - 1)];
+    return true;
+}
+
+MI_UNUSED static void mo_drop(mo_ring *r) {
+    uint32_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
+    atomic_store_explicit(&r->head, head + 1, memory_order_release);
+}
+
+MI_UNUSED static bool mo_pop(mo_ring *r, mo_event *ev) {
+    if (!mo_peek(r, ev)) return false;
+    mo_drop(r);
+    return true;
+}

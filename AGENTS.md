@@ -482,6 +482,43 @@ starts the take on the frame captured when its downbeat is heard.
     silence for ~10 s. A tap or `KEYCODE_MEDIA_PLAY` starts it;
   - Magpie's own sequencer: digital silence (its UID is excluded).
 
+## MIDI
+
+Why it is built this way: `decisions/2026-11-13-midi.md`. No MIDI byte
+passes through the BEAM.
+
+- **Native:** `plugins/magpie_midi` (Kotlin only, `MagpieMidi.kt`): the
+  `MagpieMidiService` port "Magpie" (one input, one output), the device
+  watcher, open/close of devices (all output ports in, input port 0 out),
+  Bluetooth-MIDI scan/connect (`:midi_bluetooth` capability). The
+  `magpie_audio` NIF registers its natives (`nativeIn`, `nativeEvent`) and
+  starts a sending thread in `open/1`. `c_src/midi.c` (plain C): parser,
+  the follower's line fit, the out ring. `c_src/sampler.c` "MIDI in/out":
+  the renderer maps notes through the kit's table, sends notes/clock
+  stamped with engine frames, follows an incoming clock.
+- **Rule:** a note plays every non-keys pad whose `midi_note` it is (any
+  bank); unclaimed notes go to every keys pad (chromatic from its root);
+  note-off releases gate/loop/keys; CC 120/123 release MIDI voices.
+  Played voices (touch, sequencer) send note-on/off; MIDI voices don't
+  echo. Out channel = `in_channel` or 1. Clock `send`: tick every 4 seq
+  ticks, SPP 0 + Start on play, Stop, free-running while stopped.
+  `follow`: LS fit over 24 ticks (reset after two same-side misses > 3 ms),
+  position steered onto it half a beat ahead; downbeat late by the
+  write-ahead, then on the master's grid.
+- **Elixir:** `Magpie.Midi.Map.config/1` / `route/2` (the table and the
+  rule), `Engine.set_midi/1` (KitSession pushes it on every kit change),
+  `KitSession.set_midi(%{in_channel, clock})`, `Magpie.Midi` (devices:
+  USB/BLE auto-open, other apps' ports on request, choices in `Mob.State`;
+  `subscribe/1`, `set_open/2`, `ble_scan/0`, `ble_connect/1`), Engine
+  messages `{:magpie_audio, :transport, playing, frame}` and
+  `{:magpie_audio, :tempo, bpm}`, `Engine.state/0` `midi` and
+  `follow_tempo`, `info/0` `midi` stats. `Magpie.MidiScreen` (plain, not
+  designed) behind the magpie button.
+- **Checking it:** `cc -O2 -Wall -Wextra -Wno-unused-function -o
+  /tmp/midi_host c_src/test/midi_host.c -lm && /tmp/midi_host` (also with
+  `-fsanitize=address,undefined`); `mix test test/magpie/midi_*_test.exs
+  test/magpie/kit_session_midi_test.exs`. Not yet measured on a device.
+
 ## The pads (`Magpie.PadsScreen`)
 
 The root screen (`stack(:main, root: Magpie.PadsScreen)`), landscape,

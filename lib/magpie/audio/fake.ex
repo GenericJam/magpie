@@ -50,6 +50,19 @@ defmodule Magpie.Audio.Fake do
   later at the fake's tempo and records only after `downbeat/0` (no
   pre-roll). At `max_seconds` it sends `:full` and takes no more.
   `record_stop/0` without a recorded frame is `{:error, :not_started}`.
+
+  ## MIDI
+
+  `set_midi/1` keeps the table (`state/0`'s `midi`); `midi_in/1` plays a
+  message through it as the phone's renderer would (`Magpie.Midi.Map.route/2`,
+  live calls, recorded in `calls/0` as `{:midi, message}`), `follow/1`
+  drives what an incoming clock would (Start, Stop, the tempo). Play and
+  stop send `:transport` as the phone does. Devices: `plug/1` and
+  `unplug/1` add and remove one (`{:magpie_midi, :added | :removed,
+  json}` to the listener), `midi_open/1` opens a known one at once
+  (`:opened`) unless `fail_midi_open/1` armed a failure (`:open_failed`),
+  `midi_event/2` sends the listener anything else. The device list and the
+  listener outlive `reset/0`, as Kotlin's do.
   """
 
   @behaviour Magpie.Audio
@@ -152,6 +165,32 @@ defmodule Magpie.Audio.Fake do
   @impl Magpie.Audio
   def record_cancel, do: call(:record_cancel)
 
+  @impl Magpie.Audio
+  def set_midi(config), do: call({:set_midi, config})
+
+  @impl Magpie.Audio
+  def midi_listen(pid) when is_pid(pid), do: call({:midi_listen, pid})
+
+  @impl Magpie.Audio
+  def midi_devices, do: call(:midi_devices)
+
+  @impl Magpie.Audio
+  def midi_open(id) when is_integer(id), do: call({:midi_open, id})
+
+  @impl Magpie.Audio
+  def midi_close(id) when is_integer(id), do: call({:midi_close, id})
+
+  @impl Magpie.Audio
+  def midi_ble_scan(ms) when is_integer(ms) and ms > 0, do: call({:midi_ble, {:scan, ms}})
+
+  @impl Magpie.Audio
+  def midi_ble_connect(address) when is_binary(address),
+    do: call({:midi_ble, {:connect, address}})
+
+  @impl Magpie.Audio
+  def midi_ble_disconnect(address) when is_binary(address),
+    do: call({:midi_ble, {:disconnect, address}})
+
   # ── Driving it from a test ────────────────────────────────────────────────
 
   @doc "Run the sequencer `steps` 16th notes on."
@@ -205,6 +244,29 @@ defmodule Magpie.Audio.Fake do
   def busy(call, n) when call in [:set_pad, :unload_sample] and is_integer(n) and n >= 0,
     do: call({:busy, call, n})
 
+  @doc "A MIDI message `{status, data1, data2}` arrives (needs the stream and a table)."
+  def midi_in({status, d1, d2} = message) when status in 0..255 and d1 in 0..127 and d2 in 0..127,
+    do: call({:midi_in, message})
+
+  @doc """
+  What an incoming clock does while following: `:start` (the sequencer
+  plays from step 0, `:transport` true), `:stop`, `{:tempo, bpm}` (the
+  `:tempo` message).
+  """
+  def follow(what), do: call({:follow, what})
+
+  @doc "A MIDI device appears: `%{id, name, type, inputs, outputs}` (`own` and `address` optional)."
+  def plug(%{id: id} = device) when is_integer(id), do: call({:plug, device})
+
+  @doc "Device `id` goes away."
+  def unplug(id) when is_integer(id), do: call({:unplug, id})
+
+  @doc "Make the next `midi_open/1` fail with `reason` (nil: open again)."
+  def fail_midi_open(reason), do: call({:fail_midi_open, reason})
+
+  @doc "Send the MIDI listener `{:magpie_midi, tag, json}` (`map` as JSON)."
+  def midi_event(tag, map) when is_atom(tag) and is_map(map), do: call({:midi_event, tag, map})
+
   # ── Server ────────────────────────────────────────────────────────────────
 
   defp call(request) do
@@ -243,7 +305,11 @@ defmodule Magpie.Audio.Fake do
       play_frame: 0,
       sounding: %{},
       gated: [],
-      calls: []
+      calls: [],
+      midi: nil,
+      midi_listener: nil,
+      midi_devices: %{},
+      midi_fail_open: nil
     }
   end
 
@@ -309,14 +375,114 @@ defmodule Magpie.Audio.Fake do
 
   def handle_call(:downbeat, _from, s), do: {:reply, {:error, :not_counting}, s}
 
+  # MIDI devices: Kotlin's, open to every process.
+  def handle_call({:midi_listen, pid}, _from, s), do: {:reply, :ok, %{s | midi_listener: pid}}
+
+  def handle_call(:midi_devices, _from, s),
+    do: {:reply, {:ok, s.midi_devices |> Map.values() |> Enum.map(&Map.delete(&1, :open))}, s}
+
+  def handle_call({:midi_open, id}, _from, s) do
+    case {s.midi_devices[id], s.midi_fail_open} do
+      {nil, _} ->
+        {:reply, {:error, :unknown_device}, s}
+
+      {_device, nil} ->
+        midi_tell(s, :opened, %{id: id})
+        {:reply, :ok, put_in(s.midi_devices[id].open, true)}
+
+      {_device, reason} ->
+        midi_tell(s, :open_failed, %{id: id, reason: reason})
+        {:reply, :ok, %{s | midi_fail_open: nil}}
+    end
+  end
+
+  def handle_call({:midi_close, id}, _from, s) do
+    case s.midi_devices[id] do
+      %{open: true} ->
+        midi_tell(s, :closed, %{id: id})
+        {:reply, :ok, put_in(s.midi_devices[id].open, false)}
+
+      _ ->
+        {:reply, :ok, s}
+    end
+  end
+
+  def handle_call({:midi_ble, call}, _from, s), do: {:reply, :ok, %{s | calls: [call | s.calls]}}
+
+  def handle_call({:plug, device}, _from, s) do
+    device = Map.merge(%{own: false, address: "", open: false}, device)
+    midi_tell(s, :added, Map.delete(device, :open))
+    {:reply, :ok, put_in(s.midi_devices[device.id], device)}
+  end
+
+  def handle_call({:unplug, id}, _from, s) do
+    case Map.pop(s.midi_devices, id) do
+      {nil, _} ->
+        {:reply, :ok, s}
+
+      {device, devices} ->
+        midi_tell(s, :removed, Map.delete(device, :open))
+        {:reply, :ok, %{s | midi_devices: devices}}
+    end
+  end
+
+  def handle_call({:fail_midi_open, reason}, _from, s),
+    do: {:reply, :ok, %{s | midi_fail_open: reason}}
+
+  def handle_call({:midi_event, tag, map}, _from, s) do
+    midi_tell(s, tag, map)
+    {:reply, :ok, s}
+  end
+
+  def handle_call({:midi_in, _message}, _from, %{open: false} = s),
+    do: {:reply, {:error, :not_running}, s}
+
+  def handle_call({:midi_in, message}, _from, s) do
+    actions = if s.midi, do: Magpie.Midi.Map.route(s.midi, message), else: []
+
+    s =
+      Enum.reduce(actions, %{s | calls: [{:midi, message} | s.calls]}, fn
+        {:trigger, pad, vel}, acc -> live(acc, {:trigger, pad, vel, 0})
+        action, acc -> live(acc, action)
+      end)
+
+    {:reply, :ok, s}
+  end
+
+  def handle_call({:follow, :start}, _from, s) do
+    s = %{s | playing: true, local: 0, ticks: 0, play_frame: frame(s)}
+    send(s.owner, {:magpie_audio, :transport, true, frame(s)})
+    {:reply, :ok, at_tick(s)}
+  end
+
+  def handle_call({:follow, :stop}, _from, s), do: stop_sequencer(s)
+
+  def handle_call({:follow, {:tempo, bpm}}, _from, s) do
+    send(s.owner, {:magpie_audio, :tempo, bpm / 1})
+    {:reply, :ok, s}
+  end
+
   def handle_call(_request, {pid, _}, %{owner: owner} = s) when pid != owner,
     do: {:reply, {:error, :not_owner}, s}
 
   def handle_call(:close, _from, s), do: {:reply, :ok, %{s | open: false}}
 
+  def handle_call({:set_midi, config}, _from, s), do: {:reply, :ok, %{s | midi: config}}
+
   # The test's knobs and the ids outlive a reset, as the phone's counters do.
   def handle_call(:reset, _from, s) do
-    keep = Map.take(s, [:fail_input, :refuse_input, :stuck, :last_input, :last_take])
+    keep =
+      Map.take(s, [
+        :fail_input,
+        :refuse_input,
+        :stuck,
+        :last_input,
+        :last_take,
+        :midi_listener,
+        :midi_devices,
+        :midi_fail_open
+      ])
+
     {:reply, :ok, Map.merge(fresh(s.owner, s.open, s.fail_open), keep)}
   end
 
@@ -443,10 +609,13 @@ defmodule Magpie.Audio.Fake do
 
   def handle_call(:play, _from, s) do
     s = %{s | playing: true, local: 0, ticks: 0, play_frame: frame(s)}
+    send(s.owner, {:magpie_audio, :transport, true, frame(s)})
     {:reply, :ok, at_tick(s)}
   end
 
-  def handle_call(:stop, _from, s) do
+  def handle_call(:stop, _from, s), do: stop_sequencer(s)
+
+  defp stop_sequencer(s) do
     s =
       case s.pending do
         {number, pattern} ->
@@ -457,9 +626,20 @@ defmodule Magpie.Audio.Fake do
           s
       end
 
+    if s.playing, do: send(s.owner, {:magpie_audio, :transport, false, frame(s)})
     s = Enum.reduce(s.gated, s, fn {pad, key, _}, acc -> voice_end(acc, pad, key) end)
     {:reply, :ok, %{s | gated: [], playing: false, play_frame: frame(s), ticks: 0, local: 0}}
   end
+
+  defp midi_tell(%{midi_listener: nil}, _tag, _map), do: :ok
+
+  defp midi_tell(s, tag, map) do
+    json = Map.new(map, fn {k, v} -> {k, json_value(v)} end)
+    send(s.midi_listener, {:magpie_midi, tag, JSON.encode!(json)})
+  end
+
+  defp json_value(v) when is_atom(v) and not is_boolean(v) and v != nil, do: Atom.to_string(v)
+  defp json_value(v), do: v
 
   defp busy_reply(s, call),
     do: {:reply, {:error, :busy}, %{s | busy: Map.update!(s.busy, call, &(&1 - 1))}}

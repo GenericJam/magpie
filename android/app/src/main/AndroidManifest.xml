@@ -31,6 +31,11 @@
          permission needed — CameraManager.setTorchMode works without one. -->
     <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
 
+    <!-- MIDI (plugins/magpie_midi: the Magpie port, USB and Bluetooth MIDI).
+         required=false: a phone without the MIDI service runs Magpie without
+         MIDI. -->
+    <uses-feature android:name="android.software.midi" android:required="false" />
+
     <!-- Media-library read permissions moved to the mob_photos plugin manifest
          (READ_MEDIA_IMAGES / READ_MEDIA_VIDEO / READ_EXTERNAL_STORAGE). NOTE the
          plugin's plain-string permission list can't express maxSdkVersion="32"
@@ -74,6 +79,12 @@
     <!-- mob:plugin-permissions BEGIN (managed — regenerated each build; do not edit) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <!-- mob:plugin-permissions END -->
     <application
         android:label="Magpie"
@@ -128,6 +139,18 @@
             android:name="com.genericjam.magpie.capture.MagpieCaptureService"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
+
+        <service
+            android:name="com.genericjam.magpie.midi.MagpieMidiService"
+            android:exported="true"
+            android:permission="android.permission.BIND_MIDI_DEVICE_SERVICE">
+            <intent-filter>
+                <action android:name="android.media.midi.MidiDeviceService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.media.midi.MidiDeviceService"
+                android:resource="@xml/magpie_midi_port" />
+        </service>
         <!-- mob:plugin-components END -->
     </application>
 </manifest>

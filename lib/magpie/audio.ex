@@ -19,6 +19,8 @@ defmodule Magpie.Audio do
       {:magpie_audio, :voice, pad, :start | :end}    # a voice of the pad started; the pad's last voice ended
       {:magpie_audio, :hit, pad, %Magpie.Kit.Step{}} # a live trigger while playing, where it was heard
       {:magpie_audio, :pattern, pattern_number, frame} # a pattern took over
+      {:magpie_audio, :transport, playing, frame}    # the sequencer started (true) or stopped at `frame`, by a call or by MIDI clock follow
+      {:magpie_audio, :tempo, bpm}                   # following MIDI clock: the incoming tempo, once a beat
 
   Input and recording (`c:input_open/1`, `c:record_start/1`):
 
@@ -28,6 +30,18 @@ defmodule Magpie.Audio do
       {:magpie_audio, :record, take, :started, %{pre_roll_frames: n, late_frames: n}}
       {:magpie_audio, :record, take, :full, frames}
       {:magpie_audio, :count_in, take, first_frame, until_frame}
+
+  MIDI devices (`c:midi_listen/1`), to the listener, each with a JSON
+  object (`Magpie.Midi` decodes them):
+
+      {:magpie_midi, :added | :removed, json}   # a device (see `t:midi_device/0`) appeared or went
+      {:magpie_midi, :opened | :closed, json}   # %{"id"}: a device opened (both ways) or closed
+      {:magpie_midi, :open_failed, json}        # %{"id", "reason"}
+      {:magpie_midi, :port, json}               # %{"inputs", "outputs"}: apps connected to the Magpie port
+      {:magpie_midi, :ble_found, json}          # %{"address", "name", "rssi"}: a Bluetooth-MIDI device seen by a scan
+      {:magpie_midi, :ble_scan_done, json}      # %{} or %{"error"}
+      {:magpie_midi, :ble_connected, json}      # %{"address", "id", "name"}: it is a MIDI device now
+      {:magpie_midi, :ble_failed, json}         # %{"address", "reason"}
 
   `input` is the id `c:input_open/1` returned, `take` the one
   `c:record_start/1` returned (positive integers, never reused): a
@@ -159,6 +173,21 @@ defmodule Magpie.Audio do
   @typedoc "Engine frame `frame` is heard at `time` (`System.monotonic_time(:nanosecond)`)."
   @type clock :: %{frame: integer(), time: integer(), rate: pos_integer()}
 
+  @typedoc """
+  A MIDI device the phone knows: USB, Bluetooth (once connected) or
+  another app's virtual port. `own` is Magpie's own port; `inputs` and
+  `outputs` count its ports (an output port is what Magpie receives from).
+  """
+  @type midi_device :: %{
+          id: integer(),
+          name: String.t(),
+          type: :usb | :bluetooth | :virtual,
+          inputs: non_neg_integer(),
+          outputs: non_neg_integer(),
+          own: boolean(),
+          address: String.t()
+        }
+
   @doc """
   Open the output stream (if it isn't) and become the owner:
   `{:ok, %{rate, burst, buffer_frames, low_latency}}`.
@@ -267,6 +296,31 @@ defmodule Magpie.Audio do
   @callback record_stop() :: {:ok, recording()} | {:error, :not_recording | :not_started}
   @doc "Disarm the recorder and drop what it has."
   @callback record_cancel() :: :ok | {:error, term()}
+  @doc """
+  The kit's MIDI (`Magpie.Midi.Map.config/1`): the renderer maps every
+  incoming message through it, sends notes and clock by it. nil: MIDI off.
+  """
+  @callback set_midi(Magpie.Midi.Map.t() | nil) :: :ok | {:error, term()}
+  @doc "Send the `:magpie_midi` device messages to `pid` (one listener). `:unavailable` without MIDI."
+  @callback midi_listen(pid()) :: :ok | {:error, :unavailable}
+  @callback midi_devices() :: {:ok, [midi_device()]} | {:error, :unavailable}
+  @doc """
+  Open a device both ways (its output ports into Magpie, its input port 0
+  for what Magpie sends). The outcome arrives as `:opened` or
+  `:open_failed`.
+  """
+  @callback midi_open(id :: integer()) :: :ok | {:error, term()}
+  @callback midi_close(id :: integer()) :: :ok | {:error, term()}
+  @doc """
+  Scan for Bluetooth-MIDI devices for `ms`: `:ble_found` per device, then
+  `:ble_scan_done`. Errors: `:no_permission` (ask for the
+  `:midi_bluetooth` capability), `:bluetooth_off`, `:location_off`,
+  `:no_bluetooth`, `:unavailable`.
+  """
+  @callback midi_ble_scan(ms :: pos_integer()) :: :ok | {:error, term()}
+  @doc "Connect a scanned device: `:ble_connected` (then `:added`) or `:ble_failed`."
+  @callback midi_ble_connect(address :: String.t()) :: :ok | {:error, term()}
+  @callback midi_ble_disconnect(address :: String.t()) :: :ok | {:error, term()}
 
   @doc "The engine in use."
   def impl, do: Application.get_env(:magpie, :audio, Magpie.Audio.Native)

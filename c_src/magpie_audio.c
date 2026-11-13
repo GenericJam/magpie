@@ -65,6 +65,7 @@
  * minSdk is 28, so both libraries are always present at run time.
  */
 
+#include <errno.h>
 #include <dlfcn.h>
 #include <erl_nif.h>
 #include <fcntl.h>
@@ -371,6 +372,7 @@ static void refresh_input_clock(void);
 static void deliver_input(ErlNifEnv *env, int64_t now);
 static void count_in_heard(ErlNifEnv *env, const ErlNifPid *owner, bool has_owner, const sp_event *ev);
 static ERL_NIF_TERM input_info(ErlNifEnv *env);
+static void midi_in_latency(const sp_event *ev);
 
 static ERL_NIF_TERM atom(ErlNifEnv *env, const char *name) { return enif_make_atom(env, name); }
 
@@ -586,7 +588,7 @@ static void deliver_events(ErlNifEnv *env) {
     ErlNifPid owner = E.owner;
     pthread_mutex_unlock(&E.ctl);
 
-    sp_event ev, head = {.type = 0xff};
+    sp_event ev, head = {.type = 0xff}, tempo = {.type = 0xff};
     bool any_voice = false;
     while (sp_pop_event(&SP, &ev)) {
         switch (ev.type) {
@@ -612,7 +614,17 @@ static void deliver_events(ErlNifEnv *env) {
                                             enif_make_int64(env, ev.frame)));
             break;
         case SP_EV_TRIGGERED:
-            record_latency(&ev);
+            if (ev.b) midi_in_latency(&ev);
+            else record_latency(&ev);
+            break;
+        case SP_EV_TRANSPORT:
+            if (has_owner)
+                send_owner(&owner, env,
+                           enif_make_tuple4(env, tag(env), atom(env, "transport"), atom(env, ev.a ? "true" : "false"),
+                                            enif_make_int64(env, ev.frame)));
+            break;
+        case SP_EV_TEMPO:
+            tempo = ev;
             break;
         case SP_EV_COUNT_IN:
             count_in_heard(env, &owner, has_owner, &ev);
@@ -637,6 +649,9 @@ static void deliver_events(ErlNifEnv *env) {
         send_owner(&owner, env,
                    enif_make_tuple4(env, tag(env), atom(env, "playhead"), enif_make_int(env, head.a),
                                     enif_make_int64(env, head.frame)));
+    if (tempo.type == SP_EV_TEMPO && has_owner)
+        send_owner(&owner, env,
+                   enif_make_tuple3(env, tag(env), atom(env, "tempo"), enif_make_double(env, tempo.a / 1000.0)));
 }
 
 static void refresh_clock(void) {
@@ -1566,6 +1581,296 @@ static void deliver_input(ErlNifEnv *env, int64_t now) {
     pthread_mutex_unlock(&IN.lock);
 }
 
+/* ── MIDI ────────────────────────────────────────────────────────────────── */
+
+/* Kotlin (plugins/magpie_midi) holds the ports and devices; no MIDI byte
+ * passes through the BEAM. In: each receiver hands its bytes and their
+ * timestamp to native_in, which parses them (one parser per source, each
+ * source on its own thread) and queues one SP_CMD_MIDI per message. Out:
+ * the renderer stamps messages with engine frames into SP.midi.out; the
+ * sending thread turns each frame into CLOCK_MONOTONIC through the output
+ * timestamp, sleeps until then and calls MagpieMidi.send with that time.
+ * Device events (tag, JSON) go to the listener as {magpie_midi, Tag, Json}. */
+
+#define MIDI_CLASS "com.genericjam.magpie.midi.MagpieMidi"
+#define MIDI_SOURCES 16
+#define MIDI_LATE_CLOCK_NS 20000000LL /* a tick this late is dropped, not sent in a burst */
+#define MIDI_BATCH_NS 100000LL        /* messages this close together go in one send */
+#define MIDI_SEND_MAX 256
+#define MIDI_STATS 512
+
+static struct {
+    pthread_mutex_t lock; /* the class and its methods once bound, the listener */
+    jclass cls;
+    jmethodID attach, send, devices, open, close, ble_scan, ble_connect, ble_disconnect;
+    ErlNifPid listener;
+    bool has_listener;
+    mi_parser parsers[MIDI_SOURCES];
+    /* The sending thread: started and joined under E.lock. */
+    pthread_t out;
+    bool out_started;
+    _Atomic bool out_run;
+    _Atomic uint64_t received, sent, late_dropped;
+    /* Under E.stats_lock: send time − stamp (µs); MIDI timestamp → heard (ms). */
+    float late_us[MIDI_STATS], in_ms[MIDI_STATS];
+    int64_t late_n, in_n;
+} MI;
+
+typedef struct {
+    int64_t t_ns;
+} midi_ctx;
+
+static void midi_emit(void *ctx, mi_msg m) {
+    atomic_fetch_add_explicit(&MI.received, 1, memory_order_relaxed);
+    if (!atomic_load(&E.running)) return;
+    sp_cmd c = {.type = SP_CMD_MIDI, .u.midi = {m.status, m.d1, m.d2}, .t_ns = ((midi_ctx *)ctx)->t_ns};
+    push_cmd(&c);
+}
+
+/* MagpieMidi.nativeIn(source, data, offset, count, timestamp): a receiver's
+ * thread. A timestamp of 0 (senders that don't stamp) or more than a
+ * second off isn't System.nanoTime: the message counts as arriving now. */
+static void JNICALL native_in(JNIEnv *j, jclass cls, jint source, jbyteArray data, jint offset, jint count,
+                              jlong timestamp) {
+    (void)cls;
+    if (source < 0 || source >= MIDI_SOURCES || count <= 0 || !data) return;
+    int64_t now = now_ns();
+    midi_ctx ctx = {.t_ns = timestamp > now - 1000000000LL && timestamp < now + 1000000000LL ? timestamp : now};
+    uint8_t buf[256];
+    for (jint done = 0; done < count;) {
+        jint n = count - done > (jint)sizeof(buf) ? (jint)sizeof(buf) : count - done;
+        (*j)->GetByteArrayRegion(j, data, offset + done, n, (jbyte *)buf);
+        if (jni_failed(j)) return;
+        mi_parse(&MI.parsers[source], buf, n, midi_emit, &ctx);
+        done += n;
+    }
+}
+
+/* MagpieMidi.nativeEvent(tag, json): a device event for the listener. */
+static void JNICALL native_event(JNIEnv *j, jclass cls, jstring tag, jbyteArray json) {
+    (void)cls;
+    const char *t = tag ? (*j)->GetStringUTFChars(j, tag, NULL) : NULL;
+    if (!t) return;
+    ErlNifEnv *m = enif_alloc_env();
+    jsize len = json ? (*j)->GetArrayLength(j, json) : 0;
+    ERL_NIF_TERM bin;
+    unsigned char *p = enif_make_new_binary(m, (size_t)len, &bin);
+    if (len > 0) (*j)->GetByteArrayRegion(j, json, 0, len, (jbyte *)p);
+    ERL_NIF_TERM msg = enif_make_tuple3(m, atom(m, "magpie_midi"), atom(m, t), bin);
+    (*j)->ReleaseStringUTFChars(j, tag, t);
+    if (!jni_failed(j)) {
+        pthread_mutex_lock(&MI.lock);
+        if (MI.has_listener) enif_send(NULL, &MI.listener, m, msg);
+        pthread_mutex_unlock(&MI.lock);
+    }
+    enif_free_env(m);
+}
+
+static jmethodID static_method(JNIEnv *j, jclass cls, const char *name, const char *sig) {
+    jmethodID id = (*j)->GetStaticMethodID(j, cls, name, sig);
+    return jni_failed(j) ? NULL : id;
+}
+
+/* Find MagpieMidi through the activity's class loader, register its natives
+ * and tell it (attach) that they are there. Takes MI.lock; attach is
+ * called after it is released (it sends an event, which takes it). */
+static bool midi_bind(JNIEnv *j) {
+    pthread_mutex_lock(&MI.lock);
+    if (MI.cls) {
+        pthread_mutex_unlock(&MI.lock);
+        return true;
+    }
+    bool ok = false;
+    if (g_activity && (*j)->PushLocalFrame(j, 16) == JNI_OK) {
+        jmethodID get_loader =
+            method(j, (*j)->GetObjectClass(j, g_activity), "getClassLoader", "()Ljava/lang/ClassLoader;");
+        jobject loader = get_loader ? (*j)->CallObjectMethod(j, g_activity, get_loader) : NULL;
+        if (jni_failed(j)) loader = NULL;
+        jmethodID load_class = loader ? method(j, (*j)->GetObjectClass(j, loader), "loadClass",
+                                               "(Ljava/lang/String;)Ljava/lang/Class;")
+                                      : NULL;
+        jclass cls =
+            load_class ? (jclass)(*j)->CallObjectMethod(j, loader, load_class, (*j)->NewStringUTF(j, MIDI_CLASS)) : NULL;
+        if (jni_failed(j)) cls = NULL;
+        if (cls) {
+            JNINativeMethod natives[] = {
+                {"nativeIn", "(I[BIIJ)V", (void *)native_in},
+                {"nativeEvent", "(Ljava/lang/String;[B)V", (void *)native_event},
+            };
+            MI.attach = static_method(j, cls, "attach", "()V");
+            MI.send = static_method(j, cls, "send", "([BIJ)V");
+            MI.devices = static_method(j, cls, "devices", "()[B");
+            MI.open = static_method(j, cls, "open", "(I)Ljava/lang/String;");
+            MI.close = static_method(j, cls, "close", "(I)V");
+            MI.ble_scan = static_method(j, cls, "bleScan", "(I)Ljava/lang/String;");
+            MI.ble_connect = static_method(j, cls, "bleConnect", "(Ljava/lang/String;)Ljava/lang/String;");
+            MI.ble_disconnect = static_method(j, cls, "bleDisconnect", "(Ljava/lang/String;)V");
+            if (MI.attach && MI.send && MI.devices && MI.open && MI.close && MI.ble_scan && MI.ble_connect &&
+                MI.ble_disconnect && (*j)->RegisterNatives(j, cls, natives, 2) == 0 && !jni_failed(j)) {
+                MI.cls = (jclass)(*j)->NewGlobalRef(j, cls);
+                ok = MI.cls != NULL;
+            }
+        }
+        (*j)->PopLocalFrame(j, NULL);
+    }
+    jclass bound = MI.cls;
+    jmethodID attach = MI.attach;
+    pthread_mutex_unlock(&MI.lock);
+    if (ok) {
+        (*j)->CallStaticVoidMethod(j, bound, attach);
+        jni_failed(j);
+        LOGI("midi: bound");
+    } else {
+        LOGE("midi: %s not usable", MIDI_CLASS);
+    }
+    return ok;
+}
+
+/* MIDI bound (binding it if it isn't), with a JNI env for this thread;
+ * NULL without. Pair with jni_done. */
+static JNIEnv *midi_env(bool *attached) {
+    JNIEnv *j = jni_env(attached);
+    if (!j) return NULL;
+    if (!midi_bind(j)) {
+        jni_done(*attached);
+        return NULL;
+    }
+    return j;
+}
+
+/* When engine frame `frame` is heard (CLOCK_MONOTONIC), or now without a
+ * timestamp yet. */
+static int64_t frame_ns(int64_t frame) {
+    int64_t cf, cns;
+    int rate = atomic_load(&E.rate);
+    if (!sp_get_clock(&SP, &cf, &cns) || rate <= 0) return now_ns();
+    return cns + (int64_t)((double)(frame - cf) * 1e9 / rate);
+}
+
+static void sleep_until(int64_t t) {
+    struct timespec ts = {.tv_sec = (time_t)(t / 1000000000LL), .tv_nsec = (long)(t % 1000000000LL)};
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
+    }
+}
+
+static void stat_push(float *ring, int64_t *n, float v) {
+    pthread_mutex_lock(&E.stats_lock);
+    ring[(*n)++ % MIDI_STATS] = v;
+    pthread_mutex_unlock(&E.stats_lock);
+}
+
+/* The sending thread: each message at the time it is heard, stamped with
+ * it. Messages within MIDI_BATCH_NS of the first go in the same send. A
+ * tick more than MIDI_LATE_CLOCK_NS late is dropped (a stalled client
+ * would otherwise get a burst of clock); notes go however late. */
+static void *midi_out_main(void *arg) {
+    (void)arg;
+    if (setpriority(PRIO_PROCESS, (id_t)gettid(), -19) != 0) LOGE("midi: could not raise the sending thread's priority");
+    JNIEnv *j = NULL;
+    if (!g_jvm || (*g_jvm)->AttachCurrentThreadAsDaemon(g_jvm, &j, NULL) != JNI_OK) {
+        LOGE("midi: the sending thread has no JVM");
+        return NULL;
+    }
+    jbyteArray local = (*j)->NewByteArray(j, MIDI_SEND_MAX);
+    jbyteArray arr = local ? (jbyteArray)(*j)->NewGlobalRef(j, local) : NULL;
+    if (local) (*j)->DeleteLocalRef(j, local);
+    uint8_t buf[MIDI_SEND_MAX];
+    while (arr && atomic_load(&MI.out_run)) {
+        mo_event ev;
+        if (!mo_peek(&SP.midi.out, &ev)) {
+            usleep(1000);
+            continue;
+        }
+        int64_t t = frame_ns(ev.frame), now = now_ns();
+        if (t - now > 5000000LL) {
+            /* Far ahead (the stream renders ~20–40 ms ahead): look again
+             * shortly, so a stop doesn't wait and the clock map stays fresh. */
+            usleep(2000);
+            continue;
+        }
+        if (t > now) sleep_until(t);
+        int n = 0, count = 0;
+        while (mo_peek(&SP.midi.out, &ev) && n + ev.len <= MIDI_SEND_MAX) {
+            int64_t te = frame_ns(ev.frame);
+            if (te > t + MIDI_BATCH_NS) break;
+            mo_drop(&SP.midi.out);
+            if (ev.kind == MO_CLOCK && now_ns() - te > MIDI_LATE_CLOCK_NS) {
+                atomic_fetch_add_explicit(&MI.late_dropped, 1, memory_order_relaxed);
+                continue;
+            }
+            memcpy(buf + n, ev.b, ev.len);
+            n += ev.len;
+            count++;
+        }
+        if (n == 0) continue;
+        (*j)->SetByteArrayRegion(j, arr, 0, n, (const jbyte *)buf);
+        int64_t sent_at = now_ns();
+        (*j)->CallStaticVoidMethod(j, MI.cls, MI.send, arr, (jint)n, (jlong)t);
+        jni_failed(j);
+        atomic_fetch_add_explicit(&MI.sent, (uint64_t)count, memory_order_relaxed);
+        stat_push(MI.late_us, &MI.late_n, (float)((sent_at - t) / 1000.0));
+    }
+    if (arr) (*j)->DeleteGlobalRef(j, arr);
+    (*g_jvm)->DetachCurrentThread(g_jvm);
+    return NULL;
+}
+
+/* Bind MIDI and start the sending thread (dropping what is left in the out
+ * queue from an earlier stream: nobody consumes it before the thread
+ * starts). Caller holds E.lock. */
+static void midi_start_locked(void) {
+    bool attached;
+    JNIEnv *j = midi_env(&attached);
+    if (!j) return;
+    jni_done(attached);
+    if (MI.out_started) return;
+    mo_event ev;
+    while (mo_pop(&SP.midi.out, &ev)) {
+    }
+    atomic_store(&MI.out_run, true);
+    MI.out_started = pthread_create(&MI.out, NULL, midi_out_main, NULL) == 0;
+    if (!MI.out_started) {
+        atomic_store(&MI.out_run, false);
+        LOGE("midi: no sending thread");
+    }
+}
+
+/* Caller holds E.lock. */
+static void midi_stop_locked(void) {
+    if (!MI.out_started) return;
+    atomic_store(&MI.out_run, false);
+    pthread_join(MI.out, NULL);
+    MI.out_started = false;
+}
+
+/* The event thread: a MIDI note's timestamp → when its voice is heard. */
+static void midi_in_latency(const sp_event *ev) {
+    int64_t cf, cns;
+    int rate = atomic_load(&E.rate);
+    if (!sp_get_clock(&SP, &cf, &cns) || rate <= 0) return;
+    double heard_ns = (double)cns + (double)(ev->frame - cf) * 1e9 / rate;
+    stat_push(MI.in_ms, &MI.in_n, (float)((heard_ns - (double)ev->t_ns) / 1e6));
+}
+
+static ERL_NIF_TERM ring_term(ErlNifEnv *env, const float *ring, const int64_t *count_at, int size);
+
+static ERL_NIF_TERM midi_info(ErlNifEnv *env) {
+    ERL_NIF_TERM keys[9] = {atom(env, "bound"),        atom(env, "received"),         atom(env, "applied"),
+                            atom(env, "sent"),         atom(env, "out_dropped"),      atom(env, "late_ticks_dropped"),
+                            atom(env, "in_latency_ms"), atom(env, "out_late_us"),     atom(env, "follow_bpm")};
+    int64_t milli = atomic_load(&SP.midi.follow_bpm_milli);
+    ERL_NIF_TERM vals[9] = {atom(env, MI.cls ? "true" : "false"),
+                            enif_make_uint64(env, atomic_load(&MI.received)),
+                            enif_make_uint64(env, atomic_load(&SP.midi.in_messages)),
+                            enif_make_uint64(env, atomic_load(&MI.sent)),
+                            enif_make_uint64(env, atomic_load(&SP.midi.out.dropped)),
+                            enif_make_uint64(env, atomic_load(&MI.late_dropped)),
+                            ring_term(env, MI.in_ms, &MI.in_n, MIDI_STATS),
+                            ring_term(env, MI.late_us, &MI.late_n, MIDI_STATS),
+                            milli > 0 ? enif_make_double(env, milli / 1000.0) : atom(env, "nil")};
+    return make_map(env, keys, vals, 9);
+}
+
 /* ── NIFs ────────────────────────────────────────────────────────────────── */
 
 /* open(Owner) -> {ok, #{rate, burst, buffer_frames, low_latency}} | {error, Reason}.
@@ -1609,6 +1914,7 @@ static ERL_NIF_TERM nif_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
             return error_tuple(env, "thread");
         }
     }
+    midi_start_locked();
     ERL_NIF_TERM info = stream_info(env);
     pthread_mutex_unlock(&E.lock);
     return enif_make_tuple2(env, ok_atom(env), info);
@@ -1634,6 +1940,7 @@ static ERL_NIF_TERM nif_close(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
     sp_garbage g;
     while (sp_pop_garbage(&SP, &g)) free_garbage(&g);
     pthread_mutex_unlock(&E.ctl);
+    midi_stop_locked();
     bool closed = close_output_locked();
     pthread_mutex_unlock(&E.lock);
     return closed ? ok_atom(env) : error_tuple(env, "output_stuck");
@@ -2027,12 +2334,14 @@ static int cmp_float(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 
-static ERL_NIF_TERM latency_term(ErlNifEnv *env) {
-    float v[LATENCIES];
+/* The newest `size` values of a stats ring (under stats_lock) as count,
+ * mean, p50, p95, min and max; nil when empty. */
+static ERL_NIF_TERM ring_term(ErlNifEnv *env, const float *ring, const int64_t *count_at, int size) {
+    float v[MIDI_STATS > LATENCIES ? MIDI_STATS : LATENCIES];
     pthread_mutex_lock(&E.stats_lock);
-    int n = E.latency_n < LATENCIES ? (int)E.latency_n : LATENCIES;
-    memcpy(v, E.latency_ms, sizeof(float) * (size_t)n);
-    int64_t count = E.latency_n;
+    int64_t count = *count_at;
+    int n = count < size ? (int)count : size;
+    memcpy(v, ring, sizeof(float) * (size_t)n);
     pthread_mutex_unlock(&E.stats_lock);
     if (n == 0) return atom(env, "nil");
     qsort(v, (size_t)n, sizeof(float), cmp_float);
@@ -2046,12 +2355,14 @@ static ERL_NIF_TERM latency_term(ErlNifEnv *env) {
     return make_map(env, keys, vals, 6);
 }
 
+static ERL_NIF_TERM latency_term(ErlNifEnv *env) { return ring_term(env, E.latency_ms, &E.latency_n, LATENCIES); }
+
 /* info() -> map of engine diagnostics. Dirty IO (takes `lock` to ask the
  * stream). */
 static ERL_NIF_TERM nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     (void)argv;
-    enum { N = 28 };
+    enum { N = 29 };
     pthread_mutex_lock(&E.lock);
     AAudioStream *s = E.out;
     int rate = atomic_load(&E.rate);
@@ -2076,7 +2387,7 @@ static ERL_NIF_TERM nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         atom(env, "voices_peak"),     atom(env, "steals"),           atom(env, "hard_cuts"),
         atom(env, "trigger_latency_ms"), atom(env, "samples"),       atom(env, "sample_bytes"),
         atom(env, "dropped"),         atom(env, "playing"),          atom(env, "frame"),
-        atom(env, "input"),
+        atom(env, "input"),           atom(env, "midi"),
     };
     ERL_NIF_TERM dropped[3] = {enif_make_uint64(env, atomic_load(&SP.cmds_dropped)),
                                enif_make_uint64(env, atomic_load(&SP.events_dropped)),
@@ -2111,6 +2422,7 @@ static ERL_NIF_TERM nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         atom(env, atomic_load(&SP.playing_now) ? "true" : "false"),
         enif_make_int64(env, atomic_load(&E.engine_frame)),
         input_info(env),
+        midi_info(env),
     };
     pthread_mutex_unlock(&E.lock);
     return make_map(env, keys, vals, N);
@@ -2132,6 +2444,11 @@ static ERL_NIF_TERM nif_reset_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     atomic_store(&SP.hard_cuts, 0);
     pthread_mutex_lock(&E.stats_lock);
     E.latency_n = 0;
+    MI.late_n = 0;
+    MI.in_n = 0;
+    atomic_store(&MI.received, 0);
+    atomic_store(&MI.sent, 0);
+    atomic_store(&MI.late_dropped, 0);
     pthread_mutex_unlock(&E.stats_lock);
     return ok_atom(env);
 }
@@ -2396,11 +2713,199 @@ static ERL_NIF_TERM input_info(ErlNifEnv *env) {
     return result;
 }
 
+/* set_midi(nil | {InChannel, OutChannel, Clock, NoteMasks, OutNotes}) -> ok
+ * | {error, not_owner | busy | alloc}: the kit's MIDI table (owner only).
+ * InChannel 0 (all) | 1..16, OutChannel 1..16, Clock internal | follow |
+ * send, NoteMasks 128 integers (a bit per pad), OutNotes 64 integers (-1:
+ * the pad sends nothing). */
+static ERL_NIF_TERM nif_set_midi(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    sp_midi_map *m = NULL;
+    if (!enif_is_identical(argv[0], atom(env, "nil"))) {
+        const ERL_NIF_TERM *t;
+        int arity, in_ch, out_ch;
+        unsigned len;
+        if (!enif_get_tuple(env, argv[0], &arity, &t) || arity != 5 || !get_range(env, t[0], 0, 16, &in_ch) ||
+            !get_range(env, t[1], 1, 16, &out_ch) || !enif_get_list_length(env, t[3], &len) || len != 128 ||
+            !enif_get_list_length(env, t[4], &len) || len != SP_PADS)
+            return enif_make_badarg(env);
+        uint8_t clock;
+        if (enif_is_identical(t[2], atom(env, "internal"))) clock = SP_CLOCK_INTERNAL;
+        else if (enif_is_identical(t[2], atom(env, "follow"))) clock = SP_CLOCK_FOLLOW;
+        else if (enif_is_identical(t[2], atom(env, "send"))) clock = SP_CLOCK_SEND;
+        else return enif_make_badarg(env);
+        m = calloc(1, sizeof(*m));
+        if (!m) return error_tuple(env, "alloc");
+        *m = (sp_midi_map){.in_channel = (uint8_t)in_ch, .out_channel = (uint8_t)out_ch, .clock = clock};
+        ERL_NIF_TERM head, tail = t[3];
+        for (int i = 0; enif_get_list_cell(env, tail, &head, &tail); i++) {
+            ErlNifUInt64 mask;
+            if (!enif_get_uint64(env, head, &mask)) {
+                free(m);
+                return enif_make_badarg(env);
+            }
+            m->notes[i] = mask;
+        }
+        tail = t[4];
+        for (int i = 0; enif_get_list_cell(env, tail, &head, &tail); i++) {
+            int note;
+            if (!get_range(env, head, -1, 127, &note)) {
+                free(m);
+                return enif_make_badarg(env);
+            }
+            m->out_note[i] = (int16_t)note;
+        }
+    }
+    pthread_mutex_lock(&E.ctl);
+    if (!is_owner(env)) {
+        pthread_mutex_unlock(&E.ctl);
+        free(m);
+        return error_tuple(env, "not_owner");
+    }
+    sp_cmd c = {.type = SP_CMD_MIDI_MAP, .u.map = m};
+    bool queued = ctl_push(&c);
+    pthread_mutex_unlock(&E.ctl);
+    if (!queued) {
+        free(m);
+        return error_tuple(env, "busy");
+    }
+    return ok_atom(env);
+}
+
+/* midi_listen(Pid) -> ok | {error, unavailable}: device events to Pid.
+ * Dirty IO (binds MIDI on first use). */
+static ERL_NIF_TERM nif_midi_listen(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    ErlNifPid pid;
+    if (!enif_get_local_pid(env, argv[0], &pid)) return enif_make_badarg(env);
+    pthread_mutex_lock(&MI.lock);
+    MI.listener = pid;
+    MI.has_listener = true;
+    pthread_mutex_unlock(&MI.lock);
+    bool attached;
+    JNIEnv *j = midi_env(&attached);
+    if (!j) return error_tuple(env, "unavailable");
+    jni_done(attached);
+    return ok_atom(env);
+}
+
+/* A Kotlin answer: "" → ok, else {error, Reason} (null: error). */
+static ERL_NIF_TERM reason_term(ErlNifEnv *env, JNIEnv *j, jstring r) {
+    if (jni_failed(j) || !r) return error_tuple(env, "error");
+    const char *s = (*j)->GetStringUTFChars(j, r, NULL);
+    ERL_NIF_TERM out = s && s[0] ? error_tuple(env, s) : ok_atom(env);
+    if (s) (*j)->ReleaseStringUTFChars(j, r, s);
+    (*j)->DeleteLocalRef(j, r);
+    return out;
+}
+
+/* midi_devices() -> {ok, Json} | {error, unavailable}. Dirty IO. */
+static ERL_NIF_TERM nif_midi_devices(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    (void)argv;
+    bool attached;
+    JNIEnv *j = midi_env(&attached);
+    if (!j) return error_tuple(env, "unavailable");
+    jbyteArray json = (jbyteArray)(*j)->CallStaticObjectMethod(j, MI.cls, MI.devices);
+    ERL_NIF_TERM out = error_tuple(env, "error");
+    if (!jni_failed(j) && json) {
+        jsize len = (*j)->GetArrayLength(j, json);
+        ERL_NIF_TERM bin;
+        unsigned char *p = enif_make_new_binary(env, (size_t)len, &bin);
+        (*j)->GetByteArrayRegion(j, json, 0, len, (jbyte *)p);
+        if (!jni_failed(j)) out = enif_make_tuple2(env, ok_atom(env), bin);
+        (*j)->DeleteLocalRef(j, json);
+    }
+    jni_done(attached);
+    return out;
+}
+
+/* midi_open(Id) / midi_close(Id): open a device both ways (outcome as an
+ * event) or close it. Dirty IO. */
+static ERL_NIF_TERM nif_midi_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    int id;
+    if (!enif_get_int(env, argv[0], &id)) return enif_make_badarg(env);
+    bool attached;
+    JNIEnv *j = midi_env(&attached);
+    if (!j) return error_tuple(env, "unavailable");
+    ERL_NIF_TERM out = reason_term(env, j, (jstring)(*j)->CallStaticObjectMethod(j, MI.cls, MI.open, (jint)id));
+    jni_done(attached);
+    return out;
+}
+
+static ERL_NIF_TERM nif_midi_close(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    int id;
+    if (!enif_get_int(env, argv[0], &id)) return enif_make_badarg(env);
+    bool attached;
+    JNIEnv *j = midi_env(&attached);
+    if (!j) return error_tuple(env, "unavailable");
+    (*j)->CallStaticVoidMethod(j, MI.cls, MI.close, (jint)id);
+    ERL_NIF_TERM out = jni_failed(j) ? error_tuple(env, "error") : ok_atom(env);
+    jni_done(attached);
+    return out;
+}
+
+/* midi_ble_scan(Ms) -> ok | {error, Reason}. Dirty IO. */
+static ERL_NIF_TERM nif_midi_ble_scan(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    int ms;
+    if (!get_range(env, argv[0], 1, 600000, &ms)) return enif_make_badarg(env);
+    bool attached;
+    JNIEnv *j = midi_env(&attached);
+    if (!j) return error_tuple(env, "unavailable");
+    ERL_NIF_TERM out = reason_term(env, j, (jstring)(*j)->CallStaticObjectMethod(j, MI.cls, MI.ble_scan, (jint)ms));
+    jni_done(attached);
+    return out;
+}
+
+/* An address binary as a Java string (NULL: not one). */
+static jstring address_string(ErlNifEnv *env, JNIEnv *j, ERL_NIF_TERM term) {
+    ErlNifBinary b;
+    char s[32];
+    if (!enif_inspect_binary(env, term, &b) || b.size == 0 || b.size >= sizeof(s)) return NULL;
+    memcpy(s, b.data, b.size);
+    s[b.size] = 0;
+    return (*j)->NewStringUTF(j, s);
+}
+
+/* midi_ble_connect(Address) -> ok | {error, Reason}; midi_ble_disconnect. Dirty IO. */
+static ERL_NIF_TERM nif_midi_ble_connect(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    bool attached;
+    JNIEnv *j = midi_env(&attached);
+    if (!j) return error_tuple(env, "unavailable");
+    jstring a = address_string(env, j, argv[0]);
+    ERL_NIF_TERM out = a ? reason_term(env, j, (jstring)(*j)->CallStaticObjectMethod(j, MI.cls, MI.ble_connect, a))
+                         : enif_make_badarg(env);
+    if (a) (*j)->DeleteLocalRef(j, a);
+    jni_done(attached);
+    return out;
+}
+
+static ERL_NIF_TERM nif_midi_ble_disconnect(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    bool attached;
+    JNIEnv *j = midi_env(&attached);
+    if (!j) return error_tuple(env, "unavailable");
+    jstring a = address_string(env, j, argv[0]);
+    ERL_NIF_TERM out = enif_make_badarg(env);
+    if (a) {
+        (*j)->CallStaticVoidMethod(j, MI.cls, MI.ble_disconnect, a);
+        out = jni_failed(j) ? error_tuple(env, "error") : ok_atom(env);
+        (*j)->DeleteLocalRef(j, a);
+    }
+    jni_done(attached);
+    return out;
+}
+
 static int on_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     (void)priv;
     (void)info;
     pthread_mutex_init(&E.lock, NULL);
     pthread_mutex_init(&IN.lock, NULL);
+    pthread_mutex_init(&MI.lock, NULL);
     pcm_type = enif_open_resource_type(env, NULL, "magpie_pcm", pcm_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!pcm_type) return 1;
     pthread_mutex_init(&E.ctl, NULL);
@@ -2441,6 +2946,14 @@ static ErlNifFunc nif_funcs[] = {
     {"record_start", 4, nif_record_start, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"record_stop", 0, nif_record_stop, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"record_cancel", 0, nif_record_cancel, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"set_midi", 1, nif_set_midi, 0},
+    {"midi_listen", 1, nif_midi_listen, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"midi_devices", 0, nif_midi_devices, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"midi_open", 1, nif_midi_open, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"midi_close", 1, nif_midi_close, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"midi_ble_scan", 1, nif_midi_ble_scan, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"midi_ble_connect", 1, nif_midi_ble_connect, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"midi_ble_disconnect", 1, nif_midi_ble_disconnect, ERL_NIF_DIRTY_JOB_IO_BOUND},
 };
 
 ERL_NIF_INIT(Elixir.Magpie.Audio.Nif, nif_funcs, on_load, NULL, NULL, NULL)

@@ -30,6 +30,18 @@
  * [48s, 48). A step's tick 0 lands on its swung start and an off-grid tick
  * keeps its relative place; hits are unwarped the same way, so a recorded
  * hit plays back where it was heard.
+ *
+ * MIDI (c_src/midi.c holds the parser, the follower's line fit and the out
+ * ring): each incoming message is a command (SP_CMD_MIDI, with its
+ * CLOCK_MONOTONIC timestamp) the renderer maps through the kit's table
+ * (sp_midi_map: per note the pads it plays, per pad the note it sends).
+ * Voices started by touch or by the sequencer send note-on on their first
+ * frame and note-off when they stop sounding at full (release, cut or
+ * end). Clock send puts a tick on every 4th position (24 PPQN), exact to
+ * the frame like the steps; clock follow steers the sequencer's ticks per
+ * frame onto a line fitted through the incoming ticks. Out messages carry
+ * their engine frame and go, sorted, into an SPSC ring the sending thread
+ * drains.
  */
 
 #include <math.h>
@@ -38,6 +50,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "midi.c"
 
 #define SP_PADS 64
 #define SP_POLY 32       /* voices sounding at full level */
@@ -50,6 +64,7 @@
 #define SP_MARKS 512     /* power of two: rendered segments kept for stamping hits */
 #define SP_ACTIONS 512   /* sequencer actions in one block */
 #define SP_MAX_STEPS 4096 /* events in one pattern */
+#define SP_MIDI_BLOCK 256 /* MIDI out messages in one block */
 
 #define SP_PPQN 96
 #define SP_STEP 24
@@ -62,12 +77,19 @@
 #define SP_DECLICK_IN_MS 0.5    /* every voice fades in at least this long */
 #define SP_DECLICK_OUT_MS 1.0   /* and out at its region's end */
 #define SP_FRAME_TOL 1e-6       /* frames: a position on a frame sounds on it */
+#define SP_FOLLOW_MISS_MS 3.0   /* an incoming tick this far off the fitted line is a tempo change, not jitter */
 #define SP_SEG_EPS 1e-7         /* ticks: just before a change point */
 
 #define SP_PEAK_FRAMES 256      /* frames per peak byte */
 #define SP_SOFT_KNEE 0.8f
 
 enum { SP_ONE_SHOT, SP_GATE, SP_LOOP, SP_TOGGLE, SP_KEYS };
+
+/* Who started a voice: played (touch, the sequencer, a BEAM call) sends
+ * MIDI out; a MIDI note doesn't echo. */
+enum { SP_SRC_PLAYED, SP_SRC_MIDI };
+
+enum { SP_CLOCK_INTERNAL, SP_CLOCK_FOLLOW, SP_CLOCK_SEND };
 
 /* ── Data ─────────────────────────────────────────────────────────────────── */
 
@@ -107,6 +129,17 @@ typedef struct sp_pattern {
     sp_step steps[]; /* sorted by pos */
 } sp_pattern;
 
+/* The kit's MIDI, compiled by Magpie.Midi.Map: which pads a note plays and
+ * which note a pad sends. Allocated by the control side, swapped in whole
+ * (SP_CMD_MIDI_MAP) and retired through the garbage queue. */
+typedef struct sp_midi_map {
+    uint8_t in_channel;  /* 0: all; else 1..16 */
+    uint8_t out_channel; /* 1..16 */
+    uint8_t clock;       /* SP_CLOCK_* */
+    uint64_t notes[128]; /* per note, a bit per pad */
+    int16_t out_note[SP_PADS]; /* −1: the pad sends nothing */
+} sp_midi_map;
+
 enum {
     SP_CMD_TRIGGER,
     SP_CMD_RELEASE,
@@ -122,6 +155,8 @@ enum {
     SP_CMD_RATE,
     SP_CMD_RESET,
     SP_CMD_COUNT_IN,
+    SP_CMD_MIDI,
+    SP_CMD_MIDI_MAP,
 };
 
 typedef struct {
@@ -145,22 +180,36 @@ typedef struct {
             uint32_t id; /* reported with the count-in's event */
             int beats;   /* 0: cancel the count-in */
         } count_in;
+        struct {
+            uint8_t status, d1, d2; /* one message; t_ns is when it arrived */
+        } midi;
+        sp_midi_map *map; /* NULL: MIDI off */
     } u;
 } sp_cmd;
 
-enum { SP_EV_PLAYHEAD, SP_EV_VOICE_START, SP_EV_VOICE_END, SP_EV_HIT, SP_EV_PATTERN, SP_EV_TRIGGERED, SP_EV_COUNT_IN };
+enum {
+    SP_EV_PLAYHEAD,
+    SP_EV_VOICE_START,
+    SP_EV_VOICE_END,
+    SP_EV_HIT,
+    SP_EV_PATTERN,
+    SP_EV_TRIGGERED,
+    SP_EV_COUNT_IN,
+    SP_EV_TRANSPORT,
+    SP_EV_TEMPO,
+};
 
 typedef struct {
     uint8_t type, pad, vel;
     int16_t note;  /* hit: −1 unless a keys pad */
-    int32_t a;     /* playhead, hit: step; pattern: id; count-in: id */
-    int32_t b;     /* hit: tick (−12..12); count-in: beats */
+    int32_t a;     /* playhead, hit: step; pattern: id; count-in: id; transport: playing; tempo: bpm × 1000 */
+    int32_t b;     /* hit: tick (−12..12); count-in: beats; triggered: 1 from MIDI in */
     int64_t frame; /* engine frame; count-in: its first click */
-    int64_t t_ns;  /* triggered: when the call was made */
+    int64_t t_ns;  /* triggered: when the call was made (MIDI: when the message arrived) */
     int64_t until; /* count-in: the downbeat after its last click */
 } sp_event;
 
-enum { SP_GB_SAMPLE = 1, SP_GB_PATTERN = 2 };
+enum { SP_GB_SAMPLE = 1, SP_GB_PATTERN = 2, SP_GB_MIDI_MAP = 3 };
 
 typedef struct {
     int kind;
@@ -184,6 +233,9 @@ typedef struct {
     double gate_at;       /* sequencer position of an automatic release (a sequenced step's end); < 0 none */
     float level;          /* gain × envelope at the last frame, for stealing */
     uint64_t serial;      /* start order */
+    bool from_midi;       /* started by a MIDI note */
+    uint8_t out_ch;       /* the channel its note-on went out on … */
+    int16_t out_note;     /* … and the note; −1: nothing sent (or its note-off is out) */
 } sp_voice;
 
 /* A linear stretch of the sequencer's time, for stamping hits. */
@@ -237,6 +289,7 @@ typedef struct {
     int rate;
     bool offline; /* sp_drain: no audio runs, cuts are immediate */
     int64_t frame;
+    int64_t at; /* the frame being processed: a block's first for commands, an action's own */
     sp_pad pads[SP_PADS];
     sp_sample *slots[SP_SLOTS];
     sp_sample *retired;
@@ -274,6 +327,28 @@ typedef struct {
 
     sp_action actions[SP_ACTIONS];
     int n_actions;
+
+    /* MIDI. The renderer's, except the out ring (its consumer is the
+     * sending thread) and the counters. */
+    struct {
+        sp_midi_map *map;              /* NULL: MIDI off */
+        mo_event block[SP_MIDI_BLOCK]; /* this block's messages, sorted by frame at its end */
+        int n_block;
+        mo_ring out;
+        double free_next; /* clock send while stopped: the next tick's frame; < 0 from the next block */
+        /* Clock follow. */
+        mi_fit fit;
+        int64_t ticks;    /* incoming clock ticks counted */
+        double last_tick; /* its heard frame */
+        int64_t k0;       /* the tick the run started on */
+        double arm_pos;   /* the position the tick after Start / Continue is */
+        int spp;          /* song position (16ths) for Continue */
+        bool armed, following;
+        int misses;       /* ticks in a row off the fitted line (signed: which way) */
+        _Atomic uint64_t in_messages;
+        _Atomic int64_t follow_bpm_milli; /* 0: no clock to follow yet */
+        double bpm_shown;                 /* the followed tempo as reported */
+    } midi;
 
     /* Counters for info (relaxed). */
     _Atomic int32_t voices_active, voices_peak, step_now;
@@ -347,7 +422,7 @@ static void sp_pattern_sort(sp_pattern *p) { qsort(p->steps, (size_t)p->count, s
 
 static void sp_free_garbage(const sp_garbage *g) {
     if (g->kind == SP_GB_SAMPLE) sp_sample_free(g->ptr);
-    else if (g->kind == SP_GB_PATTERN) free(g->ptr);
+    else if (g->kind == SP_GB_PATTERN || g->kind == SP_GB_MIDI_MAP) free(g->ptr);
 }
 
 /* ── Queues ───────────────────────────────────────────────────────────────── */
@@ -461,12 +536,48 @@ static void sp_init(sp_engine *e, int rate) {
     e->seq.tpf = sp_tpf(120.0, rate);
     e->click.t = -1;
     atomic_store(&e->step_now, -1);
+    e->midi.free_next = -1;
+}
+
+/* ── MIDI out (renderer) ──────────────────────────────────────────────────── */
+
+/* A message for engine frame `frame` into this block's list (sorted and
+ * queued at the block's end). Nothing goes out while no audio runs
+ * (sp_drain): it would be stamped in the past. */
+static void midi_push(sp_engine *e, int64_t frame, uint8_t kind, uint8_t len, uint8_t b0, uint8_t b1, uint8_t b2) {
+    if (e->offline) return;
+    if (e->midi.n_block >= SP_MIDI_BLOCK) {
+        atomic_fetch_add_explicit(&e->midi.out.dropped, 1, memory_order_relaxed);
+        return;
+    }
+    e->midi.block[e->midi.n_block++] = (mo_event){.frame = frame, .len = len, .kind = kind, .b = {b0, b1, b2}};
+}
+
+/* The note-on of a voice of `pad` starting at `frame`: the pad's note, or
+ * for a keys pad the note it plays (`played`). Returns the note sent, −1
+ * when the pad sends nothing. */
+static int16_t midi_note_on(sp_engine *e, int pad, int played, int vel, int64_t frame, uint8_t *ch) {
+    const sp_midi_map *m = e->midi.map;
+    if (!m || e->offline || m->out_note[pad] < 0) return -1;
+    int note = played >= 0 ? played : m->out_note[pad];
+    *ch = (uint8_t)((m->out_channel - 1) & 0x0F);
+    midi_push(e, frame, MO_NOTE, 3, (uint8_t)(0x90 | *ch), (uint8_t)note, (uint8_t)vel);
+    return (int16_t)note;
+}
+
+/* The voice stops sounding at full (its release starts, it is cut, or it
+ * ends): the note-off of its note-on. */
+static void voice_note_off(sp_engine *e, sp_voice *v, int64_t frame) {
+    if (v->state != SP_V_ON || v->out_note < 0) return;
+    midi_push(e, frame, MO_NOTE, 3, (uint8_t)(0x80 | v->out_ch), (uint8_t)v->out_note, 64);
+    v->out_note = -1;
 }
 
 /* ── Voices ───────────────────────────────────────────────────────────────── */
 
 static void voice_finish(sp_engine *e, sp_voice *v, int64_t frame) {
     if (v->state == SP_V_FREE) return;
+    voice_note_off(e, v, frame);
     v->state = SP_V_FREE;
     v->smp->refs--;
     v->smp = NULL;
@@ -479,6 +590,7 @@ static void voice_finish(sp_engine *e, sp_voice *v, int64_t frame) {
  * runs) a fade would never finish: cut at once. */
 static void voice_release(sp_engine *e, sp_voice *v, double frames) {
     if (v->state == SP_V_FREE) return;
+    voice_note_off(e, v, e->at);
     if (e->offline) {
         voice_finish(e, v, e->frame);
         return;
@@ -529,11 +641,13 @@ static void release_pad_voices(sp_engine *e, int pad, int note) {
 }
 
 /* Start pad `pad` at `frame`. `note` is the keys-mode note (−1: the root);
- * `gate_at` the sequencer position of an automatic release (< 0: none).
- * Returns false when the pad has nothing to play. */
-static bool voice_start(sp_engine *e, int pad, int vel, int note, double gate_at, int64_t frame) {
+ * `gate_at` the sequencer position of an automatic release (< 0: none);
+ * `src` SP_SRC_PLAYED (sends MIDI out) or SP_SRC_MIDI. Returns false when
+ * the pad has nothing to play. */
+static bool voice_start(sp_engine *e, int pad, int vel, int note, double gate_at, int64_t frame, uint8_t src) {
     const sp_pad *pd = &e->pads[pad];
     if (pd->slot < 0) return false;
+    e->at = frame;
     sp_sample *s = e->slots[pd->slot];
     if (!s || s->frames == 0) return false;
     int64_t start = pd->start < 0 ? 0 : pd->start;
@@ -601,7 +715,9 @@ static bool voice_start(sp_engine *e, int pad, int vel, int note, double gate_at
         .gate_at = gate_at,
         .level = sp_velocity_gain(vel) * pd->gain,
         .serial = ++e->serial,
+        .from_midi = src == SP_SRC_MIDI,
     };
+    v->out_note = src == SP_SRC_PLAYED ? midi_note_on(e, pad, played, vel, frame, &v->out_ch) : -1;
     s->refs++;
     e->pad_voices[pad]++;
     sp_emit(e, &(sp_event){.type = SP_EV_VOICE_START, .pad = (uint8_t)pad, .frame = frame});
@@ -889,6 +1005,9 @@ static void sequence(sp_engine *e, int frames) {
     push_mark(e, e->frame);
     double tol = SP_FRAME_TOL * e->seq.tpf;
     double x0 = e->seq.done, x1 = m_at(e, e->frame + frames - 1) + tol;
+    /* Started by an incoming clock on a frame still ahead: nothing yet. */
+    if (x1 <= x0) return;
+    const double from = x0;
     for (;;) {
         double cp = next_change(e, x0);
         if (cp > x1) {
@@ -910,6 +1029,11 @@ static void sequence(sp_engine *e, int frames) {
         x0 = cp - SP_SEG_EPS;
     }
     e->seq.done = x1;
+
+    /* MIDI clock out: a tick on every 4th position (24 PPQN, straight). */
+    if (e->midi.map && e->midi.map->clock == SP_CLOCK_SEND)
+        for (double t = (floor(from / 4) + 1) * 4; t <= x1; t += 4)
+            midi_push(e, e->frame + clamp_off(frame_of(e, t) - e->frame, frames), MO_CLOCK, 1, 0xF8, 0, 0);
 
     /* Sequenced gate, loop and keys voices end where the next step starts
      * (swing and tempo changes included). Voices this block's steps start
@@ -955,14 +1079,19 @@ static void stamp(const sp_engine *e, double heard, int *step, int *tick) {
     *tick = t;
 }
 
+/* The engine frame heard at CLOCK_MONOTONIC `t_ns` (the output clock),
+ * else a buffer back from the block being rendered. */
+static double heard_frame(sp_engine *e, int64_t t_ns) {
+    int64_t cf, cns;
+    if (sp_get_clock(e, &cf, &cns)) return (double)cf + (double)(t_ns - cns) * e->rate / 1e9;
+    return (double)(e->frame - atomic_load_explicit(&e->latency_frames, memory_order_relaxed));
+}
+
 /* A live hit while playing, stamped where the player heard it: the frame
- * being heard when the call was made (the clock), else a buffer back. */
+ * being heard when the call was made (or the MIDI message arrived). */
 static void report_hit(sp_engine *e, int pad, int vel, int note, int64_t t_ns) {
     if (e->pads[pad].slot < 0) return;
-    double heard;
-    int64_t cf, cns;
-    if (sp_get_clock(e, &cf, &cns)) heard = (double)cf + (double)(t_ns - cns) * e->rate / 1e9;
-    else heard = (double)(e->frame - atomic_load_explicit(&e->latency_frames, memory_order_relaxed));
+    double heard = heard_frame(e, t_ns);
     if (heard > (double)e->frame) heard = (double)e->frame;
     int step, tick;
     stamp(e, heard, &step, &tick);
@@ -1017,8 +1146,18 @@ static void rebase(sp_engine *e) {
 }
 
 /* Stopping ends what the sequencer was holding: gated voices fade out
- * (one-shots ring on). */
+ * (one-shots ring on). Sending clock: Stop goes out, and the clock runs
+ * on from the next tick position. */
 static void stop_sequencer(sp_engine *e) {
+    if (e->seq.playing) {
+        if (e->midi.map && e->midi.map->clock == SP_CLOCK_SEND) {
+            midi_push(e, e->at, MO_TRANSPORT, 1, 0xFC, 0, 0);
+            double next = (floor(m_at(e, e->at) / 4) + 1) * 4;
+            e->midi.free_next = (double)e->seq.base_frame + (next - e->seq.base_m) / e->seq.tpf;
+        }
+        sp_emit(e, &(sp_event){.type = SP_EV_TRANSPORT, .a = 0, .frame = e->at});
+    }
+    e->midi.following = false;
     e->seq.playing = false;
     e->seq.n_pending = 0;
     e->seq.done = 0;
@@ -1049,7 +1188,7 @@ static void live_trigger(sp_engine *e, const sp_cmd *c, bool note_on) {
         };
         return;
     }
-    if (voice_start(e, c->pad, c->vel, note, -1, e->frame))
+    if (voice_start(e, c->pad, c->vel, note, -1, e->frame, SP_SRC_PLAYED))
         sp_emit(e, &(sp_event){.type = SP_EV_TRIGGERED, .pad = c->pad, .frame = e->frame, .t_ns = c->t_ns});
 }
 
@@ -1058,6 +1197,240 @@ static void cancel_pending(sp_engine *e, int pad) {
         if (e->seq.pending[i].pad == pad) e->seq.pending[i] = e->seq.pending[--e->seq.n_pending];
         else i++;
     }
+}
+
+/* The sequencer started at e->at (a play call or an incoming Start):
+ * sending clock, song position 0 and Start go out on that frame, before
+ * its first tick. */
+static void seq_started(sp_engine *e) {
+    if (e->midi.map && e->midi.map->clock == SP_CLOCK_SEND) {
+        midi_push(e, e->at, MO_TRANSPORT, 3, 0xF2, 0, 0);
+        midi_push(e, e->at, MO_TRANSPORT, 1, 0xFA, 0, 0);
+    }
+    e->midi.free_next = -1;
+    sp_emit(e, &(sp_event){.type = SP_EV_TRANSPORT, .a = 1, .frame = e->at});
+}
+
+/* ── MIDI in (renderer) ───────────────────────────────────────────────────── */
+
+/* Note-on (or off) `c->u.midi.d1`: every pad the kit's table lists for it.
+ * A keys pad plays the note chromatically, any other pad triggers; off
+ * releases gate, loop and keys pads (keys: that note's voice). Voices
+ * started here send no MIDI out. */
+static void midi_note(sp_engine *e, const sp_cmd *c, bool on) {
+    int note = c->u.midi.d1 & 0x7F, vel = c->u.midi.d2 & 0x7F;
+    uint64_t pads = e->midi.map->notes[note];
+    while (pads) {
+        int pad = __builtin_ctzll(pads);
+        pads &= pads - 1;
+        uint8_t mode = e->pads[pad].mode;
+        bool keys = mode == SP_KEYS;
+        if (on) {
+            if (e->seq.playing) report_hit(e, pad, vel, keys ? note : e->pads[pad].root, c->t_ns);
+            if (voice_start(e, pad, vel, keys ? note : -1, -1, e->frame, SP_SRC_MIDI))
+                sp_emit(e, &(sp_event){.type = SP_EV_TRIGGERED, .pad = (uint8_t)pad, .b = 1, .frame = e->frame,
+                                       .t_ns = c->t_ns});
+        } else if (mode == SP_GATE || mode == SP_LOOP || keys) {
+            release_pad_voices(e, pad, keys ? note : -1);
+        }
+    }
+}
+
+/* CC 123 (all notes off): the voices MIDI started that a note-off would
+ * release; CC 120 (all sound off): every voice MIDI started, fast. */
+static void midi_all_off(sp_engine *e, bool sound) {
+    for (int i = 0; i < SP_VOICES; i++) {
+        sp_voice *v = &e->voices[i];
+        if (v->state != SP_V_ON || !v->from_midi) continue;
+        if (sound) voice_release(e, v, cut_frames(e));
+        else if (v->mode == SP_GATE || v->mode == SP_LOOP || v->mode == SP_KEYS) voice_release(e, v, v->release_frames);
+    }
+}
+
+/* Following: the sequencer starts on the tick after Start / Continue, which
+ * arrived at heard frame `f` (normally a little in the past: the stream
+ * renders ahead), at the position it has there, `P` frames per tick. The
+ * steps it missed by starting late sound now (the downbeat late by that
+ * much); more than a step late, the grid is caught without them. */
+static void follow_start(sp_engine *e, double f, double P) {
+    e->midi.armed = false;
+    e->midi.k0 = e->midi.ticks;
+    e->seq.playing = true;
+    e->seq.play++;
+    e->seq.origin = 0;
+    e->seq.tpf = 4.0 / P;
+    e->seq.base_frame = e->frame;
+    e->seq.base_m = e->midi.arm_pos + ((double)e->frame - f) * e->seq.tpf;
+    e->seq.done = e->seq.base_m - e->midi.arm_pos > SP_STEP ? e->seq.base_m - SP_SEG_EPS : e->midi.arm_pos - SP_SEG_EPS;
+    e->midi.following = true;
+    e->at = e->frame;
+    seq_started(e);
+    atomic_store_explicit(&e->playing_now, true, memory_order_relaxed);
+}
+
+/* While following: the position should meet the line through the last
+ * ticks half a beat from now. The ticks per frame are set so it does,
+ * continuous at this block's first frame (never backwards). */
+static void follow_steer(sp_engine *e) {
+    double kc, fc, P;
+    if (!mi_fit_line(&e->midi.fit, &kc, &fc, &P)) return;
+    double H = 12.0 * P, F = (double)e->frame;
+    double now = m_at(e, e->frame);
+    double target = e->midi.arm_pos + 4.0 * (kc + (F + H - fc) / P - (double)e->midi.k0);
+    double tpf = (target - now) / H, nominal = 4.0 / P;
+    if (tpf < 0.5 * nominal) tpf = 0.5 * nominal;
+    if (tpf > 2.0 * nominal) tpf = 2.0 * nominal;
+    e->seq.base_m = now;
+    e->seq.base_frame = e->frame;
+    e->seq.tpf = tpf;
+}
+
+/* An incoming clock tick, heard at frame `f`. A gap of more than 3 ticks
+ * (or half a second before there is a tempo) starts the fit afresh. Once
+ * a beat the followed tempo goes to the BEAM. */
+static void follow_tick(sp_engine *e, double f) {
+    double kc, fc, P;
+    bool have = mi_fit_line(&e->midi.fit, &kc, &fc, &P);
+    int64_t k = e->midi.ticks + 1;
+    if (e->midi.ticks > 0 && f - e->midi.last_tick > (have ? 3.0 * P : 0.5 * e->rate)) {
+        mi_fit_reset(&e->midi.fit);
+        e->midi.misses = 0;
+    } else if (have && e->midi.fit.n >= 12) {
+        /* Two ticks in a row off the line the same way, by more than
+         * jitter explains: the tempo changed. Fit from those two on (and
+         * look again once there are a dozen). */
+        double miss = f - (fc + P * ((double)k - kc));
+        bool off = fabs(miss) > fmax(SP_FOLLOW_MISS_MS * e->rate / 1000.0, 0.15 * P);
+        int sign = miss > 0 ? 1 : -1;
+        e->midi.misses = off ? (e->midi.misses * sign > 0 ? e->midi.misses + sign : sign) : 0;
+        if (abs(e->midi.misses) >= 2) {
+            mi_fit_reset(&e->midi.fit);
+            mi_fit_add(&e->midi.fit, k - 1, e->midi.last_tick);
+            e->midi.misses = 0;
+        }
+    }
+    e->midi.ticks = k;
+    e->midi.last_tick = f;
+    mi_fit_add(&e->midi.fit, k, f);
+    have = mi_fit_line(&e->midi.fit, &kc, &fc, &P);
+    if (e->midi.armed) follow_start(e, f, have ? P : 4.0 / sp_tpf(e->seq.bpm, e->rate));
+    else if (e->midi.following && e->seq.playing) follow_steer(e);
+    if (have && k % 24 == 0) {
+        /* Shown, smoothed over a few beats (a step of more than 1.5 % is
+         * taken at once). */
+        double bpm = 60.0 * e->rate / (24.0 * P), shown = e->midi.bpm_shown;
+        shown = shown <= 0 || fabs(bpm - shown) > 0.015 * shown ? bpm : shown + 0.3 * (bpm - shown);
+        e->midi.bpm_shown = shown;
+        int32_t milli = (int32_t)lround(shown * 1000.0);
+        atomic_store_explicit(&e->midi.follow_bpm_milli, milli, memory_order_relaxed);
+        sp_emit(e, &(sp_event){.type = SP_EV_TEMPO, .a = milli, .frame = e->frame});
+    }
+}
+
+/* Clock follow: ticks, Start, Continue (from the song position), Stop. */
+static void follow_realtime(sp_engine *e, const sp_cmd *c) {
+    e->at = e->frame;
+    switch (c->u.midi.status) {
+    case 0xF8:
+        follow_tick(e, heard_frame(e, c->t_ns));
+        break;
+    case 0xFA:
+        if (e->seq.playing) stop_sequencer(e);
+        e->midi.armed = true;
+        e->midi.arm_pos = 0;
+        e->midi.spp = 0;
+        break;
+    case 0xFB:
+        if (!e->seq.playing) {
+            e->midi.armed = true;
+            e->midi.arm_pos = (double)e->midi.spp * SP_STEP;
+        }
+        break;
+    case 0xFC:
+        e->midi.armed = false;
+        /* A Continue with no song position resumes from the next 16th. */
+        if (e->midi.following)
+            e->midi.spp = (int)ceil((e->midi.arm_pos / 4 + (double)(e->midi.ticks - e->midi.k0 + 1)) / 6.0);
+        if (e->seq.playing) stop_sequencer(e);
+        break;
+    case 0xF2:
+        if (!e->seq.playing) e->midi.spp = c->u.midi.d1 | (c->u.midi.d2 << 7);
+        break;
+    }
+}
+
+/* One incoming message, through the kit's table: notes on its channel,
+ * CC 120 / 123, and with clock follow the clock and transport. */
+static void midi_in(sp_engine *e, const sp_cmd *c) {
+    const sp_midi_map *m = e->midi.map;
+    if (!m) return;
+    uint8_t st = c->u.midi.status;
+    if (st >= 0xF0) {
+        if (m->clock == SP_CLOCK_FOLLOW) follow_realtime(e, c);
+        return;
+    }
+    if (m->in_channel && (st & 0x0F) != m->in_channel - 1) return;
+    switch (st & 0xF0) {
+    case 0x90:
+        midi_note(e, c, c->u.midi.d2 > 0);
+        break;
+    case 0x80:
+        midi_note(e, c, false);
+        break;
+    case 0xB0:
+        if (c->u.midi.d1 == 120 || c->u.midi.d1 == 123) midi_all_off(e, c->u.midi.d1 == 120);
+        break;
+    }
+}
+
+/* A new table (NULL: MIDI off). Leaving follow mode hands the tempo back
+ * to the kit's; leaving send forgets the free-running clock. */
+static void set_midi_map(sp_engine *e, sp_midi_map *map) {
+    sp_midi_map *old = e->midi.map;
+    e->midi.map = map;
+    if (old) sp_discard(e, SP_GB_MIDI_MAP, old);
+    if (!map || map->clock != SP_CLOCK_FOLLOW) {
+        if (e->midi.following) {
+            e->midi.following = false;
+            rebase(e);
+        }
+        e->midi.armed = false;
+        e->midi.ticks = 0;
+        mi_fit_reset(&e->midi.fit);
+        atomic_store_explicit(&e->midi.follow_bpm_milli, 0, memory_order_relaxed);
+        e->midi.bpm_shown = 0;
+        e->midi.misses = 0;
+    }
+    if (!map || map->clock != SP_CLOCK_SEND) e->midi.free_next = -1;
+}
+
+/* This block's MIDI out, sorted by frame (stable: a play's Start before its
+ * first tick), into the ring; and, sending clock while stopped, the free
+ * running ticks at the tempo. */
+static void midi_flush(sp_engine *e, int frames) {
+    const sp_midi_map *m = e->midi.map;
+    if (m && m->clock == SP_CLOCK_SEND && !e->seq.playing && !e->offline) {
+        double period = 60.0 * e->rate / (e->seq.bpm * 24.0);
+        if (e->midi.free_next < 0) e->midi.free_next = (double)e->frame;
+        for (;;) {
+            int64_t f = (int64_t)ceil(e->midi.free_next - SP_FRAME_TOL);
+            if (f >= e->frame + frames) break;
+            midi_push(e, f < e->frame ? e->frame : f, MO_CLOCK, 1, 0xF8, 0, 0);
+            e->midi.free_next += period;
+        }
+    }
+    mo_event *b = e->midi.block;
+    for (int i = 1; i < e->midi.n_block; i++) {
+        mo_event x = b[i];
+        int j = i - 1;
+        while (j >= 0 && b[j].frame > x.frame) {
+            b[j + 1] = b[j];
+            j--;
+        }
+        b[j + 1] = x;
+    }
+    for (int i = 0; i < e->midi.n_block; i++) mo_push(&e->midi.out, &b[i]);
+    e->midi.n_block = 0;
 }
 
 /* ── The count-in ─────────────────────────────────────────────────────────── */
@@ -1173,7 +1546,9 @@ static void apply(sp_engine *e, const sp_cmd *c, bool live) {
         break;
     case SP_CMD_TEMPO:
         e->seq.bpm = c->u.value;
-        rebase(e);
+        /* Following, the incoming clock sets the pace; the kit's tempo
+         * waits for follow to end. */
+        if (!e->midi.following) rebase(e);
         break;
     case SP_CMD_SWING:
         if (e->seq.playing) e->seq.pending_swing = c->u.value;
@@ -1188,6 +1563,8 @@ static void apply(sp_engine *e, const sp_cmd *c, bool live) {
             e->seq.done = -SP_SEG_EPS;
             e->seq.origin = 0;
             e->seq.tpf = sp_tpf(e->seq.bpm, e->rate);
+            e->midi.armed = false;
+            seq_started(e);
         }
         break;
     case SP_CMD_STOP:
@@ -1213,13 +1590,23 @@ static void apply(sp_engine *e, const sp_cmd *c, bool live) {
         e->seq.swing = 0.5;
         e->seq.tpf = sp_tpf(120.0, e->rate);
         e->click.beats = 0;
+        set_midi_map(e, NULL);
         break;
     case SP_CMD_COUNT_IN:
         if (live && c->u.count_in.beats > 0) start_count_in(e, c->u.count_in.id, c->u.count_in.beats);
         else e->click.beats = 0;
         break;
+    case SP_CMD_MIDI:
+        if (live) {
+            atomic_fetch_add_explicit(&e->midi.in_messages, 1, memory_order_relaxed);
+            midi_in(e, c);
+        }
+        break;
+    case SP_CMD_MIDI_MAP:
+        set_midi_map(e, c->u.map);
+        break;
     }
-    if (c->type == SP_CMD_PATTERN || c->type == SP_CMD_RESET || c->type == SP_CMD_STOP)
+    if (c->type == SP_CMD_PATTERN || c->type == SP_CMD_RESET || c->type == SP_CMD_STOP || c->type == SP_CMD_MIDI)
         atomic_store_explicit(&e->playing_now, e->seq.playing, memory_order_relaxed);
     if (c->type == SP_CMD_PLAY) atomic_store_explicit(&e->playing_now, true, memory_order_relaxed);
 }
@@ -1239,6 +1626,7 @@ static void publish_counts(sp_engine *e) {
 static void sp_render(sp_engine *e, float *out, int frames) {
     memset(out, 0, sizeof(float) * 2 * (size_t)frames);
     e->offline = false;
+    e->at = e->frame;
     sp_cmd c;
     while (sp_pop_cmd(e, &c)) apply(e, &c, true);
 
@@ -1246,6 +1634,7 @@ static void sp_render(sp_engine *e, float *out, int frames) {
     int cursor = 0;
     for (int i = 0; i < e->n_actions; i++) {
         const sp_action *a = &e->actions[i];
+        e->at = e->frame + a->off;
         if (a->off > cursor) {
             mix(e, out, cursor, a->off);
             cursor = a->off;
@@ -1256,7 +1645,7 @@ static void sp_render(sp_engine *e, float *out, int frames) {
         } else if (a->pad >= SP_PADS) {
             continue;
         } else if (a->kind == SP_A_FIRE) {
-            voice_start(e, a->pad, a->vel, a->note_on ? a->note : -1, -1, e->frame + a->off);
+            voice_start(e, a->pad, a->vel, a->note_on ? a->note : -1, -1, e->frame + a->off, SP_SRC_PLAYED);
         } else {
             /* A step: gate, loop and keys pads sound until the next step. A
              * step that also ends within this block gets its gate now, in
@@ -1264,7 +1653,7 @@ static void sp_render(sp_engine *e, float *out, int frames) {
             uint8_t mode = e->pads[a->pad].mode;
             bool gated = mode == SP_GATE || mode == SP_LOOP || mode == SP_KEYS;
             uint64_t before = e->serial;
-            voice_start(e, a->pad, a->vel, a->note, gated ? a->gate_at : -1, e->frame + a->off);
+            voice_start(e, a->pad, a->vel, a->note, gated ? a->gate_at : -1, e->frame + a->off, SP_SRC_PLAYED);
             if (gated && e->serial != before && a->gate_at <= e->seq.done) {
                 for (int v = 0; v < SP_VOICES; v++) {
                     if (e->voices[v].state != SP_V_ON || e->voices[v].serial != e->serial) continue;
@@ -1281,6 +1670,7 @@ static void sp_render(sp_engine *e, float *out, int frames) {
     }
     mix(e, out, cursor, frames);
     clicks(e, out, frames);
+    midi_flush(e, frames);
 
     for (int i = 0; i < 2 * frames; i++) out[i] = sp_soft_clip(out[i]);
     e->frame += frames;
@@ -1293,6 +1683,7 @@ static void sp_render(sp_engine *e, float *out, int frames) {
  * late) unless `live`; fades end at once. */
 static void sp_drain(sp_engine *e, bool live) {
     e->offline = true;
+    e->at = e->frame;
     sp_cmd c;
     while (sp_pop_cmd(e, &c)) apply(e, &c, live);
     reclaim(e);

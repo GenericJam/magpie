@@ -99,4 +99,28 @@ defmodule Magpie.Audio.Nif do
 
   @doc "Drop the recording (owner only, dirty IO)."
   def record_cancel, do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  The kit's MIDI table (owner only): `{in_channel (0 all), out_channel,
+  clock, [128 note masks, a bit per pad], [64 out notes, -1 none]}`, or nil
+  for MIDI off.
+  """
+  def set_midi(_table), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Send `{:magpie_midi, tag, json}` device messages to `pid` (anyone, dirty IO)."
+  def midi_listen(_pid), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "`{:ok, json}`: the MIDI devices as a JSON array (dirty IO)."
+  def midi_devices, do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Open device `id` both ways; `:opened` / `:open_failed` follows (dirty IO)."
+  def midi_open(_id), do: :erlang.nif_error(:nif_not_loaded)
+
+  def midi_close(_id), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Scan for Bluetooth-MIDI devices for `ms` (dirty IO)."
+  def midi_ble_scan(_ms), do: :erlang.nif_error(:nif_not_loaded)
+
+  def midi_ble_connect(_address), do: :erlang.nif_error(:nif_not_loaded)
+  def midi_ble_disconnect(_address), do: :erlang.nif_error(:nif_not_loaded)
 end

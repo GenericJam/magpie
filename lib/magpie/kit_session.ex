@@ -73,7 +73,9 @@ defmodule Magpie.KitSession do
     samples: %{},
     refused: %{},
     queue: [],
-    subscribers: %{}
+    subscribers: %{},
+    # The MIDI table last given to the engine (`Magpie.Midi.Map.config/1`).
+    midi: nil
   ]
 
   # ── API ─────────────────────────────────────────────────────────────────────
@@ -131,6 +133,25 @@ defmodule Magpie.KitSession do
   @doc "Snap on or off (the kit's `snap`)."
   def set_snap(on) when is_boolean(on), do: GenServer.call(__MODULE__, {:snap, on})
 
+  @doc """
+  The kit's MIDI settings: `in_channel` (`:all` or 1..16; notes out go on
+  it, or 1 with `:all`) and `clock` (`:internal`, `:follow` an incoming
+  MIDI clock, `:send` one). Either key may be left out.
+  """
+  @spec set_midi(map()) :: :ok | {:error, {:invalid, atom()}}
+  def set_midi(changes) when is_map(changes) do
+    cond do
+      not (Map.get(changes, :in_channel, :all) == :all or Map.get(changes, :in_channel) in 1..16) ->
+        {:error, {:invalid, :in_channel}}
+
+      Map.get(changes, :clock, :internal) not in [:internal, :follow, :send] ->
+        {:error, {:invalid, :clock}}
+
+      true ->
+        GenServer.call(__MODULE__, {:midi, Map.take(changes, [:in_channel, :clock])})
+    end
+  end
+
   @doc "Save now if a change is waiting for the autosave."
   def flush, do: GenServer.call(__MODULE__, :flush)
 
@@ -186,7 +207,7 @@ defmodule Magpie.KitSession do
   def handle_continue(:load, s) do
     _ = Engine.set_tempo(s.kit.tempo)
     _ = Engine.set_swing(s.kit.swing)
-    {:noreply, s |> enqueue(sample_ids(s.kit)) |> next_load() |> publish()}
+    {:noreply, s |> sync_midi() |> enqueue(sample_ids(s.kit)) |> next_load() |> publish()}
   end
 
   @impl true
@@ -220,6 +241,9 @@ defmodule Magpie.KitSession do
 
   def handle_call({:snap, on}, _from, s),
     do: {:reply, :ok, s |> put_kit(%{s.kit | snap: on}) |> publish()}
+
+  def handle_call({:midi, changes}, _from, s),
+    do: {:reply, :ok, s |> put_kit(%{s.kit | midi: Map.merge(s.kit.midi, changes)}) |> publish()}
 
   def handle_call(:flush, _from, s) do
     {result, s} = save(s)
@@ -489,7 +513,25 @@ defmodule Magpie.KitSession do
   defp put_kit(s, kit) do
     token = make_ref()
     Process.send_after(self(), {:autosave, token}, s.autosave_ms)
-    %{s | kit: kit, save_token: token}
+    sync_midi(%{s | kit: kit, save_token: token})
+  end
+
+  # The engine plays MIDI by the kit's pads and settings: a change to either
+  # gives it the table again. One it refused is tried with the next change.
+  defp sync_midi(s) do
+    config = Magpie.Midi.Map.config(s.kit)
+
+    cond do
+      config == s.midi ->
+        s
+
+      Engine.set_midi(config) == :ok ->
+        %{s | midi: config}
+
+      true ->
+        Logger.warning("Magpie.KitSession: the engine refused the MIDI table")
+        %{s | midi: nil}
+    end
   end
 
   defp save(%{save_token: nil} = s), do: {:ok, s}

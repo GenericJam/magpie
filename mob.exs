@@ -55,11 +55,14 @@ config :mob_dev,
 # magpie_capture: the "Other apps" recording source (plugins/magpie_capture,
 # Kotlin only: the MediaProjection consent, its foreground service and the
 # AudioRecord read thread feeding the magpie_audio NIF), part of this repo.
-config :mob, :plugins, [:magpie_capture]
+# magpie_midi: the virtual "Magpie" MIDI port, the MIDI device watcher, USB /
+# Bluetooth device open and Bluetooth-MIDI connect (plugins/magpie_midi,
+# Kotlin only, feeding and fed by the magpie_audio NIF), part of this repo.
+config :mob, :plugins, [:magpie_capture, :magpie_midi]
 
-# magpie_capture is this app's own code, reviewed with it, so it builds
-# unsigned instead of carrying a signing key (mob_dev prints a banner).
-config :mob, :acknowledge_unsafe_plugins, [:magpie_capture]
+# magpie_capture and magpie_midi are this app's own code, reviewed with it, so
+# they build unsigned instead of carrying a signing key (mob_dev prints a banner).
+config :mob, :acknowledge_unsafe_plugins, [:magpie_capture, :magpie_midi]
 
 # Trust gate for the first-party plugins. Each is signed in CI with the shared
 # mob release key; this is that key's public fingerprint. The build refuses an

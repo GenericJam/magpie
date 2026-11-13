@@ -46,11 +46,20 @@ defmodule Magpie.PadsScreen do
   while the sheet is up. Every change in the sheet goes through
   `Magpie.KitSession`.
 
+  ## MIDI
+
+  The magpie button opens `Magpie.MidiScreen` (plain, not designed). Pads
+  MIDI plays light like touched ones (the engine's voice messages). The
+  selected bank's pattern is the engine's even while stopped, so an
+  incoming MIDI Start (clock follow) plays it; `{:magpie_audio,
+  :transport, playing, frame}` keeps Play in step with it, and while
+  following the tempo shows the incoming clock's.
+
   ## Not designed / not built yet (inert, shown as the board has them)
 
-  The menu (the magpie button), the kit name (kit save / load sheet), the
-  tempo, Record pattern and Seq in the top bar, and the sheet's "Edit
-  sample" (no editor yet). Play plays the selected bank's pattern
+  The kit name (kit save / load sheet), the tempo (setting it), Record
+  pattern and Seq in the top bar, and the sheet's "Edit sample" (no editor
+  yet). Play plays the selected bank's pattern
   (`Magpie.KitSession.pattern/2`); while it plays the button shows a stop
   square (the board has only the play state).
 
@@ -62,7 +71,7 @@ defmodule Magpie.PadsScreen do
 
   import Mob.Canvas, only: [path: 2, rect: 5]
 
-  alias Magpie.{Bird, Engine, Kit, KitSession, RecordScreen, Style}
+  alias Magpie.{Bird, Engine, Kit, KitSession, MidiScreen, RecordScreen, Style}
   alias Magpie.Kit.{Pad, Region}
 
   @banks Style.pad().banks
@@ -104,10 +113,13 @@ defmodule Magpie.PadsScreen do
         drag: nil,
         playing: state.playing,
         audio: is_map(state.stream),
+        follow_tempo: state.follow_tempo,
         now: now(),
         tick: nil
       )
 
+    # The bank's pattern waits in the engine, for Play or a MIDI Start.
+    unless state.playing, do: Engine.set_pattern(KitSession.pattern(snapshot.kit, "A"), at: :now)
     {:ok, socket}
   end
 
@@ -218,6 +230,12 @@ defmodule Magpie.PadsScreen do
   def handle_info({:magpie_audio, :voice, pad, :end}, socket),
     do: {:noreply, Mob.Socket.update(socket, :voices, &Map.delete(&1, pad))}
 
+  def handle_info({:magpie_audio, :transport, playing, _frame}, socket),
+    do: {:noreply, Mob.Socket.assign(socket, :playing, playing)}
+
+  def handle_info({:magpie_audio, :tempo, bpm}, socket),
+    do: {:noreply, Mob.Socket.assign(socket, :follow_tempo, bpm)}
+
   def handle_info({:magpie_audio, _kind, _a, _b}, socket), do: {:noreply, socket}
 
   def handle_info({:magpie_kit, snapshot}, socket) do
@@ -239,11 +257,17 @@ defmodule Magpie.PadsScreen do
   # ── Taps ────────────────────────────────────────────────────────────────
 
   def handle_info({:tap, {:bank, bank}}, socket) when bank in @banks do
-    if socket.assigns.playing,
-      do: Engine.set_pattern(KitSession.pattern(kit(socket.assigns), bank), at: :bar)
+    # Playing: the bank's pattern takes over at the next bar. Stopped: it
+    # waits in the engine for Play or a MIDI Start.
+    Engine.set_pattern(KitSession.pattern(kit(socket.assigns), bank),
+      at: if(socket.assigns.playing, do: :bar, else: :now)
+    )
 
     {:noreply, Mob.Socket.assign(socket, :bank, bank)}
   end
+
+  def handle_info({:tap, :menu}, socket),
+    do: {:noreply, Mob.Socket.push_screen(socket, MidiScreen, %{})}
 
   def handle_info({:tap, :play}, %{assigns: %{playing: true}} = socket) do
     _ = Engine.stop()
@@ -462,13 +486,23 @@ defmodule Magpie.PadsScreen do
     kit = kit(assigns)
     snap_tap = {self(), :snap}
     play_tap = {self(), :play}
+    menu_tap = {self(), :menu}
     snap_bg = Style.color(if kit.snap, do: :selected, else: :surface)
     snap_fg = Style.color(if kit.snap, do: :fm, else: :muted)
     tabs = for bank <- @banks, do: bank_tab(bank, bank == assigns.bank)
 
     ~MOB"""
     <Row height={44} fill_width={true} gap={8}>
-      <Box width={44} height={44} corner_radius={22} background={Style.color(:raised)} align="center">
+      <Box
+        id="menu"
+        width={44}
+        height={44}
+        corner_radius={22}
+        background={Style.color(:raised)}
+        align="center"
+        on_tap={menu_tap}
+        on_press_out={held()}
+      >
         <Canvas
           id="menu_bird"
           width={32}
@@ -514,7 +548,7 @@ defmodule Magpie.PadsScreen do
         align="center"
       >
         <Text
-          text={"#{format_tempo(kit.tempo)} bpm"}
+          text={"#{format_tempo(shown_tempo(assigns))} bpm"}
           font={:mono_semibold}
           text_size={12}
           text_color={Style.color(:text)}
@@ -589,6 +623,16 @@ defmodule Magpie.PadsScreen do
     do: [path([{5, 3}, {14, 8}, {5, 13}], color: Style.color(:ink), fill: true)]
 
   defp play_icon(true), do: [rect(3, 3, 10, 10, color: Style.color(:ink), fill: true, radius: 1)]
+
+  # Following a MIDI clock, its tempo (one decimal); else the kit's.
+  defp shown_tempo(%{follow_tempo: bpm} = assigns) when is_number(bpm),
+    do:
+      if(kit(assigns).midi.clock == :follow,
+        do: Float.round(bpm / 1, 1),
+        else: kit(assigns).tempo
+      )
+
+  defp shown_tempo(assigns), do: kit(assigns).tempo
 
   defp format_tempo(t) when is_float(t) and t == trunc(t), do: trunc(t)
   defp format_tempo(t), do: t
