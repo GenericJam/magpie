@@ -3,10 +3,12 @@ defmodule Magpie.PadsScreenTest do
   use Mob.ScreenCase, async: false
 
   import Magpie.Test.Kits
+  import Magpie.Test.Screens, only: [assert_every_tap_held: 1, canvas_ops: 2, texts: 1]
 
   alias Magpie.Audio.Fake
-  alias Magpie.{Kit, KitSession, PadsScreen}
+  alias Magpie.{Bird, Kit, KitSession, PadsScreen, RecordScreen}
   alias Magpie.Kit.{Pad, Region}
+  alias Magpie.Test.Screens
   alias Mob.Event.Touch
 
   @h 155.0
@@ -85,8 +87,6 @@ defmodule Magpie.PadsScreenTest do
         height: @h
       )
 
-  defp texts(view), do: for(%{type: :text, props: %{text: t}} <- flatten(view), do: t)
-
   defp triggers, do: for({:trigger, pad, vel, q} <- Fake.calls(), do: {pad, vel, q})
   defp releases, do: for({:release, pad} <- Fake.calls(), do: pad)
 
@@ -103,18 +103,6 @@ defmodule Magpie.PadsScreenTest do
   defp long_press_message(pointer) do
     assert_receive {:long_press, ^pointer, _token} = msg, 1_000
     msg
-  end
-
-  defp assert_every_tap_held(view) do
-    taps = for node <- flatten(view), node.props[:on_tap] != nil, do: node
-    assert taps != []
-
-    for node <- taps do
-      assert node.props[:on_press_out] == {self(), :held},
-             "#{node.type} #{inspect(node.props[:id])} with on_tap #{inspect(node.props.on_tap)} has no on_press_out={held()}"
-    end
-
-    length(taps)
   end
 
   describe "rendering" do
@@ -161,6 +149,19 @@ defmodule Magpie.PadsScreenTest do
       view = render_info(view, long_press_message(1))
       assert "Done" in texts(view)
       assert assert_every_tap_held(view) > 20
+    end
+
+    test "the menu button's magpie: idle, playing with the sequencer, asleep with no audio" do
+      view = mount()
+      assert canvas_ops(view, "menu_bird") == Bird.ops(:idle, size: 0.5)
+      view = render_info(view, {:tap, :play})
+      assert canvas_ops(view, "menu_bird") == Bird.ops(:play, size: 0.5)
+
+      stop_supervised!(Magpie.Engine)
+      :ok = Fake.fail_open(:output_unavailable)
+      start_supervised!(Magpie.Engine)
+      :ok = Fake.fail_open(nil)
+      assert canvas_ops(mount(), "menu_bird") == Bird.ops(:sleep, size: 0.5)
     end
   end
 
@@ -368,10 +369,26 @@ defmodule Magpie.PadsScreenTest do
     do: Enum.find(flatten(view), &(&1.props[:id] == "pad_#{index}")).props.on_touch
 
   describe "empty pads" do
-    test "a tap opens the Record screen for that pad" do
+    test "a tap opens the Record screen for that pad, and what it records lands on the pad" do
       view = mount() |> down(9, 1, 50.0) |> up(9, 1)
-      assert navigated_to(view) == Magpie.RecordScreen
       assert triggers() == []
+      assert {:push, RecordScreen, params} = view.socket.__mob__.nav_action
+      assert params == %{pad: 9, reply_to: KitSession.whereis()}
+
+      :ok = Fake.fail_input(nil)
+      :ok = Fake.refuse_input(nil)
+      :ok = Fake.stick_input(0)
+      record = RecordScreen |> mount_screen(params) |> Screens.pump()
+      assert "Record into pad A10" in texts(record)
+
+      record = record |> render_info({:tap, :record}) |> Screens.pump()
+      :ok = Fake.feed(for(_ <- 1..4800, into: <<>>, do: <<0.25::float-32-little>>))
+      _record = record |> Screens.pump() |> render_info({:tap, :record}) |> render_async()
+
+      assert [sample] = Enum.filter(Magpie.Library.list(), &(&1.name =~ ~r/^Mic /))
+      assert %{9 => %{status: :ready}} = await_loaded().pads
+      assert %Pad{sample: %Region{id: id}} = KitSession.snapshot().kit.banks["A"][9]
+      assert id == sample.id
       refute_receive {:long_press, _, _}, 700
     end
 

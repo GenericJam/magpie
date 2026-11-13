@@ -200,6 +200,7 @@ defmodule Magpie.Audio.Fake do
 
   @doc "The count-in's downbeat: a counting recorder starts recording."
   def downbeat, do: call(:downbeat)
+
   @doc "Make the next `n` `call` (`:set_pad` or `:unload_sample`) fail with `:busy`, as with a full command queue."
   def busy(call, n) when call in [:set_pad, :unload_sample] and is_integer(n) and n >= 0,
     do: call({:busy, call, n})

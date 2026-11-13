@@ -502,7 +502,10 @@ locked on mount. Why it is built this way:
   lifts. Fingers are tracked by pointer id; voice `:start`/`:end` keep a
   pad lit (or looping, with a progress bar from a tokened 50 ms timer)
   after the lift. Empty pad tap → `Magpie.RecordScreen` with `%{pad,
-  reply_to: KitSession.whereis()}`.
+  reply_to: KitSession.whereis()}`: what it saves lands on that pad (the
+  session handles `{:recorded, pad, sample}`). With the old home screen
+  gone, the pads are the only way into the Record screen for now (the
+  Library screen comes later).
 - **Long press:** 600 ms on the BEAM from the `:down` (`{:long_press,
   pointer_id, token}`), cancelled by the lift or by the finger leaving the
   pad; the first to fire cancels the others, and none opens over the
@@ -517,8 +520,9 @@ locked on mount. Why it is built this way:
   the board shows only play). Plain fallbacks: a pad whose sample isn't in
   the library says "sample missing", one that failed to load "can't
   load", one still loading "loading…".
-- **The magpie's mood** on the menu button: `:play` while the sequencer
-  plays, `:sleep` with no audio output, else `:idle`.
+- **The magpie's mood** on the menu button (`Magpie.Bird.ops(mood, size:
+  0.5)` on a 32 × 28 canvas): `:play` while the sequencer plays, `:sleep`
+  with no audio output, else `:idle`.
 
 ### Measured
 

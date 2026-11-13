@@ -62,7 +62,7 @@ defmodule Magpie.PadsScreen do
 
   import Mob.Canvas, only: [path: 2, rect: 5]
 
-  alias Magpie.{Engine, Kit, KitSession, Style}
+  alias Magpie.{Bird, Engine, Kit, KitSession, RecordScreen, Style}
   alias Magpie.Kit.{Pad, Region}
 
   @banks Style.pad().banks
@@ -82,8 +82,6 @@ defmodule Magpie.PadsScreen do
   @notes ~w(C C# D D# E F F# G G# A A# B)
   # The board's Clear outline (the bird's outline colour).
   @clear_line 0xFF4A4560
-
-  @record_screen Magpie.RecordScreen
 
   # ── Mount ───────────────────────────────────────────────────────────────
 
@@ -373,7 +371,7 @@ defmodule Magpie.PadsScreen do
   defp inside?(%{x: x, y: y, width: w, height: h}), do: x >= 0 and x <= w and y >= 0 and y <= h
 
   defp record(socket, index) do
-    Mob.Socket.push_screen(socket, @record_screen, %{pad: index, reply_to: KitSession.whereis()})
+    Mob.Socket.push_screen(socket, RecordScreen, %{pad: index, reply_to: KitSession.whereis()})
   end
 
   defp edit(%{assigns: %{sheet: index}} = socket, fun) when index != nil do
@@ -471,7 +469,12 @@ defmodule Magpie.PadsScreen do
     ~MOB"""
     <Row height={44} fill_width={true} gap={8}>
       <Box width={44} height={44} corner_radius={22} background={Style.color(:raised)} align="center">
-        <Canvas id="menu_bird" width={32} height={28} draw={bird_ops(bird_mood(assigns))} />
+        <Canvas
+          id="menu_bird"
+          width={32}
+          height={28}
+          draw={Bird.ops(bird_mood(assigns), size: 0.5)}
+        />
       </Box>
       <Row
         fill_width={false}
@@ -595,9 +598,6 @@ defmodule Magpie.PadsScreen do
   defp bird_mood(%{audio: false}), do: :sleep
   defp bird_mood(%{playing: true}), do: :play
   defp bird_mood(_assigns), do: :idle
-
-  # Slot for Magpie.Bird (branch `record`): its ops at size 0.5.
-  defp bird_ops(_mood), do: []
 
   # ── Pads ────────────────────────────────────────────────────────────────
 
