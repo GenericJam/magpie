@@ -59,11 +59,11 @@ object MagpieCapture : io.mob.plugin.MobActivityAware {
     private const val READ_FRAMES = 960 // 20 ms at 48 kHz
     internal const val EXTRA_SESSION = "com.genericjam.magpie.capture.SESSION"
 
-    @JvmStatic external fun nativeStarted(rate: Int, channels: Int): Boolean
+    @JvmStatic external fun nativeStarted(session: Long, rate: Int, channels: Int): Boolean
 
-    @JvmStatic external fun nativeWrite(buffer: ByteBuffer, frames: Int, t0Ns: Long)
+    @JvmStatic external fun nativeWrite(session: Long, buffer: ByteBuffer, frames: Int, t0Ns: Long)
 
-    @JvmStatic external fun nativeEnded(reason: String)
+    @JvmStatic external fun nativeEnded(session: Long, reason: String)
 
     private val main = Handler(Looper.getMainLooper())
     private val keyPrefix = "magpie_capture_${UUID.randomUUID()}_"
@@ -78,7 +78,7 @@ object MagpieCapture : io.mob.plugin.MobActivityAware {
     }
 
     private val lock = Any()
-    private var session = 0L // bumps on every start and stop: older consents and service starts are stale
+    private var session = -1L // the NIF's number for the current start; -1 after a stop: older consents and service starts are stale
     private var pending: Request? = null
     private var projection: MediaProjection? = null
     private var record: AudioRecord? = null
@@ -95,8 +95,10 @@ object MagpieCapture : io.mob.plugin.MobActivityAware {
     }
 
     // From the NIF: "" once the consent dialog is on its way, else why not.
+    // `sessionId` comes back with every native call, so the NIF ignores
+    // calls from an earlier session.
     @JvmStatic
-    fun start(rate: Int): String {
+    fun start(rate: Int, sessionId: Long): String {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return "unsupported"
         val activity = activityRef?.get() ?: return "no_activity"
         if (ContextCompat.checkSelfPermission(activity, Manifest.permission.RECORD_AUDIO) !=
@@ -108,7 +110,10 @@ object MagpieCapture : io.mob.plugin.MobActivityAware {
         val req = synchronized(lock) {
             if (pending != null) return "busy"
             stopLocked()
-            Request(++session, rate).also { pending = it }
+            Request(sessionId, rate).also {
+                session = sessionId
+                pending = it
+            }
         }
         main.post { askConsent(activity, owner, req) }
         return ""
@@ -118,12 +123,13 @@ object MagpieCapture : io.mob.plugin.MobActivityAware {
     @JvmStatic
     fun stop() {
         synchronized(lock) {
-            session++
+            session = -1L
             stopLocked()
         }
     }
 
     private fun askConsent(activity: Activity, owner: ActivityResultRegistryOwner, req: Request) {
+        if (synchronized(lock) { pending !== req }) return // stopped before the dialog could open
         try {
             val mpm = activity.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             var launcher: ActivityResultLauncher<Intent>? = null
@@ -153,7 +159,7 @@ object MagpieCapture : io.mob.plugin.MobActivityAware {
             }
         }
         if (!granted) {
-            nativeEnded("denied")
+            nativeEnded(req.session, "denied")
             return
         }
         try {
@@ -170,7 +176,7 @@ object MagpieCapture : io.mob.plugin.MobActivityAware {
         val current = synchronized(lock) {
             (pending === req).also { if (it) pending = null }
         }
-        if (current) nativeEnded(reason)
+        if (current) nativeEnded(req.session, reason)
     }
 
     // MagpieCaptureService, foregrounded as mediaProjection (main thread).
@@ -195,11 +201,11 @@ object MagpieCapture : io.mob.plugin.MobActivityAware {
             r
         }
         failure?.let {
-            nativeEnded(it)
+            nativeEnded(req.session, it)
             return
         }
         val rate = synchronized(lock) { record?.sampleRate } ?: return
-        if (!nativeStarted(rate, CHANNELS)) {
+        if (!nativeStarted(req.session, rate, CHANNELS)) {
             synchronized(lock) { if (session == req.session) stopLocked() }
             return
         }
@@ -262,7 +268,7 @@ object MagpieCapture : io.mob.plugin.MobActivityAware {
             val ts = AudioTimestamp()
             var total = 0L
             var failed = false
-            while (reading) {
+            while (reading && session == sessionId) {
                 buf.clear()
                 val n = rec.read(buf, buf.capacity(), AudioRecord.READ_BLOCKING)
                 if (n < 0) {
@@ -276,7 +282,7 @@ object MagpieCapture : io.mob.plugin.MobActivityAware {
                 } else {
                     System.nanoTime() - frames * 1_000_000_000L / rate
                 }
-                nativeWrite(buf, frames, t0)
+                nativeWrite(sessionId, buf, frames, t0)
                 total += frames
             }
             if (failed) {
@@ -290,26 +296,26 @@ object MagpieCapture : io.mob.plugin.MobActivityAware {
         val current = synchronized(lock) {
             (session == sessionId).also {
                 if (it) {
-                    session++
+                    session = -1L
                     stopLocked()
                 }
             }
         }
-        if (current) nativeEnded("error")
+        if (current) nativeEnded(sessionId, "error")
     }
 
     // The user ended the projection (the system's cast/record chip, or
     // another app took it).
     private fun projectionStopped(proj: MediaProjection) {
-        val current = synchronized(lock) {
-            (projection === proj).also {
-                if (it) {
-                    session++
-                    stopLocked()
-                }
+        var ended = -1L
+        synchronized(lock) {
+            if (projection === proj) {
+                ended = session
+                session = -1L
+                stopLocked()
             }
         }
-        if (current) nativeEnded("stopped")
+        if (ended >= 0) nativeEnded(ended, "stopped")
     }
 
     // Everything off. Caller holds lock.

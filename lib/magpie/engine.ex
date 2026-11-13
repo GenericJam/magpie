@@ -239,7 +239,7 @@ defmodule Magpie.Engine do
   def open_input(_source), do: {:error, {:invalid, :source}}
 
   @doc "Close the input (a recording in progress is dropped)."
-  @spec close_input() :: :ok
+  @spec close_input() :: :ok | {:error, term()}
   def close_input, do: GenServer.call(__MODULE__, :close_input)
 
   @doc """
@@ -417,7 +417,10 @@ defmodule Magpie.Engine do
     end
   end
 
-  def handle_call(:close_input, _from, s), do: {:reply, :ok, close_input(s)}
+  def handle_call(:close_input, _from, s) do
+    {result, s} = close_input(s)
+    {:reply, result, s}
+  end
 
   def handle_call({:record, params}, _from, s), do: {:reply, Audio.impl().record_start(params), s}
 
@@ -482,7 +485,7 @@ defmodule Magpie.Engine do
 
   # The input's opener exited: the mic goes off with it.
   def handle_info({:DOWN, ref, :process, _pid, _}, %{input_ref: ref} = s) when ref != nil,
-    do: {:noreply, close_input(s)}
+    do: {:noreply, s |> close_input() |> elem(1)}
 
   def handle_info({:DOWN, ref, :process, pid, _}, s) do
     case s.subscribers do
@@ -493,13 +496,18 @@ defmodule Magpie.Engine do
 
   # ── Helpers ─────────────────────────────────────────────────────────────────
 
+  # A mic stream that won't stop stays the Engine's (state and monitor
+  # kept, the error returned), so a later close can try again.
   defp close_input(s) do
-    with {:error, reason} <- Audio.impl().input_close() do
-      Logger.warning("Magpie.Engine: closing the input: #{inspect(reason)}")
-    end
+    case Audio.impl().input_close() do
+      :ok ->
+        if s.input_ref, do: Process.demonitor(s.input_ref, [:flush])
+        {:ok, %{s | input: nil, input_ref: nil}}
 
-    if s.input_ref, do: Process.demonitor(s.input_ref, [:flush])
-    %{s | input: nil, input_ref: nil}
+      {:error, reason} = error ->
+        Logger.warning("Magpie.Engine: closing the input: #{inspect(reason)}")
+        {error, s}
+    end
   end
 
   defp record_params(opts) do

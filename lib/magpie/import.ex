@@ -53,13 +53,13 @@ defmodule Magpie.Import do
       dir = Library.dir()
       tmp = Path.join(dir, ".import-#{System.unique_integer([:positive])}.wav")
 
-      result =
+      try do
         with :ok <- File.mkdir_p(dir),
              :ok <- File.write(tmp, Wav.encode_f32(pcm, info.rate, info.channels)),
              do: Engine.decode(tmp)
-
-      File.rm(tmp)
-      result
+      after
+        File.rm(tmp)
+      end
     end
   end
 end

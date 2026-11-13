@@ -1105,6 +1105,7 @@ static struct {
     /* Java: MagpieCapture, found through the activity's class loader. */
     jclass cls;
     jmethodID start, stop;
+    _Atomic int64_t session; /* the current other-apps start; Kotlin's calls carry it */
 } IN;
 
 typedef struct {
@@ -1196,11 +1197,12 @@ static bool mic_permitted(void) {
 /* MagpieCapture.nativeStarted(rate, channels): capture runs; false tells
  * Kotlin to stop (nobody waits for it any more). Kotlin calls it before its
  * read thread starts. */
-static jboolean JNICALL native_started(JNIEnv *j, jclass cls, jint rate, jint channels) {
+static jboolean JNICALL native_started(JNIEnv *j, jclass cls, jlong session, jint rate, jint channels) {
     (void)j;
     (void)cls;
     pthread_mutex_lock(&IN.lock);
-    bool current = atomic_load(&IN.source) == SRC_APPS && atomic_load(&IN.status) == IN_OPENING && rate > 0 &&
+    bool current = session == atomic_load(&IN.session) && atomic_load(&IN.source) == SRC_APPS &&
+                   atomic_load(&IN.status) == IN_OPENING && rate > 0 &&
                    channels >= 1 && channels <= 2;
     if (current) {
         rc_init(&REC, rate, channels);
@@ -1215,10 +1217,12 @@ static jboolean JNICALL native_started(JNIEnv *j, jclass cls, jint rate, jint ch
 /* MagpieCapture.nativeWrite(buffer, frames, t0): 16-bit interleaved PCM
  * from a direct buffer, its first frame captured at `t0` (System.nanoTime,
  * CLOCK_MONOTONIC). The read thread; takes no lock. */
-static void JNICALL native_write(JNIEnv *j, jclass cls, jobject buffer, jint frames, jlong t0) {
+static void JNICALL native_write(JNIEnv *j, jclass cls, jlong session, jobject buffer, jint frames, jlong t0) {
     (void)cls;
     static float scratch[2 * 1024];
-    if (atomic_load(&IN.source) != SRC_APPS || atomic_load(&IN.status) != IN_OPEN || frames <= 0) return;
+    if (session != atomic_load(&IN.session) || atomic_load(&IN.source) != SRC_APPS ||
+        atomic_load(&IN.status) != IN_OPEN || frames <= 0)
+        return;
     const int16_t *pcm = (*j)->GetDirectBufferAddress(j, buffer);
     if (!pcm) return;
     const int ch = REC.channels, rate = REC.rate;
@@ -1234,7 +1238,7 @@ static void JNICALL native_write(JNIEnv *j, jclass cls, jobject buffer, jint fra
 
 /* MagpieCapture.nativeEnded(reason): consent refused ("denied"), the user
  * stopped the projection ("stopped"), or capture failed ("error"). */
-static void JNICALL native_ended(JNIEnv *j, jclass cls, jstring reason) {
+static void JNICALL native_ended(JNIEnv *j, jclass cls, jlong session, jstring reason) {
     (void)cls;
     char why[16] = "error";
     const char *s = reason ? (*j)->GetStringUTFChars(j, reason, NULL) : NULL;
@@ -1243,7 +1247,8 @@ static void JNICALL native_ended(JNIEnv *j, jclass cls, jstring reason) {
         (*j)->ReleaseStringUTFChars(j, reason, s);
     }
     pthread_mutex_lock(&IN.lock);
-    bool current = atomic_load(&IN.source) == SRC_APPS && atomic_load(&IN.status) != IN_CLOSED;
+    bool current = session == atomic_load(&IN.session) && atomic_load(&IN.source) == SRC_APPS &&
+                   atomic_load(&IN.status) != IN_CLOSED;
     if (current) {
         atomic_store(&IN.status, IN_CLOSED);
         tell_closed(NULL, why);
@@ -1270,11 +1275,11 @@ static bool capture_bind(JNIEnv *j) {
     if (jni_failed(j)) cls = NULL;
     if (cls) {
         JNINativeMethod natives[] = {
-            {"nativeStarted", "(II)Z", (void *)native_started},
-            {"nativeWrite", "(Ljava/nio/ByteBuffer;IJ)V", (void *)native_write},
-            {"nativeEnded", "(Ljava/lang/String;)V", (void *)native_ended},
+            {"nativeStarted", "(JII)Z", (void *)native_started},
+            {"nativeWrite", "(JLjava/nio/ByteBuffer;IJ)V", (void *)native_write},
+            {"nativeEnded", "(JLjava/lang/String;)V", (void *)native_ended},
         };
-        IN.start = (*j)->GetStaticMethodID(j, cls, "start", "(I)Ljava/lang/String;");
+        IN.start = (*j)->GetStaticMethodID(j, cls, "start", "(IJ)Ljava/lang/String;");
         if (jni_failed(j)) IN.start = NULL;
         IN.stop = (*j)->GetStaticMethodID(j, cls, "stop", "()V");
         if (jni_failed(j)) IN.stop = NULL;
@@ -1299,7 +1304,7 @@ static const char *capture_start(int rate) {
     if (!capture_bind(j)) {
         failure = "unsupported";
     } else {
-        jstring r = (jstring)(*j)->CallStaticObjectMethod(j, IN.cls, IN.start, (jint)rate);
+        jstring r = (jstring)(*j)->CallStaticObjectMethod(j, IN.cls, IN.start, (jint)rate, (jlong)atomic_fetch_add(&IN.session, 1) + 1);
         if (jni_failed(j)) {
             failure = "error";
         } else if (r) {
@@ -1441,6 +1446,7 @@ static bool close_input_locked(void) {
         capture_stop();
     }
     atomic_store(&IN.source, SRC_NONE);
+    atomic_fetch_add(&IN.session, 1); /* late calls from that session are stale */
     atomic_store(&IN.mic_dead, false);
     return true;
 }
@@ -2277,11 +2283,10 @@ static ERL_NIF_TERM nif_record_stop(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     float *data = realloc(REC.buf, bytes); /* shrinks in place: the unused tail of the maximum goes */
     if (!data) data = REC.buf;
     REC.buf = NULL;
-    pcm_res *res = enif_alloc_resource(pcm_type, sizeof(pcm_res));
     ERL_NIF_TERM pcm, peaks;
-    unsigned char *p = res ? enif_make_new_binary(env, (size_t)n_peaks, &peaks) : NULL;
-    if (!p) {
-        if (res) enif_release_resource(res);
+    unsigned char *p = enif_make_new_binary(env, (size_t)n_peaks, &peaks);
+    pcm_res *res = p ? enif_alloc_resource(pcm_type, sizeof(pcm_res)) : NULL;
+    if (!res) {
         free(data);
         rc_free_buffers(&REC);
         pthread_mutex_unlock(&IN.lock);
