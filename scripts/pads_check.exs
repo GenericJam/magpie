@@ -13,8 +13,9 @@
 #
 # It puts short test sounds ("CHECK 1".."CHECK 16") on bank A's pads (PADS,
 # default 16: a full bank, the heaviest screen to draw) of the kit on the
-# phone and clears them (and deletes the sounds) at the end. Turn the
-# volume down. The pads screen must be in front, landscape.
+# phone, then puts the pads back as they were and deletes only the sounds
+# it added. Turn the volume down. The pads screen must be in front,
+# landscape.
 #
 # Clocks: a touch's `ts` is the MotionEvent's uptimeMillis (CLOCK_MONOTONIC,
 # ms); the BEAM's monotonic clock is CLOCK_MONOTONIC plus an offset read on

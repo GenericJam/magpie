@@ -262,12 +262,8 @@ defmodule Magpie.PadsScreen do
   def handle_info({:tap, {:color, color}}, socket),
     do: {:noreply, edit(socket, &%{&1 | color: color})}
 
-  def handle_info({:tap, {:mode, mode}}, socket) do
-    if match?(%Pad{mode: m} when m != mode, sheet_pad(socket.assigns)),
-      do: stop_toggle(socket.assigns)
-
-    {:noreply, edit(socket, &%{&1 | mode: mode})}
-  end
+  def handle_info({:tap, {:mode, mode}}, socket),
+    do: {:noreply, edit(socket, &%{&1 | mode: mode})}
 
   def handle_info({:tap, {:choke, group}}, socket),
     do: {:noreply, edit(socket, &%{&1 | choke: group})}
@@ -276,15 +272,12 @@ defmodule Magpie.PadsScreen do
     do: {:noreply, edit(socket, &%{&1 | velocity: mode})}
 
   def handle_info({:tap, :clear}, %{assigns: %{sheet: index}} = socket) when index != nil do
-    stop_toggle(socket.assigns)
     :ok = KitSession.clear_pad(index)
     {:noreply, Mob.Socket.assign(socket, sheet: nil, drag: nil)}
   end
 
-  def handle_info({:tap, :replace}, %{assigns: %{sheet: index}} = socket) when index != nil do
-    stop_toggle(socket.assigns)
-    {:noreply, socket |> Mob.Socket.assign(sheet: nil, drag: nil) |> record(index)}
-  end
+  def handle_info({:tap, :replace}, %{assigns: %{sheet: index}} = socket) when index != nil,
+    do: {:noreply, socket |> Mob.Socket.assign(sheet: nil, drag: nil) |> record(index)}
 
   def handle_info({:press_out, :held}, socket), do: {:noreply, socket}
 
@@ -317,8 +310,8 @@ defmodule Magpie.PadsScreen do
     finger_down(socket, index, t, vel, release)
   end
 
-  # Pad touches already queued, in their order: downs trigger, the rest are
-  # handled as usual; one render follows for all of them.
+  # Pad touches already queued, and kit changes among them, in their order:
+  # downs trigger, the rest are handled as usual; one render follows.
   defp press_waiting(socket) do
     receive do
       {:touch, {:pad, index}, %{phase: :down} = t} ->
@@ -326,6 +319,10 @@ defmodule Magpie.PadsScreen do
 
       {:touch, {:pad, _index}, _t} = touch ->
         {:noreply, socket} = handle_info(touch, socket)
+        press_waiting(socket)
+
+      {:magpie_kit, _snapshot} = change ->
+        {:noreply, socket} = handle_info(change, socket)
         press_waiting(socket)
     after
       0 -> socket
@@ -355,14 +352,6 @@ defmodule Magpie.PadsScreen do
   end
 
   defp release(_finger, _index, _fingers_left), do: :ok
-
-  # A sounding toggle pad about to be cleared, replaced or change mode: a
-  # trigger toggles it off (its loop would otherwise run on, unreachable).
-  defp stop_toggle(%{sheet: index, voices: voices} = assigns) do
-    with %Pad{mode: :toggle} <- sheet_pad(assigns),
-         true <- Map.has_key?(voices, index),
-         do: Engine.trigger(index, 1)
-  end
 
   defp inside?(%{x: x, y: y, width: w, height: h}), do: x >= 0 and x <= w and y >= 0 and y <= h
 

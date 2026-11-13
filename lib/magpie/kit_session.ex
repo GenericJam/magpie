@@ -69,6 +69,7 @@ defmodule Magpie.KitSession do
     autosave_ms: @autosave_ms,
     samples: %{},
     refused: %{},
+    sounding: MapSet.new(),
     queue: [],
     subscribers: %{}
   ]
@@ -181,6 +182,9 @@ defmodule Magpie.KitSession do
 
   @impl true
   def handle_continue(:load, s) do
+    # Voice starts and ends: which pads sound, to stop a toggle pad's loop
+    # when the pad changes.
+    :ok = Engine.subscribe()
     _ = Engine.set_tempo(s.kit.tempo)
     _ = Engine.set_swing(s.kit.swing)
     {:noreply, s |> enqueue(sample_ids(s.kit)) |> next_load() |> publish()}
@@ -250,6 +254,14 @@ defmodule Magpie.KitSession do
 
   def handle_info({:autosave, _stale}, s), do: {:noreply, s}
 
+  def handle_info({:magpie_audio, :voice, index, :start}, s),
+    do: {:noreply, %{s | sounding: MapSet.put(s.sounding, index)}}
+
+  def handle_info({:magpie_audio, :voice, index, :end}, s),
+    do: {:noreply, %{s | sounding: MapSet.delete(s.sounding, index)}}
+
+  def handle_info({:magpie_audio, _kind, _a, _b}, s), do: {:noreply, s}
+
   # Magpie.RecordScreen's reply: a sample saved for a pad.
   def handle_info({:recorded, index, %Library.Sample{id: id}}, s) when index in 0..63 do
     {result, s} = put_sample_on(s, index, id)
@@ -286,11 +298,16 @@ defmodule Magpie.KitSession do
   end
 
   # Pad `index` becomes `pad` (nil: empty) in the engine, then in the kit.
-  # The old pad's held voices (gate, loop, keys) are let go when its sound
-  # or mode changes, and a sample no pad uses any more is unloaded.
+  # When its sound or mode changes, the old pad's voices stop first, while
+  # the engine still has the old definition (a release goes by the pad's
+  # current mode; a sounding toggle stops on a trigger). A sample no pad
+  # uses any more is unloaded.
   defp set_pad(s, index, pad) do
     id = with %Pad{sample: %Region{id: id}} <- pad, do: id
     old = pad_at(s.kit, index)
+
+    if old && (pad == nil or old.sample != pad.sample or old.mode != pad.mode),
+      do: stop_voices(s, index, old)
 
     result =
       case Map.get(s.samples, id) do
@@ -301,9 +318,6 @@ defmodule Magpie.KitSession do
 
     case result do
       :ok ->
-        if old && (pad == nil or old.sample != pad.sample or old.mode != pad.mode),
-          do: Engine.release(index)
-
         old_id = with %Pad{sample: %Region{id: old_id}} <- old, do: old_id
 
         s =
@@ -333,10 +347,20 @@ defmodule Magpie.KitSession do
         s
 
       true ->
-        if match?({:ok, _}, s.samples[id]), do: Engine.unload_sample(id)
-        %{s | samples: Map.delete(s.samples, id), queue: List.delete(s.queue, id)}
+        # The engine still holding it (busy): keep it, to unload next time.
+        kept = match?({:ok, _}, s.samples[id]) and Engine.unload_sample(id) != :ok
+
+        if kept,
+          do: s,
+          else: %{s | samples: Map.delete(s.samples, id), queue: List.delete(s.queue, id)}
     end
   end
+
+  defp stop_voices(s, index, %Pad{mode: :toggle}) do
+    if MapSet.member?(s.sounding, index), do: Engine.trigger(index, 1)
+  end
+
+  defp stop_voices(_s, index, _old), do: Engine.release(index)
 
   defp reply({result, s}), do: {:reply, result, s}
 
