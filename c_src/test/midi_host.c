@@ -1044,6 +1044,124 @@ static void test_follow_loss(void) {
     }
 }
 
+/* ── Clock follow: two inputs sending clock ───────────────────────────────── */
+
+/* One burst with two masters ticking: `a` from the Magpie port (input 0),
+ * `b` from input `src_b`, each tick in arrival order. */
+static void two_block(sp_engine *e, master_t *a, master_t *b, uint8_t src_b) {
+    double now = (double)heard_ns(e->frame - LAT);
+    for (;;) {
+        master_t *m = a->next_ns <= b->next_ns ? a : b;
+        if (m->next_ns > now) break;
+        if (m->k < (1 << 14)) m->nominal[m->k] = m->next_ns;
+        push(e, (sp_cmd){.type = SP_CMD_MIDI,
+                         .u.midi = {0xF8, 0, 0, m == a ? 0 : src_b},
+                         .t_ns = (int64_t)(m->next_ns + m->jit_ms * unit() * 1e6)});
+        m->k++;
+        m->next_ns += m->period_ns;
+    }
+    sp_render(e, scratch, BLOCK);
+    collect(e);
+}
+
+static void transport_from(sp_engine *e, uint8_t src, uint8_t status, double ns) {
+    push(e, (sp_cmd){.type = SP_CMD_MIDI, .u.midi = {status, 0, 0, src}, .t_ns = (int64_t)ns});
+}
+
+static double last_tempo(void) {
+    double bpm = 0;
+    for (int i = 0; i < n_evs; i++)
+        if (evs[i].type == SP_EV_TEMPO) bpm = evs[i].a / 1000.0;
+    return bpm;
+}
+
+static int playheads(void) {
+    int n = 0;
+    for (int i = 0; i < n_evs; i++) n += evs[i].type == SP_EV_PLAYHEAD;
+    return n;
+}
+
+/* Only one input's clock is followed (the first to send, or the last to
+ * start its transport): another input's ticks don't merge into the fit, its
+ * Stop doesn't stop the run, its song position or Continue only take over
+ * while stopped, its Start always does; a takeover starts a fresh fit. */
+static void test_follow_two(void) {
+    printf("clock follow: two inputs sending clock\n");
+    static master_t a, b;
+    const uint8_t SRC_B = 3;
+    int n;
+    sp_engine *e = new_engine();
+    sp_set_clock(e, 0, CLOCK0);
+    set_map(e, map_new(0, 1, SP_CLOCK_FOLLOW));
+    cmd(e, SP_CMD_TEMPO, 90);
+    master_init(&a, (double)heard_ns(LAT + BLOCK), 120.0, 1.0);
+    master_init(&b, (double)heard_ns(LAT + BLOCK) + 3e6, 75.0, 1.0);
+
+    reset_log();
+    for (int i = 0; i < 200; i++) two_block(e, &a, &b, SRC_B);
+    double shown = last_tempo();
+    CHECK(e->midi.follow_src == 0 && fabs(shown - 120.0) < 0.3,
+          "the first to send is followed: input %d, %.2f bpm while stopped (120; the other at 75)", e->midi.follow_src,
+          shown);
+
+    transport_from(e, 0, 0xFA, a.next_ns - 1e5);
+    int64_t k_a = a.k;
+    reset_log();
+    for (int i = 0; i < 400; i++) two_block(e, &a, &b, SRC_B);
+    double worst = worst_from(&a, k_a, a.nominal[k_a] + 0.5e9, &n);
+    CHECK(e->seq.playing && n >= 11 && worst < 3.0, "its Start: %d steps on its grid from 0.5 s on, worst %.3f ms", n,
+          worst);
+
+    /* The other input's transport while this one plays: Stop, song position
+     * and Continue change nothing. */
+    double now = (double)heard_ns(e->frame - LAT);
+    transport_from(e, SRC_B, 0xFC, now);
+    push(e, (sp_cmd){.type = SP_CMD_MIDI, .u.midi = {0xF2, 8, 0, SRC_B}, .t_ns = (int64_t)now});
+    transport_from(e, SRC_B, 0xFB, now);
+    reset_log();
+    for (int i = 0; i < 200; i++) two_block(e, &a, &b, SRC_B);
+    CHECK(e->seq.playing && e->midi.follow_src == 0 && playheads() >= 7 && fabs(last_tempo() - 120.0) < 0.3,
+          "another input's Stop, song position and Continue while playing: still playing (%d steps), input %d, "
+          "%.2f bpm",
+          playheads(), e->midi.follow_src, last_tempo());
+
+    /* Its own Stop stops; then the other's song position and Continue take
+     * over from a fresh fit and play on its grid. */
+    transport_from(e, 0, 0xFC, (double)heard_ns(e->frame - LAT));
+    for (int i = 0; i < 20; i++) two_block(e, &a, &b, SRC_B);
+    bool stopped = !e->seq.playing;
+    now = (double)heard_ns(e->frame - LAT);
+    push(e, (sp_cmd){.type = SP_CMD_MIDI, .u.midi = {0xF2, 4, 0, SRC_B}, .t_ns = (int64_t)now});
+    transport_from(e, SRC_B, 0xFB, now);
+    sp_render(e, scratch, 1);
+    bool took = e->midi.follow_src == SRC_B && e->midi.fit.n == 0 && e->midi.n_held == 0;
+    int64_t k_b = b.k;
+    reset_log();
+    for (int i = 0; i < 800; i++) two_block(e, &a, &b, SRC_B);
+    worst = worst_from(&b, k_b, b.nominal[k_b] + 2e9, &n);
+    int first_step = -1;
+    for (int i = 0; i < n_evs && first_step < 0; i++)
+        if (evs[i].type == SP_EV_PLAYHEAD) first_step = evs[i].a;
+    CHECK(stopped && took && e->seq.playing && first_step == 4 && n >= 8 && worst < 3.0 &&
+              fabs(last_tempo() - 75.0) < 0.3,
+          "its Stop stops (%d); the other's song position + Continue take over (%d) from step %d (4), %d steps on its "
+          "grid from 2 s on, worst %.3f ms, %.2f bpm (75)",
+          stopped, took, first_step, n, worst, last_tempo());
+
+    /* The first input's Start while the other plays takes over at once. */
+    transport_from(e, 0, 0xFA, a.next_ns - 1e5);
+    sp_render(e, scratch, 1);
+    took = e->midi.follow_src == 0 && e->midi.fit.n == 0;
+    k_a = a.k;
+    reset_log();
+    for (int i = 0; i < 800; i++) two_block(e, &a, &b, SRC_B);
+    worst = worst_from(&a, k_a, a.nominal[k_a] + 2e9, &n);
+    CHECK(took && e->seq.playing && n >= 15 && worst < 3.0 && fabs(last_tempo() - 120.0) < 0.3,
+          "the first input's Start takes back over (%d): %d steps on its grid from 2 s on, worst %.3f ms, %.2f bpm", took,
+          n, worst, last_tempo());
+    free_engine(e);
+}
+
 /* ── Notes out: one note open per channel and note; note-offs always out ── */
 
 static void test_out_pairing(void) {
@@ -1191,6 +1309,7 @@ int main(void) {
     test_clock_send();
     test_follow();
     test_follow_loss();
+    test_follow_two();
     test_out_pairing();
     test_hits();
     printf(failures ? "FAILED: %d\n" : "passed: 0 failures\n", failures);
