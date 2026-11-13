@@ -1633,21 +1633,27 @@ typedef struct {
     uint8_t src;
 } midi_ctx;
 
-/* A MIDI command for the renderer; with no stream rendering, the control
- * path applies it now (only releases count then, see apply), or the
- * stream being reopened does first. */
-static void midi_push_cmd(const sp_cmd *c) {
-    if (atomic_load(&E.running)) {
-        push_cmd(c);
-        return;
-    }
+/* With no stream rendering, the control path renders: now, if it does
+ * (else the stream being reopened does first). */
+static void midi_drain_offline(void) {
+    if (atomic_load(&E.running)) return;
     pthread_mutex_lock(&E.ctl);
-    ctl_push(c);
+    if (E.drains) sp_drain(&SP, false);
     pthread_mutex_unlock(&E.ctl);
 }
 
-/* With no stream only what releases voices goes (a note-off, CC 120/123):
- * a note held across a route change still ends. */
+/* What input `source` held ends: a bit the renderer reads before its next
+ * command (so before anything pushed after this), never lost to a full
+ * command queue. */
+static void source_gone(int source) {
+    atomic_fetch_or(&SP.midi.gone, 1u << source);
+    midi_drain_offline();
+}
+
+/* With no stream only what releases voices goes (a note-off, CC 120/123),
+ * applied offline: a note held across a route change still ends. A release
+ * the full command queue refuses ends everything its input holds instead
+ * (source_gone): an early end, never a stuck note. */
 static void midi_emit(void *ctx, mi_msg m) {
     atomic_fetch_add_explicit(&MI.received, 1, memory_order_relaxed);
     const midi_ctx *x = ctx;
@@ -1655,8 +1661,12 @@ static void midi_emit(void *ctx, mi_msg m) {
     uint8_t kind = m.status & 0xF0;
     bool release = m.status < 0xF0 && (kind == 0x80 || (kind == 0x90 && m.d2 == 0) ||
                                        (kind == 0xB0 && (m.d1 == 120 || m.d1 == 123)));
-    if (atomic_load(&E.running)) push_cmd(&c);
-    else if (release) midi_push_cmd(&c);
+    if (!atomic_load(&E.running) && !release) return;
+    if (!push_cmd(&c)) {
+        if (release) source_gone(x->src);
+        return;
+    }
+    if (release) midi_drain_offline();
 }
 
 /* Under the source's lock: `generation` becomes current, from a fresh
@@ -1666,13 +1676,6 @@ static bool source_renew_locked(midi_source *s, int64_t generation) {
     s->generation = generation;
     s->parser = (mi_parser){0};
     return true;
-}
-
-/* What the input that had `source` held ends; under the source's lock, so
- * it goes before anything the new one sends. */
-static void source_gone(int source) {
-    sp_cmd c = {.type = SP_CMD_MIDI_GONE, .u.midi = {.src = (uint8_t)source}};
-    midi_push_cmd(&c);
 }
 
 /* MagpieMidi.nativeIn(source, generation, data, offset, count, timestamp): a

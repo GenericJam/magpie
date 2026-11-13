@@ -157,7 +157,6 @@ enum {
     SP_CMD_RESET,
     SP_CMD_COUNT_IN,
     SP_CMD_MIDI,
-    SP_CMD_MIDI_GONE,
     SP_CMD_MIDI_MAP,
 };
 
@@ -359,6 +358,7 @@ typedef struct {
         int spp;          /* song position (16ths) for Continue … */
         int64_t stop_k;   /* … unless a followed run stopped on this tick since (moved as held ticks settle); < 0 none */
         bool armed, following;
+        int follow_src;   /* the input whose clock is followed (its last Start, else its first tick); < 0 none */
         int misses;       /* ticks in a row off the fitted line (signed: which way) */
         sp_held_tick held[SP_FOLLOW_HELD]; /* out of the fit until the next gap says what they were */
         int n_held;
@@ -366,6 +366,7 @@ typedef struct {
         _Atomic uint64_t in_messages;
         _Atomic int64_t follow_bpm_milli; /* 0: no clock to follow yet */
         double bpm_shown;                 /* the followed tempo as reported */
+        _Atomic uint32_t gone;            /* a bit per input gone (any thread): its voices end before the next command */
     } midi;
 
     /* Counters for info (relaxed). */
@@ -556,6 +557,7 @@ static void sp_init(sp_engine *e, int rate) {
     atomic_store(&e->step_now, -1);
     e->midi.free_next = -1;
     e->midi.stop_k = -1;
+    e->midi.follow_src = -1;
 }
 
 /* ── MIDI out (renderer) ──────────────────────────────────────────────────── */
@@ -1311,6 +1313,33 @@ static void midi_in_release(sp_engine *e, const sp_cmd *c) {
     else if (kind == 0xB0 && (d1 == 120 || d1 == 123)) midi_release(e, c->u.midi.src, st & 0x0F, -1, d1 == 120);
 }
 
+/* The inputs gone since the last look (midi.gone, set by any thread): the
+ * voices they started end as on their note-offs, and a followed clock from
+ * one of them is free to be taken by the next input that sends one. */
+static void midi_gone_apply(sp_engine *e) {
+    if (!atomic_load_explicit(&e->midi.gone, memory_order_acquire)) return;
+    uint32_t gone = atomic_exchange_explicit(&e->midi.gone, 0, memory_order_acq_rel);
+    while (gone) {
+        int src = __builtin_ctz(gone);
+        gone &= gone - 1;
+        midi_release(e, src, -1, -1, false);
+        if (src == e->midi.follow_src) e->midi.follow_src = -1;
+    }
+}
+
+/* Forget a followed clock: its count, fit and held ticks, its tempo. */
+static void follow_forget(sp_engine *e) {
+    e->midi.armed = false;
+    e->midi.ticks = 0;
+    e->midi.stop_k = -1;
+    mi_fit_reset(&e->midi.fit);
+    atomic_store_explicit(&e->midi.follow_bpm_milli, 0, memory_order_relaxed);
+    e->midi.bpm_shown = 0;
+    e->midi.misses = 0;
+    e->midi.n_held = 0;
+    e->midi.p_ref = 0;
+}
+
 /* Following: the sequencer starts on the tick after Start / Continue, which
  * arrived at heard frame `f` (normally a little in the past: the stream
  * renders ahead), at the position it has there, `P` frames per tick. The
@@ -1535,8 +1564,20 @@ static void follow_tick(sp_engine *e, double f) {
     }
 }
 
-/* Clock follow: ticks, Start, Continue (from the song position), Stop. */
+/* Clock follow: ticks, Start, Continue (from the song position), Stop, from
+ * one input: the last to start its transport (Start; song position or
+ * Continue while stopped), else the first to send anything (two masters'
+ * ticks merged would be one at twice the tempo). Another input taking over
+ * starts from a fresh fit. */
 static void follow_realtime(sp_engine *e, const sp_cmd *c) {
+    int src = c->u.midi.src;
+    uint8_t st = c->u.midi.status;
+    if (src != e->midi.follow_src) {
+        bool takes = st == 0xFA || (!e->seq.playing && (st == 0xFB || st == 0xF2));
+        if (e->midi.follow_src >= 0 && !takes) return;
+        if (e->midi.follow_src >= 0) follow_forget(e);
+        e->midi.follow_src = src;
+    }
     e->at = e->frame;
     switch (c->u.midi.status) {
     case 0xF8:
@@ -1613,15 +1654,8 @@ static void set_midi_map(sp_engine *e, sp_midi_map *map) {
             e->midi.following = false;
             rebase(e);
         }
-        e->midi.armed = false;
-        e->midi.ticks = 0;
-        e->midi.stop_k = -1;
-        mi_fit_reset(&e->midi.fit);
-        atomic_store_explicit(&e->midi.follow_bpm_milli, 0, memory_order_relaxed);
-        e->midi.bpm_shown = 0;
-        e->midi.misses = 0;
-        e->midi.n_held = 0;
-        e->midi.p_ref = 0;
+        follow_forget(e);
+        e->midi.follow_src = -1;
     }
     if (!map || map->clock != SP_CLOCK_SEND) e->midi.free_next = -1;
 }
@@ -1845,18 +1879,16 @@ static void apply(sp_engine *e, const sp_cmd *c, bool live) {
         else e->click.beats = 0;
         break;
     case SP_CMD_MIDI:
-        /* With no stream (offline) only releases: a note held across a
-         * route change still ends. */
+        /* An input gone before this message arrived ends what it held
+         * first; with no stream (offline) only releases: a note held across
+         * a route change still ends. */
+        midi_gone_apply(e);
         if (live) {
             atomic_fetch_add_explicit(&e->midi.in_messages, 1, memory_order_relaxed);
             midi_in(e, c);
         } else {
             midi_in_release(e, c);
         }
-        break;
-    case SP_CMD_MIDI_GONE:
-        /* An input closed (unplugged, its port gone): what it held ends. */
-        midi_release(e, c->u.midi.src, -1, -1, false);
         break;
     case SP_CMD_MIDI_MAP:
         set_midi_map(e, c->u.map);
@@ -1884,6 +1916,7 @@ static void sp_render(sp_engine *e, float *out, int frames) {
     e->offline = false;
     e->at = e->frame;
     sp_cmd c;
+    midi_gone_apply(e);
     while (sp_pop_cmd(e, &c)) apply(e, &c, true);
 
     sequence(e, frames);
@@ -1941,6 +1974,7 @@ static void sp_drain(sp_engine *e, bool live) {
     e->offline = true;
     e->at = e->frame;
     sp_cmd c;
+    midi_gone_apply(e);
     while (sp_pop_cmd(e, &c)) apply(e, &c, live);
     reclaim(e);
     publish_counts(e);

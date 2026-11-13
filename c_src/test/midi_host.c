@@ -388,7 +388,8 @@ static void test_table_change(void) {
     midi_from(e, 4, 0x80, 38, 0);
     render(e, 256, 256);
     kept = voices_on(e, 1) == 1;
-    push(e, (sp_cmd){.type = SP_CMD_MIDI_GONE, .u.midi = {.src = 3}});
+    atomic_fetch_or(&e->midi.gone, 1u << 3);
+    for (int i = 0; i < SP_CMDS; i++) push(e, (sp_cmd){.type = SP_CMD_SWING, .u.value = 0.5}); /* the queue full */
     render(e, 256, 256);
     CHECK(kept && voices_on(e, 1) == 0 && voices_on(e, 0) == 1 && voices_on(e, 13) == 1,
           "another input's note-off leaves a voice; its input gone releases its gate voice, the one-shot rings, "
