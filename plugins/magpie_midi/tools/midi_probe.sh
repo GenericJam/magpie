@@ -7,7 +7,7 @@
 #   plugins/magpie_midi/tools/midi_probe.sh <serial> <device name> devices
 #   plugins/magpie_midi/tools/midi_probe.sh <serial> Magpie listen 10
 #   plugins/magpie_midi/tools/midi_probe.sh <serial> Magpie notes 10 20 200 1 36,38
-#   plugins/magpie_midi/tools/midi_probe.sh <serial> Magpie clock 20 120:16,100:16 -1 0
+#   plugins/magpie_midi/tools/midi_probe.sh <serial> Magpie clock 8 120 8
 #
 # PROBE_PUSH_ONLY=1 builds and pushes /data/local/tmp/magpie_midi_probe.dex
 # without running it (scripts/midi_check.exs does that, then runs it

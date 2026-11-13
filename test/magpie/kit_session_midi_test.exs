@@ -45,17 +45,29 @@ defmodule Magpie.KitSessionMidiTest do
   test "set_midi changes the kit's channel and clock, which are saved with it" do
     start_session!(drums())
     :ok = KitSession.set_midi(%{in_channel: 10})
-    :ok = KitSession.set_midi(%{clock: :follow})
+    :ok = KitSession.set_midi(%{clock: :send})
 
-    assert %{midi: %{in_channel: 10, clock: :follow}} = KitSession.snapshot().kit
-    assert %{in_channel: 10, out_channel: 10, clock: :follow} = Fake.state().midi
+    assert %{midi: %{in_channel: 10, clock: :send}} = KitSession.snapshot().kit
+    assert %{in_channel: 10, out_channel: 10, clock: :send} = Fake.state().midi
     :ok = KitSession.flush()
     {:ok, saved} = Library.load_kit("test-kit")
-    assert saved.midi == %{in_channel: 10, clock: :follow}
+    assert saved.midi == %{in_channel: 10, clock: :send}
 
     assert KitSession.set_midi(%{in_channel: 17}) == {:error, {:invalid, :in_channel}}
     assert KitSession.set_midi(%{clock: :sync}) == {:error, {:invalid, :clock}}
-    assert %{midi: %{in_channel: 10, clock: :follow}} = KitSession.snapshot().kit
+    assert KitSession.set_midi(%{clock: :follow}) == {:error, {:invalid, :clock}}
+    assert %{midi: %{in_channel: 10, clock: :send}} = KitSession.snapshot().kit
+  end
+
+  test "a kit saying follow keeps it, and the engine runs the internal clock" do
+    start_session!(%{drums() | midi: %{in_channel: :all, clock: :follow}})
+    assert %{clock: :internal} = Fake.state().midi
+    assert %{clock: :internal} = Engine.state().midi
+
+    :ok = KitSession.set_midi(%{in_channel: 3})
+    :ok = KitSession.flush()
+    {:ok, saved} = Library.load_kit("test-kit")
+    assert saved.midi == %{in_channel: 3, clock: :follow}
   end
 
   test "a MIDI table the engine refuses (queue full) reaches it once it can" do
@@ -91,25 +103,5 @@ defmodule Magpie.KitSessionMidiTest do
     assert_receive {:magpie_audio, :voice, @keys, :start}
     :ok = Fake.midi_in({0x91, 67, 0})
     assert_receive {:magpie_audio, :voice, @keys, :end}
-  end
-
-  test "following a clock: Start and Stop move the Engine's state, the tempo shows" do
-    start_session!(drums())
-    :ok = KitSession.set_midi(%{clock: :follow})
-    :ok = Engine.subscribe()
-
-    :ok = Fake.follow({:tempo, 123.4})
-    assert_receive {:magpie_audio, :tempo, 123.4}
-    :ok = Fake.follow(:start)
-    assert_receive {:magpie_audio, :transport, true, _frame}
-    assert %{playing: true, follow_tempo: 123.4} = Engine.state()
-
-    :ok = Fake.follow(:stop)
-    assert_receive {:magpie_audio, :transport, false, _frame}
-    refute Engine.state().playing
-
-    # Back to the internal clock: no followed tempo any more.
-    :ok = KitSession.set_midi(%{clock: :internal})
-    assert Engine.state().follow_tempo == nil
   end
 end

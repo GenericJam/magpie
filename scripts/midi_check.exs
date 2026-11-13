@@ -14,9 +14,8 @@
 # touches (`Engine.trigger`) and sequencer steps, stamped with the frame
 # heard; clock send (tick spacing of the stamps and of the arrivals, arrival
 # − stamp, `out_late_us`, song position / Start / Stop, notes on the tick
-# grid); clock follow (followed tempo, lock time and step error against the
-# probe's ticks, a tempo change, jittered ticks, ticks lost on the way);
-# song position + Continue and Stop while following.
+# grid); an incoming clock with Start / Stop / song position / Continue
+# ignored (Magpie doesn't follow a clock yet).
 #
 # It puts short test tones on bank A pads 0..4 (notes 36, 38, 42, 46 and a
 # keys pad rooted at 60) and its own pattern in the engine, then puts the
@@ -100,12 +99,6 @@ parse = fn text ->
       ["SENT", t | hex] ->
         [{:sent, String.to_integer(t), Enum.map(hex, &String.to_integer(&1, 16))}]
 
-      ["GRID", t] ->
-        [{:grid, String.to_integer(t)}]
-
-      ["LOST", t] ->
-        [{:lost, String.to_integer(t)}]
-
       ["RECV", arrival, stamp | hex] ->
         a = String.to_integer(arrival)
         s = String.to_integer(stamp)
@@ -171,7 +164,7 @@ defmodule MagpieMidiCheck do
       end
 
     state = Engine.state()
-    # Straight 16ths: the step errors below are against the master's ticks.
+    # Straight 16ths: sequenced notes land on clock ticks.
     :ok = Engine.set_swing(0.5)
     %{originals: originals, new: Enum.reject(new, &is_nil/1), midi: before.midi, pattern: state.pattern, swing: state.swing}
   end
@@ -184,7 +177,9 @@ defmodule MagpieMidiCheck do
   def cleanup(%{originals: originals, new: new, midi: midi, pattern: pattern, swing: swing}) do
     Engine.stop()
     Engine.set_swing(swing)
-    :ok = KitSession.set_midi(midi)
+    # A kit's `follow` can't be set back (Magpie refuses it for now): it
+    # keeps the clock this run left.
+    :ok = KitSession.set_midi(if midi.clock == :follow, do: Map.delete(midi, :clock), else: midi)
     for {i, pad} <- originals, do: :ok = KitSession.update_pad(i, fn _ -> pad end)
     :ok = KitSession.flush()
     Engine.set_pattern(pattern, at: :now)
@@ -250,10 +245,8 @@ defmodule MagpieMidiCheck do
         for {t, msg} <- msgs do
           msg =
             case msg do
-              {:magpie_audio, :transport, playing, frame} -> {:transport, playing, heard(frame)}
               {:magpie_audio, :playhead, step, frame} -> {:playhead, step, heard(frame)}
               {:magpie_audio, :voice, pad, what} -> {:voice, pad, what}
-              {:magpie_audio, :tempo, bpm} -> {:tempo, bpm}
               other -> other
             end
           {t - off, msg}
@@ -407,126 +400,33 @@ try do
 
   IO.puts("  note stamp − nearest tick stamp: #{stats.(grid_err)} µs")
 
-  # ── Clock follow ───────────────────────────────────────────────────────────
+  # ── Clock in: ignored ──────────────────────────────────────────────────────
 
-  follow = fn label, args ->
-    IO.puts("\n== Clock follow: #{label}")
-    :ok = rpc.(Magpie.KitSession, :set_midi, [%{clock: :follow}])
-    :ok = rpc.(Magpie.Engine, :set_pattern, [rpc.(MagpieMidiCheck, :pattern, [[{0, Enum.to_list(0..15)}]]), [at: :now]])
-    Process.sleep(300)
-    clear.()
-    events = Task.await(probe.(["clock" | args]), :infinity)
-    beam = report.()
+  IO.puts("\n== Clock in (probe → the Magpie port): not followed, ignored")
+  :ok = rpc.(Magpie.KitSession, :set_midi, [%{clock: :internal}])
+  :ok = rpc.(Magpie.Engine, :set_pattern, [rpc.(MagpieMidiCheck, :pattern, [[{0, Enum.to_list(0..15)}]]), [at: :now]])
+  Process.sleep(300)
+  before = info.()
+  clear.()
+  events = Task.await(probe.(["clock", "6", "120", "8"]), :infinity)
+  Process.sleep(200)
+  after_ = info.()
+  beam = report.()
+  sent = for {:sent, _, [b | _]} <- events, do: b
+  heads = Enum.count(for {_, {:playhead, _, _}} <- beam, do: 1)
+  voices = Enum.count(for {_, {:voice, _, :start}} <- beam, do: 1)
+  outs = Enum.count(for {:recv, _, _, _} <- events, do: 1)
 
-    # The master's grid (a jittered tick is stamped when it is sent).
-    sent_ticks = for {:grid, t} <- events, do: t
-    [{start_t, _} | _] = for {:sent, t, [b | _]} <- events, b in [0xFA, 0xFB], do: {t, b}
-    stop_t = Enum.find_value(events, fn {:sent, t, [0xFC]} -> t; _ -> nil end)
-    step_ticks = sent_ticks |> Enum.take_every(6) |> Enum.with_index()
-    {last_tick, _} = List.last(step_ticks)
-    step_ns = (last_tick - start_t) / max(length(step_ticks) - 1, 1)
-    ons = for {:recv, _, s, [0x90, 36, v]} <- events, v > 0, do: s
-    # A step due when the Stop arrives was rendered before it came: it sounds.
-    {ons, at_stop} = Enum.split_with(ons, &(&1 < last_tick + step_ns / 2))
+  IO.puts(
+    "  sent #{Enum.count(sent, &(&1 == 0xF8))} ticks at 120 bpm with Start, Stop, song position 8 + Continue, Stop " <>
+      "(#{length(sent)} messages); applied #{after_.applied - before.applied}"
+  )
 
-    errs =
-      for s <- ons do
-        {tick, k} = Enum.min_by(step_ticks, fn {t, _} -> abs(t - s) end)
-        {k, tick, ms.(s - tick)}
-      end
+  IO.puts(
+    "  Magpie: playing #{rpc.(Magpie.Engine, :state, []).playing}, #{heads} playhead steps, #{voices} voice starts, " <>
+      "#{outs} messages out"
+  )
 
-    if System.get_env("MIDI_SERIES"),
-      do: IO.puts("  series (step:error ms) " <> Enum.map_join(errs, " ", fn {k, _, e} -> "#{k}:#{fmt.(e)}" end))
-
-    playing = for {_, {:transport, p, heard}} <- beam, do: {p, heard}
-    tempos = for {t, {:tempo, bpm}} <- beam, do: {t, bpm}
-    first_step = Enum.find_value(beam, fn {_, {:playhead, step, _}} -> step; _ -> nil end)
-
-    IO.puts(
-      "  probe: #{length(sent_ticks)} ticks (#{length(step_ticks)} steps, #{length(for {:lost, _} <- events, do: 1)} not sent); " <>
-        "Magpie: #{length(ons)} step notes + #{length(at_stop)} at the Stop, " <>
-        "transport #{inspect(Enum.map(playing, &elem(&1, 0)))}, first playhead step #{inspect(first_step)}"
-    )
-
-    case playing do
-      [{true, heard} | _] -> IO.puts("  started: heard #{fmt.(ms.(heard - start_t))} ms after the probe's Start")
-      _ -> :ok
-    end
-
-    case Enum.find(playing, &(elem(&1, 0) == false)) do
-      {false, heard} when stop_t != nil -> IO.puts("  stopped: heard #{fmt.(ms.(heard - stop_t))} ms after the probe's Stop")
-      _ -> :ok
-    end
-
-    {errs, tempos, start_t}
-  end
-
-  # Locked: the first step of 8 in a row within `tol` ms (from `from` on);
-  # and how many later steps of the segment still miss it.
-  settle = fn errs, from, to, tol ->
-    seg = for {k, t, e} <- errs, k >= from, k < to, do: {k, t, e}
-    within = fn {_, _, e} -> abs(e) < tol end
-
-    seg
-    |> Enum.with_index()
-    |> Enum.find_value(fn {{k, t, _}, i} ->
-      if Enum.all?(Enum.slice(seg, i, 8), within),
-        do: {k, t, seg |> Enum.drop(i) |> Enum.reject(within) |> Enum.map(&elem(&1, 2))}
-    end)
-  end
-
-  report_follow = fn errs, tempos, start_t, segments ->
-    IO.puts("  downbeat (step 0) error: #{fmt.(errs |> List.first() |> elem(2))} ms")
-
-    for {label, from, to, settle_from, tol} <- segments do
-      case settle.(errs, settle_from, to, tol) do
-        {k, tick, misses} ->
-          IO.puts(
-            "  #{label}: locked (8 steps in a row within #{tol} ms) at step #{k}, #{fmt.(ms.(tick - start_t))} ms after Start; " <>
-              "later steps outside: #{length(misses)} #{inspect(Enum.map(misses, &Float.round(&1, 2)))}"
-          )
-
-        nil ->
-          IO.puts("  #{label}: never locked within #{tol} ms")
-      end
-
-      seg = for {k, _, e} <- errs, k >= from, k < to, do: e
-      IO.puts("    steps #{from}..#{to - 1}: error #{stats.(seg)} ms, rms #{fmt.(rms.(seg))}")
-    end
-
-    IO.puts("  followed tempo reported: #{tempos |> Enum.map(fn {_, b} -> fmt.(b * 1.0) end) |> Enum.dedup() |> Enum.join(" → ")}")
-  end
-
-  {errs, tempos, start_t} = follow.("120 bpm for 16 beats, then 100 bpm for 16 beats", ["20", "120:16,100:16", "-1", "0"])
-
-  report_follow.(errs, tempos, start_t, [
-    {"120 bpm", 8, 64, 1, 1.0},
-    {"100 bpm (the change at step 64)", 72, 128, 64, 1.0}
-  ])
-
-  {errs, tempos, start_t} = follow.("120 bpm, ticks ±2 ms jitter", ["14", "120:24", "-1", "2"])
-  report_follow.(errs, tempos, start_t, [{"jittered", 8, 96, 1, 1.5}])
-
-  # Ticks lost on the way (the probe doesn't send them): one; two, two
-  # apart; four, every other one; a 1 s dropout, then one 4 ticks after it.
-  {errs, tempos, start_t} =
-    follow.("120 bpm, ticks lost: 96; 192, 194; 288..294 every other; 400..447, then 452", [
-      "20",
-      "120:32",
-      "-1",
-      "0",
-      "96,192,194,288,290,292,294,400-447,452"
-    ])
-
-  report_follow.(errs, tempos, start_t, [
-    {"one lost (tick 96, step 16)", 16, 32, 16, 1.0},
-    {"two lost two apart (ticks 192, 194; step 32)", 32, 48, 32, 1.0},
-    {"four lost, every other tick (ticks 288..294; step 48)", 48, 66, 48, 1.0},
-    {"a 1 s dropout (ticks 400..447), then tick 452 lost (steps 66..75)", 66, 128, 66, 1.0}
-  ])
-
-  {errs, _, _} = follow.("song position 8 + Continue at 120 bpm", ["8", "120:8", "8", "0"])
-  IO.puts("  first step note error: #{fmt.(errs |> List.first() |> elem(2))} ms; from its 8th step: #{stats.(for {k, _, e} <- errs, k >= 8, do: e)} ms")
   IO.puts("\n== Totals: #{inspect(Map.take(info.(), [:received, :applied, :sent, :out_dropped, :late_ticks_dropped]))}")
 after
   send(c, :exit)

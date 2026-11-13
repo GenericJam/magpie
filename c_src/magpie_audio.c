@@ -588,7 +588,7 @@ static void deliver_events(ErlNifEnv *env) {
     ErlNifPid owner = E.owner;
     pthread_mutex_unlock(&E.ctl);
 
-    sp_event ev, head = {.type = 0xff}, tempo = {.type = 0xff};
+    sp_event ev, head = {.type = 0xff};
     bool any_voice = false;
     while (sp_pop_event(&SP, &ev)) {
         switch (ev.type) {
@@ -617,15 +617,6 @@ static void deliver_events(ErlNifEnv *env) {
             if (ev.b) midi_in_latency(&ev);
             else record_latency(&ev);
             break;
-        case SP_EV_TRANSPORT:
-            if (has_owner)
-                send_owner(&owner, env,
-                           enif_make_tuple4(env, tag(env), atom(env, "transport"), atom(env, ev.a ? "true" : "false"),
-                                            enif_make_int64(env, ev.frame)));
-            break;
-        case SP_EV_TEMPO:
-            tempo = ev;
-            break;
         case SP_EV_COUNT_IN:
             count_in_heard(env, &owner, has_owner, &ev);
             break;
@@ -649,9 +640,6 @@ static void deliver_events(ErlNifEnv *env) {
         send_owner(&owner, env,
                    enif_make_tuple4(env, tag(env), atom(env, "playhead"), enif_make_int(env, head.a),
                                     enif_make_int64(env, head.frame)));
-    if (tempo.type == SP_EV_TEMPO && has_owner)
-        send_owner(&owner, env,
-                   enif_make_tuple3(env, tag(env), atom(env, "tempo"), enif_make_double(env, tempo.a / 1000.0)));
 }
 
 static void refresh_clock(void) {
@@ -1956,20 +1944,18 @@ static void midi_in_latency(const sp_event *ev) {
 static ERL_NIF_TERM ring_term(ErlNifEnv *env, const float *ring, const int64_t *count_at, int size);
 
 static ERL_NIF_TERM midi_info(ErlNifEnv *env) {
-    ERL_NIF_TERM keys[9] = {atom(env, "bound"),        atom(env, "received"),         atom(env, "applied"),
+    ERL_NIF_TERM keys[8] = {atom(env, "bound"),        atom(env, "received"),         atom(env, "applied"),
                             atom(env, "sent"),         atom(env, "out_dropped"),      atom(env, "late_ticks_dropped"),
-                            atom(env, "in_latency_ms"), atom(env, "out_late_us"),     atom(env, "follow_bpm")};
-    int64_t milli = atomic_load(&SP.midi.follow_bpm_milli);
-    ERL_NIF_TERM vals[9] = {atom(env, MI.cls ? "true" : "false"),
+                            atom(env, "in_latency_ms"), atom(env, "out_late_us")};
+    ERL_NIF_TERM vals[8] = {atom(env, MI.cls ? "true" : "false"),
                             enif_make_uint64(env, atomic_load(&MI.received)),
                             enif_make_uint64(env, atomic_load(&SP.midi.in_messages)),
                             enif_make_uint64(env, atomic_load(&MI.sent)),
                             enif_make_uint64(env, atomic_load(&SP.midi.out.dropped)),
                             enif_make_uint64(env, atomic_load(&MI.late_dropped)),
                             ring_term(env, MI.in_ms, &MI.in_n, MIDI_STATS),
-                            ring_term(env, MI.late_us, &MI.late_n, MIDI_STATS),
-                            milli > 0 ? enif_make_double(env, milli / 1000.0) : atom(env, "nil")};
-    return make_map(env, keys, vals, 9);
+                            ring_term(env, MI.late_us, &MI.late_n, MIDI_STATS)};
+    return make_map(env, keys, vals, 8);
 }
 
 /* ── NIFs ────────────────────────────────────────────────────────────────── */
@@ -2816,9 +2802,9 @@ static ERL_NIF_TERM input_info(ErlNifEnv *env) {
 
 /* set_midi(nil | {InChannel, OutChannel, Clock, NoteMasks, OutNotes}) -> ok
  * | {error, not_owner | busy | alloc}: the kit's MIDI table (owner only).
- * InChannel 0 (all) | 1..16, OutChannel 1..16, Clock internal | follow |
- * send, NoteMasks 128 integers (a bit per pad), OutNotes 64 integers (-1:
- * the pad sends nothing). */
+ * InChannel 0 (all) | 1..16, OutChannel 1..16, Clock internal | send,
+ * NoteMasks 128 integers (a bit per pad), OutNotes 64 integers (-1: the
+ * pad sends nothing). */
 static ERL_NIF_TERM nif_set_midi(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     sp_midi_map *m = NULL;
@@ -2832,7 +2818,6 @@ static ERL_NIF_TERM nif_set_midi(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
             return enif_make_badarg(env);
         uint8_t clock;
         if (enif_is_identical(t[2], atom(env, "internal"))) clock = SP_CLOCK_INTERNAL;
-        else if (enif_is_identical(t[2], atom(env, "follow"))) clock = SP_CLOCK_FOLLOW;
         else if (enif_is_identical(t[2], atom(env, "send"))) clock = SP_CLOCK_SEND;
         else return enif_make_badarg(env);
         m = calloc(1, sizeof(*m));

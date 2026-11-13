@@ -46,7 +46,6 @@ defmodule Magpie.PadsScreenTest do
   defp drain(view) do
     receive do
       {:magpie_audio, _, _, _} = msg -> view |> render_info(msg) |> drain()
-      {:magpie_audio, :tempo, _} = msg -> view |> render_info(msg) |> drain()
       {:magpie_kit, _} = msg -> view |> render_info(msg) |> drain()
     after
       0 -> view
@@ -497,29 +496,6 @@ defmodule Magpie.PadsScreenTest do
     view = render_info(view, {:tap, :play})
     refute Fake.state().playing
     refute assigns(view).playing
-  end
-
-  describe "MIDI" do
-    test "the bank's pattern waits in the engine while stopped, for a MIDI Start" do
-      view = mount()
-      assert %{playing: false, pattern: %{length: 16}} = Fake.state()
-      _view = render_info(view, {:tap, {:bank, "B"}})
-      assert Enum.all?(Fake.state().pattern.events, fn {_, pad, _, _} -> pad in 16..31 end)
-    end
-
-    test "an incoming Start and Stop (clock follow) move Play; the followed tempo shows" do
-      :ok = KitSession.set_midi(%{clock: :follow})
-      view = mount()
-      :ok = Fake.follow({:tempo, 131.26})
-      :ok = Fake.follow(:start)
-      view = pump(view)
-      assert assigns(view).playing
-      assert "131.3 bpm" in texts(view)
-
-      :ok = Fake.follow(:stop)
-      view = pump(view)
-      refute assigns(view).playing
-    end
   end
 
   test "note_label/1 names notes with C4 = 60" do

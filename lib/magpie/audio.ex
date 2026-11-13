@@ -19,8 +19,6 @@ defmodule Magpie.Audio do
       {:magpie_audio, :voice, pad, :start | :end}    # a voice of the pad started; the pad's last voice ended
       {:magpie_audio, :hit, pad, %Magpie.Kit.Step{}} # a live trigger while playing, where it was heard
       {:magpie_audio, :pattern, pattern_number, frame} # a pattern took over
-      {:magpie_audio, :transport, playing, frame}    # the sequencer started (true) or stopped at `frame`, by a call or by MIDI clock follow
-      {:magpie_audio, :tempo, bpm}                   # following MIDI clock: the incoming tempo, once a beat
 
   Input and recording (`c:input_open/1`, `c:record_start/1`):
 

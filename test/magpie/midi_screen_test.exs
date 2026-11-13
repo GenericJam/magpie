@@ -36,8 +36,6 @@ defmodule Magpie.MidiScreenTest do
     receive do
       {:magpie_kit, _} = msg -> view |> render_info(msg) |> drain()
       {:magpie_midi, _} = msg -> view |> render_info(msg) |> drain()
-      {:magpie_audio, :tempo, _} = msg -> view |> render_info(msg) |> drain()
-      {:magpie_audio, _, _, _} -> drain(view)
     after
       0 -> view
     end
@@ -58,7 +56,7 @@ defmodule Magpie.MidiScreenTest do
     assert assert_every_tap_held(view) > 0
   end
 
-  test "MIDI in steps all → 1 … 16 → all, the clock internal → follow → send → internal" do
+  test "MIDI in steps all → 1 … 16 → all, the clock internal ↔ send" do
     view = mount() |> press(:in_channel)
     assert KitSession.snapshot().kit.midi.in_channel == 1
     assert "channel 1" in texts(view)
@@ -69,13 +67,20 @@ defmodule Magpie.MidiScreenTest do
     assert KitSession.snapshot().kit.midi.in_channel == :all
 
     view = press(view, :clock)
-    assert "follow · waiting for a clock" in texts(view)
-    :ok = Fake.follow({:tempo, 97.04})
-    view = pump(view)
-    assert "follow · 97.0 bpm" in texts(view)
-    view = view |> press(:clock) |> press(:clock)
+    assert KitSession.snapshot().kit.midi.clock == :send
+    assert "send" in texts(view)
+    view = press(view, :clock)
     assert KitSession.snapshot().kit.midi.clock == :internal
     assert "internal" in texts(view)
+  end
+
+  test "a kit saying follow shows internal (what plays); a tap goes to send" do
+    stop_supervised!(KitSession)
+    start_session!(%{KitSession.snapshot().kit | midi: %{in_channel: :all, clock: :follow}})
+    view = mount()
+    assert "internal" in texts(view)
+    _view = press(view, :clock)
+    assert KitSession.snapshot().kit.midi.clock == :send
   end
 
   test "tapping a device turns it on or off" do

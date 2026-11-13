@@ -493,9 +493,8 @@ passes through the BEAM.
   Bluetooth-MIDI scan/connect (`:midi_bluetooth` capability). The
   `magpie_audio` NIF registers its natives (`nativeIn`, `nativeEvent`) and
   starts a sending thread in `open/1`. `c_src/midi.c` (plain C): parser,
-  the follower's line fit, the out ring. `c_src/sampler.c` "MIDI in/out":
-  the renderer maps notes through the kit's table, sends notes/clock
-  stamped with engine frames, follows an incoming clock.
+  the out ring. `c_src/sampler.c` "MIDI in/out": the renderer maps notes
+  through the kit's table, sends notes/clock stamped with engine frames.
 - **Rule:** a note plays every non-keys pad whose `midi_note` it is (any
   bank); unclaimed notes go to every keys pad (chromatic from its root);
   note-off releases gate/loop/keys; a MIDI voice goes by the input,
@@ -508,23 +507,13 @@ passes through the BEAM.
   held voice's late; a note-on the full out ring refuses sends no
   note-off); MIDI voices don't echo. Out channel = `in_channel` or 1.
   Clock `send`: tick every 4 seq ticks, SPP 0 + Start on play, Stop,
-  free-running while stopped. `follow`: LS fit over 24 ticks (reset after
-  two same-side misses > 3 ms), ticks numbered by time: a tick after a gap
-  of ~2–3 ticks or > 3.5 is held out of the fit until the next gap says
-  lost ticks (renumbered) or a slower tempo (counted; up to 4 such gaps
-  in a row are losses, the sequencer at the gaps' pace from the second),
-  so losses, clusters and dropouts keep the grid; position steered onto
-  the fit half a beat ahead; downbeat late by the write-ahead, then on the
-  master's grid. Start or Continue after the clock was silent > 3.5 ticks
-  (sent only while playing) starts a fresh line and count (the old tempo
-  judges gaps only if the second tick keeps to it, else the new line from
-  4 ticks). Gaps under half a tick are a stalled sender's burst (counted,
-  out of the fit) only by a fit of ≥ 6 ticks; three in a row, alike and
-  well apart, are a tempo more than doubled (refit). One
-  input's clock is followed (`follow_src`: the first to send a tick or
-  transport message; another's Start, or song position / Continue while
-  stopped, takes over from a fresh fit; its going away frees it, stopped:
-  forgotten).
+  free-running while stopped. **No clock follow yet** (deferred, see the
+  decision record; the heuristic version is on branch
+  `midi-follow-heuristic`): incoming clock, Start, Stop, Continue and song
+  position do nothing in any mode. The kit format keeps `follow`: a kit
+  saying it loads, round-trips and plays on the internal clock
+  (`Midi.Map.config/1` compiles it to `:internal`); `KitSession.set_midi/1`
+  refuses `:follow` and `Magpie.MidiScreen` offers internal ↔ send.
   Kotlin: one C parser per output port, under its source's
   lock; a source gets a new generation when a port takes it, it is given
   back or the port's service is created, made current in C
@@ -534,11 +523,9 @@ passes through the BEAM.
   rule), `Engine.set_midi/1` (KitSession pushes it on every kit change),
   `KitSession.set_midi(%{in_channel, clock})`, `Magpie.Midi` (devices:
   USB/BLE auto-open, other apps' ports on request, choices in `Mob.State`;
-  `subscribe/1`, `set_open/2`, `ble_scan/0`, `ble_connect/1`), Engine
-  messages `{:magpie_audio, :transport, playing, frame}` and
-  `{:magpie_audio, :tempo, bpm}`, `Engine.state/0` `midi` and
-  `follow_tempo`, `info/0` `midi` stats. `Magpie.MidiScreen` (plain, not
-  designed) behind the magpie button.
+  `subscribe/1`, `set_open/2`, `ble_scan/0`, `ble_connect/1`),
+  `Engine.state/0` `midi`, `info/0` `midi` stats. `Magpie.MidiScreen`
+  (plain, not designed) behind the magpie button.
 - **Checking it:** `cc -O2 -Wall -Wextra -Wno-unused-function -o
   /tmp/midi_host c_src/test/midi_host.c -lm && /tmp/midi_host` (also with
   `-fsanitize=address,undefined`); `mix test test/magpie/midi_*_test.exs
@@ -548,8 +535,8 @@ passes through the BEAM.
   `plugins/magpie_midi/tools/MidiProbe.java`, a client of the "Magpie"
   port run as the shell user (`app_process`; `midi_probe.sh` builds and
   runs it by hand), against test tones on bank A pads 0..4, and puts the
-  kit back; `MidiProbe ... clock <s> <plan> <spp> <jitter> <lost>` can
-  leave ticks out. `MIDI_SERIES=1` prints every followed step's error.
+  kit back; `MidiProbe ... clock <s> <bpm> <beats>` sends a clock with
+  Start / Stop / song position + Continue (Magpie must ignore it).
 
 ### Measured (moto e 2020, Android 10, `scripts/midi_check.exs`)
 
@@ -576,16 +563,9 @@ Ranges are over two runs.
   0.7–0.9 ms, p95 1.8–2.0 ms. SPP 0 + Start + the first tick on one stamp,
   Stop; the clock runs on while stopped. Sequenced notes: 33 on, 33 off,
   every note-on stamped exactly on a tick (0 µs).
-- **Clock follow** against the probe's grid (step note stamps vs the
-  master's tick for that step): downbeat 32–36 ms late (the write-ahead),
-  then locked (8 steps in a row within 1 ms) from step 4 (0.5 s); 120 bpm
-  steps 8–63 rms 0.11–0.13 ms, worst 0.36 ms. 120 → 100 bpm: locked again
-  6 steps (0.9 s) after the change, then rms 0.11–0.15 ms, worst 0.56 ms.
-  Tempo shown 120.0 / 100.0 (±0.1). Ticks sent with ±2 ms jitter: rms
-  0.48 ms, worst 1.05 ms off the master's grid. Song position 8 +
-  Continue: the first step is step 8, then worst 0.24 ms. Stop stops
-  (heard ~35 ms after it: the write-ahead), and the step due at the Stop's
-  own time has already sounded.
+- **Clock follow:** numbers from the removed heuristic implementation
+  (branch `midi-follow-heuristic`), not what ships: locked from step 4,
+  120 bpm rms 0.11–0.13 ms.
 - **Not measured:** USB and Bluetooth devices (no hardware here; the code
   paths are Kotlin only, covered by the Fake on the Elixir side).
 
@@ -605,14 +585,9 @@ input, 1 output).
 - **Clock send:** 670–673 ticks, 0–3 late ticks dropped, arrival spacing
   rms 1.2–1.4 ms (2.4 in the stalled run); sequenced notes exactly on a
   tick (0 µs).
-- **Clock follow:** 120 bpm steps 8–63 rms 0.51–0.52 ms (1.56 with one
-  −6.7 ms excursion; 2.9 in the stalled run); 100 bpm after the change
-  rms 0.29–0.31 ms; ±2 ms jitter rms 0.53–2.14 ms (6.8 stalled). Lost
-  ticks: one lost rms 0.38–0.70 ms (2.93 with one −6.7 ms step); two lost
-  two apart worst 8.6–12.7 ms then locked; four lost every other tick
-  worst ~53 ms then locked within 8–12 steps; a 1 s dropout then a lost
-  tick rms 0.40–1.21 ms, worst ≤ 3.9 ms. Song position 8 + Continue: from
-  its 8th step worst ≤ 1.35 ms.
+- **Clock follow** (the removed heuristic implementation, branch
+  `midi-follow-heuristic`): 120 bpm rms 0.51–0.52 ms; lost ticks and
+  dropouts up to ~53 ms off before relocking.
 
 ## The pads (`Magpie.PadsScreen`)
 

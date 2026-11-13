@@ -6,37 +6,35 @@ defmodule Magpie.MidiScreen do
   magpie menu button on the pads.
 
   Left: MIDI in channel (tap: all → 1 → … → 16 → all; notes out go on the
-  same channel, 1 with all), clock (tap: internal → follow → send; while
-  following, the incoming tempo or "waiting for a clock"), and the Magpie
+  same channel, 1 with all), clock (tap: internal ↔ send; no follow yet: a
+  kit saying `follow` shows and plays internal), and the Magpie
   port's connections. Right: the devices (`Magpie.Midi`): tap one to turn
   it on or off; "Scan for Bluetooth MIDI" (asks for the `:midi_bluetooth`
   permission first if needed) lists what it finds, tap one to connect.
 
   Settings go to the kit (`Magpie.KitSession.set_midi/1`) and are saved
   with it. Every tap target has `on_press_out={held()}` (MOB-509): the
-  screen re-renders on device, kit and tempo messages.
+  screen re-renders on device and kit messages.
   """
 
   use Mob.Screen
 
   import Mob.Canvas
 
-  alias Magpie.{Engine, KitSession, Midi, Style}
+  alias Magpie.{KitSession, Midi, Style}
 
-  @clocks [:internal, :follow, :send]
+  @clocks [:internal, :send]
 
   @impl true
   def mount(_params, _session, socket) do
     snapshot = KitSession.subscribe()
     midi = Midi.subscribe()
-    :ok = Engine.subscribe()
     if device_calls?(), do: Mob.Device.lock_orientation(:landscape)
 
     {:ok,
      Mob.Socket.assign(socket,
        kit: snapshot.kit,
        midi: midi,
-       tempo: Engine.state().follow_tempo,
        notice: nil
      )}
   end
@@ -54,9 +52,6 @@ defmodule Magpie.MidiScreen do
   def handle_info({:magpie_midi, midi}, socket),
     do: {:noreply, Mob.Socket.assign(socket, :midi, midi)}
 
-  def handle_info({:magpie_audio, :tempo, bpm}, socket),
-    do: {:noreply, Mob.Socket.assign(socket, :tempo, bpm)}
-
   def handle_info({:tap, :back}, socket), do: {:noreply, Mob.Socket.pop_screen(socket)}
 
   def handle_info({:tap, :in_channel}, socket) do
@@ -66,7 +61,7 @@ defmodule Magpie.MidiScreen do
 
   def handle_info({:tap, :clock}, socket) do
     :ok = KitSession.set_midi(%{clock: next_clock(socket.assigns.kit.midi.clock)})
-    {:noreply, Mob.Socket.assign(socket, :tempo, nil)}
+    {:noreply, socket}
   end
 
   def handle_info({:tap, {:device, id}}, socket) do
@@ -167,7 +162,7 @@ defmodule Magpie.MidiScreen do
     ~MOB"""
     <Column weight={1} gap={8}>
       {setting_row("in_channel", "MIDI in", channel_label(midi.in_channel), :in_channel)}
-      {setting_row("clock", "Clock", clock_label(midi.clock, assigns.tempo), :clock)}
+      {setting_row("clock", "Clock", clock_label(midi.clock), :clock)}
       <Text
         id="port"
         text={port_label(assigns.midi.port)}
@@ -322,12 +317,9 @@ defmodule Magpie.MidiScreen do
   def channel_label(n), do: "channel #{n}"
 
   @doc false
-  def clock_label(:internal, _tempo), do: "internal"
-  def clock_label(:send, _tempo), do: "send"
-  def clock_label(:follow, nil), do: "follow · waiting for a clock"
-
-  def clock_label(:follow, bpm),
-    do: "follow · #{:erlang.float_to_binary(bpm / 1, decimals: 1)} bpm"
+  def clock_label(:send), do: "send"
+  # A kit's `follow` plays on the internal clock (not followed yet).
+  def clock_label(_internal), do: "internal"
 
   @doc false
   def port_label(%{inputs: i, outputs: o}),

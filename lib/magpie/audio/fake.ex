@@ -55,9 +55,8 @@ defmodule Magpie.Audio.Fake do
 
   `set_midi/1` keeps the table (`state/0`'s `midi`); `midi_in/1` plays a
   message through it as the phone's renderer would (`Magpie.Midi.Map.route/2`,
-  live calls, recorded in `calls/0` as `{:midi, message}`), `follow/1`
-  drives what an incoming clock would (Start, Stop, the tempo). Play and
-  stop send `:transport` as the phone does. Devices: `plug/1` and
+  live calls, recorded in `calls/0` as `{:midi, message}`; clock and
+  transport do nothing, as there). Devices: `plug/1` and
   `unplug/1` add and remove one (`{:magpie_midi, :added | :removed,
   json}` to the listener), `midi_open/1` opens a known one at once
   (`:opened`) unless `fail_midi_open/1` armed a failure (`:open_failed`),
@@ -248,13 +247,6 @@ defmodule Magpie.Audio.Fake do
   @doc "A MIDI message `{status, data1, data2}` arrives (needs the stream and a table)."
   def midi_in({status, d1, d2} = message) when status in 0..255 and d1 in 0..127 and d2 in 0..127,
     do: call({:midi_in, message})
-
-  @doc """
-  What an incoming clock does while following: `:start` (the sequencer
-  plays from step 0, `:transport` true), `:stop`, `{:tempo, bpm}` (the
-  `:tempo` message).
-  """
-  def follow(what), do: call({:follow, what})
 
   @doc "A MIDI device appears: `%{id, name, type, inputs, outputs}` (`own` and `address` optional)."
   def plug(%{id: id} = device) when is_integer(id), do: call({:plug, device})
@@ -450,19 +442,6 @@ defmodule Magpie.Audio.Fake do
     {:reply, :ok, s}
   end
 
-  def handle_call({:follow, :start}, _from, s) do
-    s = %{s | playing: true, local: 0, ticks: 0, play_frame: frame(s)}
-    send(s.owner, {:magpie_audio, :transport, true, frame(s)})
-    {:reply, :ok, at_tick(s)}
-  end
-
-  def handle_call({:follow, :stop}, _from, s), do: stop_sequencer(s)
-
-  def handle_call({:follow, {:tempo, bpm}}, _from, s) do
-    send(s.owner, {:magpie_audio, :tempo, bpm / 1})
-    {:reply, :ok, s}
-  end
-
   def handle_call(_request, {pid, _}, %{owner: owner} = s) when pid != owner,
     do: {:reply, {:error, :not_owner}, s}
 
@@ -613,13 +592,10 @@ defmodule Magpie.Audio.Fake do
 
   def handle_call(:play, _from, s) do
     s = %{s | playing: true, local: 0, ticks: 0, play_frame: frame(s)}
-    send(s.owner, {:magpie_audio, :transport, true, frame(s)})
     {:reply, :ok, at_tick(s)}
   end
 
-  def handle_call(:stop, _from, s), do: stop_sequencer(s)
-
-  defp stop_sequencer(s) do
+  def handle_call(:stop, _from, s) do
     s =
       case s.pending do
         {number, pattern} ->
@@ -630,7 +606,6 @@ defmodule Magpie.Audio.Fake do
           s
       end
 
-    if s.playing, do: send(s.owner, {:magpie_audio, :transport, false, frame(s)})
     s = Enum.reduce(s.gated, s, fn {pad, key, _}, acc -> voice_end(acc, pad, key) end)
     {:reply, :ok, %{s | gated: [], playing: false, play_frame: frame(s), ticks: 0, local: 0}}
   end

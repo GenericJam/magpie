@@ -21,6 +21,10 @@ defmodule Magpie.Midi.Map do
   - `in_channel` `:all` takes every channel; 1..16 only that one.
   - Out: a pad with a `midi_note` sends it (a keys pad the note it plays) on
     the out channel: `in_channel`, or 1 with `:all`.
+  - Clock: `:send` sends Magpie's clock; anything else is the internal
+    clock. A kit's `:follow` (the format has it) plays on the internal
+    clock: an incoming clock isn't followed yet, so clock and transport in
+    do nothing.
   """
 
   alias Magpie.Kit
@@ -31,7 +35,7 @@ defmodule Magpie.Midi.Map do
   @type t :: %{
           in_channel: :all | 1..16,
           out_channel: 1..16,
-          clock: :internal | :follow | :send,
+          clock: :internal | :send,
           notes: %{(0..127) => [pad()]},
           out_notes: %{pad() => 0..127},
           modes: %{pad() => :one_shot | :gate | :loop | :toggle | :keys}
@@ -68,7 +72,7 @@ defmodule Magpie.Midi.Map do
     %{
       in_channel: midi.in_channel,
       out_channel: if(midi.in_channel == :all, do: 1, else: midi.in_channel),
-      clock: midi.clock,
+      clock: if(midi.clock == :send, do: :send, else: :internal),
       notes: Map.reject(notes, fn {_, list} -> list == [] end),
       out_notes: for({i, %Pad{midi_note: n}} <- pads, n != nil, into: %{}, do: {i, n}),
       modes: Map.new(pads, fn {i, pad} -> {i, pad.mode} end)

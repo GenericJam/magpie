@@ -116,8 +116,7 @@ defmodule Magpie.Engine do
             close_retry_ms: @close_retry_ms,
             close_backoff: @close_retry_ms,
             retry: nil,
-            midi: nil,
-            follow_tempo: nil
+            midi: nil
 
   # ── Public API ──────────────────────────────────────────────────────────────
 
@@ -304,10 +303,11 @@ defmodule Magpie.Engine do
 
   @doc """
   The kit's MIDI (`Magpie.Midi.Map.config/1`; nil: off): which pads
-  incoming notes play, what pads send, and the clock (`:internal`,
-  `:follow`, `:send`). The engine applies it without the BEAM: notes in
-  play pads in the audio callback, notes and clock out are stamped there.
-  `Magpie.KitSession` keeps it current with the kit.
+  incoming notes play, what pads send, and the clock (`:internal` or
+  `:send`; an incoming clock is not followed). The engine applies it
+  without the BEAM: notes in play pads in the audio callback, notes and
+  clock out are stamped there. `Magpie.KitSession` keeps it current with
+  the kit.
   """
   @spec set_midi(Magpie.Midi.Map.t() | nil) :: :ok | {:error, term()}
   def set_midi(config) when is_nil(config) or is_map(config),
@@ -448,16 +448,12 @@ defmodule Magpie.Engine do
        pending: with({_, pattern} <- s.pending, do: pattern),
        stream: s.stream,
        input: s.input,
-       midi: s.midi && Map.take(s.midi, [:in_channel, :out_channel, :clock]),
-       follow_tempo: s.follow_tempo
+       midi: s.midi && Map.take(s.midi, [:in_channel, :out_channel, :clock])
      }, s}
   end
 
-  def handle_call({:set_midi, config}, _from, s) do
-    following = match?(%{clock: :follow}, config)
-    new = %{s | midi: config, follow_tempo: if(following, do: s.follow_tempo)}
-    control(Audio.impl().set_midi(config), new, s)
-  end
+  def handle_call({:set_midi, config}, _from, s),
+    do: control(Audio.impl().set_midi(config), %{s | midi: config}, s)
 
   def handle_call({:open_input, source, pid}, _from, s) do
     case Audio.impl().input_open(source) do
@@ -566,18 +562,6 @@ defmodule Magpie.Engine do
   def handle_info({:magpie_audio, kind, _, _, _}, s)
       when kind in [:input, :meter, :record, :count_in],
       do: {:noreply, s}
-
-  # The sequencer started or stopped: by a call here, or by an incoming
-  # MIDI clock (Start / Stop while following).
-  def handle_info({:magpie_audio, :transport, playing, _frame} = msg, s) do
-    forward(s, msg)
-    {:noreply, %{s | playing: playing, step: if(playing, do: s.step)}}
-  end
-
-  def handle_info({:magpie_audio, :tempo, bpm} = msg, s) do
-    forward(s, msg)
-    {:noreply, %{s | follow_tempo: bpm}}
-  end
 
   def handle_info({:magpie_audio, kind, _, _} = msg, s) when kind in [:voice, :hit] do
     forward(s, msg)

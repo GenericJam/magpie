@@ -135,8 +135,10 @@ defmodule Magpie.KitSession do
 
   @doc """
   The kit's MIDI settings: `in_channel` (`:all` or 1..16; notes out go on
-  it, or 1 with `:all`) and `clock` (`:internal`, `:follow` an incoming
-  MIDI clock, `:send` one). Either key may be left out.
+  it, or 1 with `:all`) and `clock` (`:internal` or `:send` a MIDI clock).
+  Either key may be left out. `:follow` is refused: Magpie doesn't follow
+  an incoming clock yet (a kit file saying `follow` still loads, keeps it
+  and plays on the internal clock; see `Magpie.Midi.Map.config/1`).
   """
   @spec set_midi(map()) :: :ok | {:error, {:invalid, atom()}}
   def set_midi(changes) when is_map(changes) do
@@ -144,7 +146,7 @@ defmodule Magpie.KitSession do
       not (Map.get(changes, :in_channel, :all) == :all or Map.get(changes, :in_channel) in 1..16) ->
         {:error, {:invalid, :in_channel}}
 
-      Map.get(changes, :clock, :internal) not in [:internal, :follow, :send] ->
+      Map.get(changes, :clock, :internal) not in [:internal, :send] ->
         {:error, {:invalid, :clock}}
 
       true ->

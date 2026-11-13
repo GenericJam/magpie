@@ -1,9 +1,8 @@
 /*
  * c_src/midi.c — the plain-C pieces of Magpie's MIDI: the byte-stream
- * parser, the line fit the clock follower steers by, and the out queue
- * between the renderer and the thread that sends. sampler.c includes it
- * (the renderer maps notes, follows and sends clock; see "MIDI" there), so
- * it builds on the Mac for the host tests too.
+ * parser and the out queue between the renderer and the thread that
+ * sends. sampler.c includes it (the renderer maps notes and sends clock;
+ * see "MIDI" there), so it builds on the Mac for the host tests too.
  *
  * Time: incoming messages carry CLOCK_MONOTONIC nanoseconds (Android's
  * MIDI timestamps are System.nanoTime); outgoing ones carry the engine
@@ -84,61 +83,6 @@ MI_UNUSED static void mi_parse(mi_parser *p, const uint8_t *in, int n, void (*em
         p->have = 0;
         if (p->status >= 0xF0) p->status = 0;
     }
-}
-
-/* ── The follower's line ──────────────────────────────────────────────────── */
-
-#define MI_FIT 24 /* ticks the fit looks back over: one beat */
-
-/* Tick k arrived at (heard) engine frame f: the last MI_FIT of them. */
-typedef struct {
-    int64_t k[MI_FIT];
-    double f[MI_FIT];
-    int n, head;
-} mi_fit;
-
-static void mi_fit_reset(mi_fit *t) { t->n = t->head = 0; }
-
-static void mi_fit_add(mi_fit *t, int64_t k, double f) {
-    t->k[t->head] = k;
-    t->f[t->head] = f;
-    t->head = (t->head + 1) % MI_FIT;
-    if (t->n < MI_FIT) t->n++;
-}
-
-/* The newest tick in the fit; false when it is empty. */
-static bool mi_fit_newest(const mi_fit *t, int64_t *k, double *f) {
-    if (t->n == 0) return false;
-    int i = (t->head + MI_FIT - 1) % MI_FIT;
-    *k = t->k[i];
-    *f = t->f[i];
-    return true;
-}
-
-/* Least squares f = fc + P·(k − kc): the centroid (kc, fc) and the slope P
- * (frames per tick). False with fewer than two ticks or a slope that isn't
- * positive. Sums relative to the newest tick, so large frame counts keep
- * their precision. */
-static bool mi_fit_line(const mi_fit *t, double *kc, double *fc, double *P) {
-    if (t->n < 2) return false;
-    int newest = (t->head + MI_FIT - 1) % MI_FIT;
-    int64_t k0 = t->k[newest];
-    double f0 = t->f[newest], sk = 0, sf = 0;
-    for (int i = 0; i < t->n; i++) {
-        sk += (double)(t->k[i] - k0);
-        sf += t->f[i] - f0;
-    }
-    double mk = sk / t->n, mf = sf / t->n, skk = 0, skf = 0;
-    for (int i = 0; i < t->n; i++) {
-        double dk = (double)(t->k[i] - k0) - mk, df = t->f[i] - f0 - mf;
-        skk += dk * dk;
-        skf += dk * df;
-    }
-    if (skk <= 0 || skf <= 0) return false;
-    *P = skf / skk;
-    *kc = (double)k0 + mk;
-    *fc = f0 + mf;
-    return true;
 }
 
 /* ── The out queue (renderer → sending thread) ────────────────────────────── */
