@@ -1,0 +1,91 @@
+defmodule Magpie.Audio.Native do
+  @moduledoc """
+  The phone's audio engine: `Magpie.Audio` over the `magpie_audio` NIF
+  (`c_src/magpie_audio.c` and `c_src/sampler.c`, Android).
+
+  An AAudio output stream (low-latency mode, shared, stereo float at the
+  device's own rate) runs the sampler in its callback: a 32-voice pool
+  (plus 16 slots for voices fading out), choke groups, the step sequencer
+  at 96 PPQN with swing. Calls only queue commands into a lock-free queue
+  the callback drains at the start of its next buffer; an event thread
+  turns what the callback did into messages. See the "audio engine"
+  section of AGENTS.md for the design and the phone's numbers.
+  """
+
+  @behaviour Magpie.Audio
+
+  alias Magpie.Audio.Nif
+
+  @impl true
+  def open(owner) when is_pid(owner), do: Nif.open(owner)
+
+  @impl true
+  def close, do: Nif.close()
+
+  @impl true
+  def reset, do: Nif.reset()
+
+  @impl true
+  def load_sample(id, path), do: Nif.load_sample(id, IO.chardata_to_string(path))
+
+  @impl true
+  def load_pcm(id, pcm, rate, channels) when is_binary(pcm),
+    do: Nif.load_pcm(id, pcm, rate, channels)
+
+  @impl true
+  def decode(path), do: Nif.decode(IO.chardata_to_string(path))
+
+  @impl true
+  def unload_sample(id), do: Nif.unload_sample(id)
+
+  @impl true
+  def set_pad(pad, nil),
+    do: Nif.set_pad(pad, {nil, 0, 0, 0.0, 0.0, false, 0.0, 0.0, :one_shot, 0, 60})
+
+  def set_pad(pad, p) do
+    Nif.set_pad(
+      pad,
+      {p.sample, p.start, p.end, p.gain_db, p.pitch_st, p.reverse, p.fade_in_ms, p.fade_out_ms,
+       p.mode, p.choke, p.root}
+    )
+  end
+
+  @impl true
+  def set_pattern(%{length: length, events: events}, at) when at in [:bar, :now] do
+    events = for {pos, pad, vel, note} <- events, do: {pos, pad, vel, note || -1}
+    Nif.set_pattern(length, events, at == :bar)
+  end
+
+  @impl true
+  def set_tempo(bpm), do: Nif.set_tempo(bpm)
+
+  @impl true
+  def set_swing(swing), do: Nif.set_swing(swing)
+
+  @impl true
+  def play, do: Nif.play()
+
+  @impl true
+  def stop, do: Nif.stop()
+
+  @impl true
+  def trigger(pad, velocity, quantize), do: Nif.trigger(pad, velocity, quantize)
+
+  @impl true
+  def release(pad), do: Nif.release(pad)
+
+  @impl true
+  def note_on(pad, note, velocity), do: Nif.note_on(pad, note, velocity)
+
+  @impl true
+  def note_off(pad, note), do: Nif.note_off(pad, note)
+
+  @impl true
+  def clock, do: Nif.clock()
+
+  @impl true
+  def info, do: Nif.info()
+
+  @doc "Start callback timing, trigger latency, the voice peak, steals and hard cuts over (for measuring a stretch)."
+  def reset_stats, do: Nif.reset_stats()
+end

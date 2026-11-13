@@ -9,6 +9,11 @@ config :magpie, ecto_repos: [Magpie.Repo]
 # state persistence. Remove this line to disable screen state persistence.
 config :mob, :repo, Magpie.Repo
 
+# The audio engine: the magpie_audio NIF on the phone, a fake the tests drive
+# on the host.
+config :magpie,
+  audio: if(config_env() == :test, do: Magpie.Audio.Fake, else: Magpie.Audio.Native)
+
 if config_env() == :test do
   # Host tests use a fresh in-memory database each time the Repo starts.
   config :magpie, Magpie.Repo, database: ":memory:", log: false
