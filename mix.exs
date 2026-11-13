@@ -10,13 +10,17 @@ defmodule Magpie.MixProject do
       deps: deps(),
       aliases: aliases(),
       erlc_paths: ["src"],
-      erlc_options: [:debug_info]
+      erlc_options: [:debug_info],
+      elixirc_paths: elixirc_paths(Mix.env())
     ]
   end
 
   def application do
     [extra_applications: [:logger]]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_env), do: ["lib"]
 
   defp deps do
     [

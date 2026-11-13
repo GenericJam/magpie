@@ -127,6 +127,24 @@ launcher masks keep the whole nest. Regenerate every launcher icon with
   against `design/kit.schema.json` with JSV, and check that every invalid
   case the decoder rejects the schema rejects too. One rule beyond the
   schema: `step < length`.
+- **`Magpie.Library`** (the stash): a sample's id is the SHA-256 (lowercase
+  hex) of its PCM in canonical form, interleaved f32le, so a sound is stored
+  once (protocol §2.2). Audio in `<dir>/<id>.wav` (float32 WAV; `dir/0` =
+  `config :magpie, :library_dir` or `<MOB_DATA_DIR>/samples`), rows in
+  SQLite (`samples`, `kits`). `put_pcm(pcm, %{name, rate, channels, source,
+  tags?, peaks?})` (a known sound comes back unchanged; `:empty`,
+  `:partial_frame`, `:invalid_meta`), `put_wav/2`, `get/1`, `path/1`,
+  `pcm/1`, `list(%{source: :all | :recorded | :fmutate | :pack | :imported,
+  q: text})` (newest first; `q` matches name or tag, any case), `rename/2`,
+  `set_tags/2`, `delete/1` (`{:error, {:in_use, kit_ids}}` while a saved kit
+  uses it), `save_kit/1` (replace by id), `load_kit/1`, `list_kits/0`,
+  `delete_kit/1`. `peaks` is whatever the decoder computed (the engine);
+  the library doesn't compute waveforms. Tests: `Magpie.Test.Repo.start/0`
+  (in-memory SQLite, migrations compiled once).
+- **`Magpie.Wav`**: `encode_f32/3`, `encode_s16/3` (for protocol `:wav16`),
+  `decode/1` → `{:ok, %{rate, channels, frames}, f32le}` from 8/16/24/32-bit
+  integer or 32/64-bit float, mono or more, WAVE_FORMAT_EXTENSIBLE, unknown
+  chunks skipped. Integer scale is ÷ 32768 both ways.
 
 ## Architecture (planned)
 

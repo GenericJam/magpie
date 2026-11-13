@@ -8,3 +8,8 @@ config :magpie, ecto_repos: [Magpie.Repo]
 # Wire the Repo into Mob.ScreenState so screens using `vsn:` get automatic
 # state persistence. Remove this line to disable screen state persistence.
 config :mob, :repo, Magpie.Repo
+
+if config_env() == :test do
+  # Host tests use a fresh in-memory database each time the Repo starts.
+  config :magpie, Magpie.Repo, database: ":memory:", log: false
+end
