@@ -194,8 +194,13 @@ defmodule Magpie.Audio do
   @callback decode(path :: Path.t()) :: {:ok, decoded()} | {:error, term()}
   @doc "Unload a sample: its voices fade, pads using it are cleared."
   @callback unload_sample(id :: term()) :: :ok | {:error, term()}
-  @doc "Set a pad (nil: clear it). Takes effect on the pad's next trigger."
-  @callback set_pad(pad(), pad_params() | nil) :: :ok | {:error, term()}
+  @doc """
+  Set a pad (nil: clear it). Takes effect on the pad's next trigger. With
+  `stop` true the pad's sounding voices fade (each by its own release) and
+  its waiting quantized launches are dropped, in the same step as the
+  change, whatever the old or new mode, and with no stream too.
+  """
+  @callback set_pad(pad(), pad_params() | nil, stop :: boolean()) :: :ok | {:error, term()}
   @doc """
   Set the pattern. `:bar`: while playing, it takes over at the next bar
   from its step 0; `:now` (and whenever stopped): at once, keeping the

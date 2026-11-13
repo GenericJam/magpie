@@ -5,7 +5,7 @@ defmodule Magpie.KitSessionTest do
   import Magpie.Test.Kits
 
   alias Magpie.Audio.Fake
-  alias Magpie.{Kit, KitSession, Library, Repo, Wav}
+  alias Magpie.{Engine, Kit, KitSession, Library, Repo, Wav}
   alias Magpie.Kit.{Pad, Region}
 
   setup do
@@ -162,17 +162,54 @@ defmodule Magpie.KitSessionTest do
       assert %Pad{} = KitSession.snapshot().kit.banks["A"][0]
     end
 
-    test "clearing a pad lets its held voices go, empties it and unloads its now unused sample",
+    test "clearing a pad stops its voices, empties it and unloads its now unused sample",
          %{kick: kick} do
       :ok = KitSession.update_pad(0, &%{&1 | mode: :gate})
-      Magpie.Engine.trigger(0, 100)
+      :ok = Engine.subscribe()
+      :ok = Engine.trigger(0, 100)
+      assert_receive {:magpie_audio, :voice, 0, :start}
       assert :ok = KitSession.clear_pad(0)
 
-      assert {:release, 0} in Fake.calls()
+      assert_receive {:magpie_audio, :voice, 0, :end}
       assert Fake.state().pads == %{}
       refute Map.has_key?(Fake.state().samples, kick.id)
       assert KitSession.snapshot().kit.banks["A"] == %{}
       assert KitSession.snapshot().pads == %{}
+    end
+
+    test "a sounding toggle stops when the pad's mode changes, not when its pitch does" do
+      :ok = KitSession.update_pad(0, &%{&1 | mode: :toggle})
+      :ok = Engine.subscribe()
+      :ok = Engine.trigger(0, 100)
+      assert_receive {:magpie_audio, :voice, 0, :start}
+
+      # Heard from its next trigger, like every other pad setting.
+      :ok = KitSession.update_pad(0, fn pad -> put_in(pad.sample.pitch_st, 3) end)
+      # Refused: nothing changes, the loop plays on.
+      assert {:error, {:invalid, :pitch_st}} =
+               KitSession.update_pad(
+                 0,
+                 &%{&1 | mode: :one_shot, sample: %{&1.sample | pitch_st: 99}}
+               )
+
+      refute_receive {:magpie_audio, :voice, 0, :end}
+
+      :ok = KitSession.update_pad(0, &%{&1 | mode: :one_shot})
+      assert_receive {:magpie_audio, :voice, 0, :end}
+      assert %{mode: :one_shot, pitch_st: 3} = Fake.state().pads[0]
+      # Nothing else was sent to stop it (a trigger would have played the one-shot).
+      assert [{:trigger, 0, 100, 0}] = Fake.calls()
+    end
+
+    test "a sample the engine can't unload yet is unloaded once it can", %{kick: kick} do
+      :ok = Fake.busy(:unload_sample, 1)
+      :ok = KitSession.clear_pad(0)
+      assert Map.has_key?(Fake.state().samples, kick.id)
+
+      assert Enum.find_value(1..50, fn _ ->
+               Process.sleep(20)
+               not Map.has_key?(Fake.state().samples, kick.id)
+             end)
     end
 
     test "a pad the engine refuses after its sample loads is marked, not ready" do

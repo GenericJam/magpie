@@ -126,6 +126,7 @@ enum {
 
 typedef struct {
     uint8_t type, pad, note, vel;
+    bool stop;        /* pad: its voices fade and its waiting launches go before the change */
     int32_t quantize; /* trigger: grid in straight ticks to wait for while playing; 0 now */
     int64_t t_ns;     /* when the call was made (CLOCK_MONOTONIC) */
     union {
@@ -1140,7 +1141,15 @@ static void apply(sp_engine *e, const sp_cmd *c, bool live) {
         }
         break;
     case SP_CMD_PAD:
-        if (c->pad < SP_PADS) e->pads[c->pad] = c->u.pad;
+        if (c->pad < SP_PADS) {
+            /* Whatever the old definition was (a toggle's loop, a loop that
+             * becomes a one-shot), in the same step as the change. */
+            if (c->stop) {
+                cancel_pending(e, c->pad);
+                release_pad_voices(e, c->pad, -1);
+            }
+            e->pads[c->pad] = c->u.pad;
+        }
         break;
     case SP_CMD_SAMPLE: {
         int slot = c->u.sample.slot;

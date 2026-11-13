@@ -259,10 +259,8 @@ defmodule Magpie.PadsScreenTest do
 
     test "one-shot and toggle pads ignore the lift" do
       :ok = KitSession.update_pad(3, &%{&1 | mode: :toggle})
-      # The mode change itself let pad 3's (silent) loop voices go.
-      assert releases() == [3]
       view = mount() |> down(0, 1, 50.0) |> up(0, 1) |> down(3, 2, 50.0) |> up(3, 2)
-      assert releases() == [3]
+      assert releases() == []
       assert [{0, _, 0}, {3, _, 0}] = triggers()
       assert_renderable(view)
     end
@@ -334,13 +332,35 @@ defmodule Magpie.PadsScreenTest do
       assert assigns(view).sheet == nil
     end
 
-    test "moves are asked for only while a long press is pending" do
+    test "a long press timer queued before its finger's lift still opens the sheet" do
+      view = mount() |> down(1, 7, 50.0)
+      timer = long_press_message(7)
+      # Both waiting while another finger's down is handled: the timer first.
+      send(self(), timer)
+      send(self(), touch_message(1, :up, 7))
+      view = down(view, 0, 8, 50.0)
+      assert assigns(view).sheet == 1
+    end
+
+    test "the first long press opens the sheet; another pending one doesn't replace it" do
+      view = mount() |> down(0, 1, 50.0) |> down(3, 2, 50.0)
+      first = long_press_message(1)
+      second = long_press_message(2)
+      view = view |> render_info(first) |> render_info(second)
+      assert assigns(view).sheet == 0
+
+      # Nor does one landing while the sheet is up.
+      view = down(view, 1, 3, 50.0)
+      view = render_info(view, long_press_message(3))
+      assert assigns(view).sheet == 0
+    end
+
+    test "loaded pads ask for moves before a finger lands (Mob reads the rule at the down)" do
       view = mount()
-      assert face_cell_touch(view, 0) == {self(), {:pad, 0}}
-      view = down(view, 0, 1, 50.0)
       assert {_, {:pad, 0}, opts} = face_cell_touch(view, 0)
       assert opts[:moves]
-      _ = long_press_message(1)
+      # An empty pad has no long press to cancel.
+      assert face_cell_touch(view, 9) == {self(), {:pad, 9}}
     end
   end
 

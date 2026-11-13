@@ -25,6 +25,16 @@ size to a screen, and re-renders a screen's whole tree after every message.
   and a debounced autosave (1 s, `Library.save_kit/1`). The snapshot carries
   per pad its load status, a 12-bar wave from the engine's peaks over the
   pad's region and the region's length, so screens compute nothing.
+- **Stopping a pad as it changes is the engine's job.** When a pad's
+  sample or mode changes or it is cleared, the session sets it with
+  `Engine.set_pad(index, pad, stop: true)`: one engine command that fades
+  the pad's sounding voices and drops its waiting quantized launches in the
+  same step as the new definition, with no stream too, and does nothing on
+  an error. The session first stopped pads itself (a release, or a second
+  trigger for a sounding toggle, from the engine's voice events), but a
+  live call is dropped with no stream or a full queue while the control
+  call still applies, and voice events lag the engine (a toggle fading
+  out still "sounds", so the second trigger started it again).
 - **Which kit:** the most recently saved one; with none, the board's
   `dusty-breaks.kit.json` (read at compile time) keeping only pads whose
   samples are in the library. A fresh install has none of them, so it
@@ -46,8 +56,11 @@ size to a screen, and re-renders a screen's whole tree after every message.
   pointer id is still held stays queued behind that id's `:up`.
 - **Long press on the BEAM:** `Process.send_after` 600 ms from the `:down`,
   a token per finger; `:up`, `:cancel` or a move outside the pad drops the
-  token. Moves are requested (`moves: true`, 32 ms / 4 dp) only for a pad
-  with a pending long press, since every message costs a render.
+  token, and the first to fire drops every other one. Every loaded pad asks
+  for moves (`moves: true`, 32 ms / 4 dp) all the time: Mob reads a node's
+  move rule when the finger lands, so asking only once a long press is
+  pending never reached that finger. A move runs `render/1` but repaints
+  nothing unless the tree changed.
 - **Orientation:** a screen locks the orientation it needs on mount and
   nobody unlocks: Mob has no "became active again" callback, so a pushed
   screen that unlocked on leave would leave the pads free to rotate.

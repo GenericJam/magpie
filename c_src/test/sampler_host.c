@@ -639,6 +639,28 @@ static void test_loop_and_release(void) {
           "toggle: loops past the sample's end (%.2f), off on the next trigger", on);
     free_engine(e);
 
+    /* A pad change with `stop`: the old voices end whatever the new mode
+     * (a release or a second trigger would go by the new one), with no
+     * stream too; without it, a toggle's loop survives becoming a one-shot. */
+    for (int stop = 0; stop <= 1; stop++) {
+        for (int offline = 0; offline <= stop; offline++) {
+            e = new_engine();
+            n_evs = 0;
+            load(e, 0, make_sample(4800, 1, RATE, dc_half));
+            set_pad(e, 0, pad_of(0, SP_TOGGLE));
+            trigger(e, 0, 127);
+            render(e, out, 9600, 0);
+            push(e, (sp_cmd){.type = SP_CMD_PAD, .pad = 0, .stop = stop, .u.pad = pad_of(0, SP_ONE_SHOT)});
+            if (offline) sp_drain(e, false);
+            render(e, out, 9600, 0);
+            float level = max_abs(out, 4800, 9600);
+            CHECK(stop ? level == 0.0f && count_events(SP_EV_VOICE_END, 0) == 1 : level > 0.49f,
+                  "toggle → one-shot %s%s: level %.2f after", stop ? "with stop" : "without stop",
+                  offline ? ", no stream" : "", level);
+            free_engine(e);
+        }
+    }
+
     /* Keys: note-off releases only its note. */
     e = new_engine();
     n_evs = 0;
@@ -731,6 +753,20 @@ static void test_quantize_and_gate_steps(void) {
     int n = onsets(out, 30000, at, 2, 1);
     CHECK(n == 1 && at[0] == 24000 - 13000, "launch quantized to the next beat: frame %lld (want 24000)",
           n ? (long long)at[0] + 13000 : -1LL);
+    free_engine(e);
+
+    /* A pad change with `stop` drops a launch still waiting for its grid. */
+    e = new_engine();
+    n_evs = 0;
+    load(e, 0, make_sample(96000, 1, RATE, dc_half));
+    set_pad(e, 0, pad_of(0, SP_TOGGLE));
+    cmd(e, SP_CMD_PLAY, 0);
+    render(e, out, 13000, 0);
+    push(e, (sp_cmd){.type = SP_CMD_TRIGGER, .pad = 0, .vel = 127, .quantize = 96});
+    render(e, out, 256, 0);
+    push(e, (sp_cmd){.type = SP_CMD_PAD, .pad = 0, .stop = true, .u.pad = pad_of(0, SP_ONE_SHOT)});
+    render(e, out, 30000, 0);
+    CHECK(max_abs(out, 0, 30000) == 0.0f, "a pad change with stop drops its waiting quantized launch");
     free_engine(e);
 
     /* Sequenced gate pads sound until the next step starts: straight, with

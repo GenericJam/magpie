@@ -39,8 +39,11 @@ defmodule Magpie.PadsScreen do
   600 ms (`Magpie.Style.pad().long_press_ms`) timed here from the `:down`
   (`{:long_press, pointer_id, token}`, the token per finger, so a timer from
   a finger already lifted does nothing). A lift, a cancel or the finger
-  leaving the pad cancels it; moves are asked for only while a long press is
-  pending on the pad. Every change in the sheet goes through
+  leaving the pad cancels it. Loaded pads always ask for moves: Mob reads a
+  node's move rule when the finger lands, so turning moves on once a long
+  press is pending would never apply to that finger. The first long press
+  to fire opens the sheet and cancels every other one pending; none opens
+  while the sheet is up. Every change in the sheet goes through
   `Magpie.KitSession`.
 
   ## Not designed / not built yet (inert, shown as the board has them)
@@ -124,11 +127,12 @@ defmodule Magpie.PadsScreen do
     do: {:noreply, socket |> press(index, t) |> press_waiting()}
 
   def handle_info({:touch, {:pad, _index}, %{phase: :move, pointer_id: id} = t}, socket) do
+    # Moves matter only while the finger's long press is pending.
     case socket.assigns.fingers do
-      %{^id => %{off: false} = f} ->
+      %{^id => %{token: token} = f} when token != nil ->
         if inside?(t),
           do: {:noreply, socket},
-          else: {:noreply, put_finger(socket, id, %{f | off: true, token: nil})}
+          else: {:noreply, put_finger(socket, id, %{f | token: nil})}
 
       _ ->
         {:noreply, socket}
@@ -148,7 +152,7 @@ defmodule Magpie.PadsScreen do
         release(finger, index, fingers)
         {:noreply, socket}
 
-      phase == :up and not finger.off and inside?(t) ->
+      phase == :up and inside?(t) ->
         {:noreply, record(socket, index)}
 
       true ->
@@ -157,10 +161,18 @@ defmodule Magpie.PadsScreen do
   end
 
   def handle_info({:long_press, pointer_id, token}, socket) do
-    case socket.assigns.fingers do
-      %{^pointer_id => %{token: ^token, pad: index} = f} when token != nil ->
-        socket = put_finger(socket, pointer_id, %{f | token: nil})
-        {:noreply, Mob.Socket.assign(socket, sheet: index, drag: nil)}
+    a = socket.assigns
+
+    case a.fingers do
+      %{^pointer_id => %{token: ^token, pad: index}}
+      when token != nil and a.sheet == nil ->
+        # One sheet: every other long press pending is off too.
+        fingers = Map.new(a.fingers, fn {id, f} -> {id, %{f | token: nil}} end)
+        socket = Mob.Socket.assign(socket, fingers: fingers, drag: nil)
+
+        if pad_at(a, index),
+          do: {:noreply, Mob.Socket.assign(socket, :sheet, index)},
+          else: {:noreply, socket}
 
       _ ->
         {:noreply, socket}
@@ -310,8 +322,9 @@ defmodule Magpie.PadsScreen do
     finger_down(socket, index, t, vel, release)
   end
 
-  # Pad touches already queued, and kit changes among them, in their order:
-  # downs trigger, the rest are handled as usual; one render follows.
+  # Pad touches already queued, kit changes and long-press timers among
+  # them, in their order: downs trigger, the rest are handled as usual; one
+  # render follows.
   defp press_waiting(socket) do
     receive do
       {:touch, {:pad, index}, %{phase: :down} = t} ->
@@ -324,6 +337,10 @@ defmodule Magpie.PadsScreen do
       {:magpie_kit, _snapshot} = change ->
         {:noreply, socket} = handle_info(change, socket)
         press_waiting(socket)
+
+      {:long_press, _pointer_id, _token} = timer ->
+        {:noreply, socket} = handle_info(timer, socket)
+        press_waiting(socket)
     after
       0 -> socket
     end
@@ -335,7 +352,7 @@ defmodule Magpie.PadsScreen do
     token = if vel, do: make_ref()
     if token, do: Process.send_after(self(), {:long_press, t.pointer_id, token}, @long_press_ms)
 
-    finger = %{pad: index, x: t.x, y: t.y, vel: vel, release: release, token: token, off: false}
+    finger = %{pad: index, x: t.x, y: t.y, vel: vel, release: release, token: token}
     socket = put_finger(socket, t.pointer_id, finger)
 
     if vel,
@@ -585,10 +602,10 @@ defmodule Magpie.PadsScreen do
   # ── Pads ────────────────────────────────────────────────────────────────
 
   defp pad_cell(assigns, index) do
-    pending = Enum.any?(assigns.fingers, fn {_, f} -> f.pad == index and f.token != nil end)
-
+    # Moves for every loaded pad, from before the finger lands (see Long
+    # press in the moduledoc); an empty pad's lift checks where it is.
     touch =
-      if pending,
+      if Map.has_key?(assigns.trig, index),
         do: {self(), {:pad, index}, moves: true, throttle: 32, delta: 4},
         else: {self(), {:pad, index}}
 

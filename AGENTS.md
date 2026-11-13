@@ -165,9 +165,11 @@ launcher masks keep the whole nest. Regenerate every launcher icon with
   `{:magpie_kit, %KitSession.Snapshot{kit, pads}}` on every change, `pads`
   per index: `status` `:loading | :ready | {:error, reason}`, `wave` 12
   peaks 0..255 over the region, `seconds` at its pitch), `snapshot/0`,
-  `update_pad(index, fn pad -> pad end)` (engine first; its error leaves the
-  kit alone), `clear_pad/1`, `put_sample(index, sample_id)` (a new pad
-  takes the sample's name and a colour by slot), `set_snap/1`, `flush/0`,
+  `update_pad(index, fn pad -> pad end)` (engine first; its error leaves
+  the kit alone; a new sample or mode, or clearing, stops the pad's voices
+  through `set_pad(…, stop: true)`), `clear_pad/1`,
+  `put_sample(index, sample_id)` (a new pad takes the sample's name and a
+  colour by slot), `set_snap/1`, `flush/0`,
   `pattern(kit, bank)`, `whereis/0` (RecordScreen's `reply_to`: it handles
   `{:recorded, pad, sample}`). Autosaves 1 s after a change. Starts with
   the last saved kit, else the board's Dusty Breaks keeping only pads
@@ -231,11 +233,16 @@ started in `App.on_start`. Why it is built this way:
   minutes each.
 - **Peaks:** one byte per 256 frames, the largest |sample| over the
   channels, linear, 255 = full scale.
-- **Pads:** `set_pad(index, %Magpie.Kit.Pad{} | nil)` (regions in seconds,
-  converted to frames of the loaded sample; `{:error, :unknown_sample |
-  {:invalid, field}}`), `clear_pad/1`, `pads/0`. Index =
-  `Magpie.Kit.pad_index(bank, slot)`. Changes apply from the pad's next
-  trigger.
+- **Pads:** `set_pad(index, %Magpie.Kit.Pad{} | nil, stop: false)` (regions
+  in seconds, converted to frames of the loaded sample; `{:error,
+  :unknown_sample | {:invalid, field} | :busy}`), `clear_pad/2`, `pads/0`.
+  Index = `Magpie.Kit.pad_index(bank, slot)`. Changes apply from the pad's
+  next trigger. `stop: true`: the pad's sounding voices fade and its
+  waiting quantized launches go in the same command as the change, whatever
+  the old or new mode, with no stream too; an error changes nothing. Use it
+  when a pad's sound or mode changes: a `release/1` after the change goes
+  by the new mode, and a toggle's stopping trigger is a live call (dropped
+  with no stream).
 - **Live:** `trigger(index, velocity, quantize: ticks)`, `release/1`,
   `note_on/3`, `note_off/2`. They run in the caller (no GenServer hop) and
   only queue a command; `{:error, :not_running}` without a stream. The
@@ -341,8 +348,9 @@ On the moto g power 2021 (Android 11), `scripts/engine_check.exs`:
   frame at 5 tempos × 4 swings with random block sizes, off-grid and
   negative ticks, block-size independence, tempo change, pattern swap at
   the bar and edits now, choke and steal with a bounded sample-to-sample
-  step, pitch to 0.5 ¢, reverse, loop, gate/one-shot/toggle/keys, fades and
-  velocity, hit stamping with swing, quantized launch, unload while
+  step, pitch to 0.5 ¢, reverse, loop, gate/one-shot/toggle/keys, a pad
+  change with `stop` (with no stream, and dropping a waiting launch), fades
+  and velocity, hit stamping with swing, quantized launch, unload while
   playing, queue overflow, the limiter, resampler SNR and aliasing, peaks;
   the count-in's clicks and downbeat stopped and on the sequencer's bar,
   the recorder's threshold, pre-roll, start time (ahead, late from the
@@ -497,7 +505,9 @@ locked on mount. Why it is built this way:
   reply_to: KitSession.whereis()}`.
 - **Long press:** 600 ms on the BEAM from the `:down` (`{:long_press,
   pointer_id, token}`), cancelled by the lift or by the finger leaving the
-  pad (moves are on only while it is pending). Opens the PadSheet panel:
+  pad; the first to fire cancels the others, and none opens over the
+  sheet. Loaded pads always ask for moves (Mob takes a node's move rule at
+  the finger's down). Opens the PadSheet panel:
   colour, play mode, choke group, velocity mode, pitch and MIDI note (drag
   the field up or down, 6 pt a step), Replace (records into the pad),
   Clear, Done; all through `Magpie.KitSession`.

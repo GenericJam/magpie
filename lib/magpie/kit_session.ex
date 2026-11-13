@@ -42,6 +42,9 @@ defmodule Magpie.KitSession do
 
   @wave_bars Style.pad().wave_bars
   @autosave_ms 1_000
+  # A sample the engine couldn't unload yet (its command queue full) is
+  # tried again after this.
+  @unload_retry_ms 200
 
   defmodule Snapshot do
     @moduledoc """
@@ -69,7 +72,6 @@ defmodule Magpie.KitSession do
     autosave_ms: @autosave_ms,
     samples: %{},
     refused: %{},
-    sounding: MapSet.new(),
     queue: [],
     subscribers: %{}
   ]
@@ -182,9 +184,6 @@ defmodule Magpie.KitSession do
 
   @impl true
   def handle_continue(:load, s) do
-    # Voice starts and ends: which pads sound, to stop a toggle pad's loop
-    # when the pad changes.
-    :ok = Engine.subscribe()
     _ = Engine.set_tempo(s.kit.tempo)
     _ = Engine.set_swing(s.kit.swing)
     {:noreply, s |> enqueue(sample_ids(s.kit)) |> next_load() |> publish()}
@@ -254,13 +253,7 @@ defmodule Magpie.KitSession do
 
   def handle_info({:autosave, _stale}, s), do: {:noreply, s}
 
-  def handle_info({:magpie_audio, :voice, index, :start}, s),
-    do: {:noreply, %{s | sounding: MapSet.put(s.sounding, index)}}
-
-  def handle_info({:magpie_audio, :voice, index, :end}, s),
-    do: {:noreply, %{s | sounding: MapSet.delete(s.sounding, index)}}
-
-  def handle_info({:magpie_audio, _kind, _a, _b}, s), do: {:noreply, s}
+  def handle_info({:unload, id}, s), do: {:noreply, drop_unused(s, id)}
 
   # Magpie.RecordScreen's reply: a sample saved for a pad.
   def handle_info({:recorded, index, %Library.Sample{id: id}}, s) when index in 0..63 do
@@ -298,28 +291,26 @@ defmodule Magpie.KitSession do
   end
 
   # Pad `index` becomes `pad` (nil: empty) in the engine, then in the kit.
-  # When its sound or mode changes, the old pad's voices stop first, while
-  # the engine still has the old definition (a release goes by the pad's
-  # current mode; a sounding toggle stops on a trigger). A sample no pad
-  # uses any more is unloaded.
+  # When its sample or mode changes (or it is emptied), the engine stops the
+  # old pad's voices and waiting launches in the same step as the change
+  # (`stop:`), so neither a release nor a toggle's second trigger has to go
+  # by a definition the engine no longer has. A sample no pad uses any more
+  # is unloaded.
   defp set_pad(s, index, pad) do
     id = with %Pad{sample: %Region{id: id}} <- pad, do: id
     old = pad_at(s.kit, index)
-
-    if old && (pad == nil or old.sample != pad.sample or old.mode != pad.mode),
-      do: stop_voices(s, index, old)
+    old_id = with %Pad{sample: %Region{id: old_id}} <- old, do: old_id
+    stop = old != nil and (pad == nil or old_id != id or old.mode != pad.mode)
 
     result =
       case Map.get(s.samples, id) do
-        {:ok, _info} -> Engine.set_pad(index, pad)
+        {:ok, _info} -> Engine.set_pad(index, pad, stop: stop)
         # Not loaded (yet, or failing): the engine must not keep the old pad.
-        _ -> Engine.clear_pad(index)
+        _ -> Engine.clear_pad(index, stop: stop)
       end
 
     case result do
       :ok ->
-        old_id = with %Pad{sample: %Region{id: old_id}} <- old, do: old_id
-
         s =
           %{s | refused: Map.delete(s.refused, index)}
           |> put_kit(put_pad(s.kit, index, pad))
@@ -335,7 +326,8 @@ defmodule Magpie.KitSession do
   end
 
   # Unload sample `id` (and forget it) once no pad of the kit uses it. One
-  # still loading is dropped when its load ends.
+  # still loading is dropped when its load ends; one the engine can't
+  # unload yet (its command queue is full) is tried again shortly.
   defp drop_unused(s, nil), do: s
 
   defp drop_unused(s, id) do
@@ -346,21 +338,14 @@ defmodule Magpie.KitSession do
       match?({_ref, ^id}, s.loader) ->
         s
 
-      true ->
-        # The engine still holding it (busy): keep it, to unload next time.
-        kept = match?({:ok, _}, s.samples[id]) and Engine.unload_sample(id) != :ok
+      match?({:ok, _}, s.samples[id]) and Engine.unload_sample(id) == {:error, :busy} ->
+        Process.send_after(self(), {:unload, id}, @unload_retry_ms)
+        s
 
-        if kept,
-          do: s,
-          else: %{s | samples: Map.delete(s.samples, id), queue: List.delete(s.queue, id)}
+      true ->
+        %{s | samples: Map.delete(s.samples, id), queue: List.delete(s.queue, id)}
     end
   end
-
-  defp stop_voices(s, index, %Pad{mode: :toggle}) do
-    if MapSet.member?(s.sounding, index), do: Engine.trigger(index, 1)
-  end
-
-  defp stop_voices(_s, index, _old), do: Engine.release(index)
 
   defp reply({result, s}), do: {:reply, result, s}
 

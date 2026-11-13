@@ -42,9 +42,10 @@ defmodule Magpie.Audio.Nif do
   @doc """
   Set pad `pad` from `{sample_id | nil, start_frame, end_frame, gain_db,
   pitch_st, reverse, fade_in_ms, fade_out_ms, mode, choke, root}` (owner
-  only). `end_frame` 0: to the sample's end.
+  only). `end_frame` 0: to the sample's end. `stop`: the pad's sounding
+  voices fade and its waiting quantized launches go first, in one step.
   """
-  def set_pad(_pad, _params), do: :erlang.nif_error(:nif_not_loaded)
+  def set_pad(_pad, _params, _stop), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
   Set the pattern: `steps` 16 | 32, events `[{pos, pad, vel, note}]` (`pos`

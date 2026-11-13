@@ -101,7 +101,7 @@ defmodule Magpie.Audio.Fake do
   def unload_sample(id), do: call({:unload, id})
 
   @impl Magpie.Audio
-  def set_pad(pad, params), do: call({:set_pad, pad, params})
+  def set_pad(pad, params, stop), do: call({:set_pad, pad, params, stop})
 
   @impl Magpie.Audio
   def set_pattern(pattern, at), do: call({:set_pattern, pattern, at})
@@ -200,6 +200,9 @@ defmodule Magpie.Audio.Fake do
 
   @doc "The count-in's downbeat: a counting recorder starts recording."
   def downbeat, do: call(:downbeat)
+  @doc "Make the next `n` `call` (`:set_pad` or `:unload_sample`) fail with `:busy`, as with a full command queue."
+  def busy(call, n) when call in [:set_pad, :unload_sample] and is_integer(n) and n >= 0,
+    do: call({:busy, call, n})
 
   # ── Server ────────────────────────────────────────────────────────────────
 
@@ -225,6 +228,7 @@ defmodule Magpie.Audio.Fake do
       last_take: 0,
       input: nil,
       rec: nil,
+      busy: %{},
       samples: %{},
       pads: %{},
       pattern: nil,
@@ -255,8 +259,12 @@ defmodule Magpie.Audio.Fake do
     do: {:reply, {:error, s.fail_open}, %{s | owner: owner, open: false}}
 
   def handle_call({:fail_open, reason}, _from, s), do: {:reply, :ok, %{s | fail_open: reason}}
+
+  def handle_call({:busy, call, n}, _from, s),
+    do: {:reply, :ok, %{s | busy: Map.put(s.busy, call, n)}}
+
   def handle_call(:calls, _from, s), do: {:reply, Enum.reverse(s.calls), s}
-  def handle_call(:state, _from, s), do: {:reply, Map.drop(s, [:calls, :fail_open]), s}
+  def handle_call(:state, _from, s), do: {:reply, Map.drop(s, [:calls, :fail_open, :busy]), s}
   def handle_call(:info, _from, s), do: {:reply, info(s), s}
 
   def handle_call(:clock, _from, %{open: true} = s),
@@ -373,6 +381,12 @@ defmodule Magpie.Audio.Fake do
 
   def handle_call(:record_cancel, _from, s), do: {:reply, :ok, %{s | rec: nil}}
 
+  def handle_call({:unload, _id}, _from, %{busy: %{unload_sample: n}} = s) when n > 0,
+    do: busy_reply(s, :unload_sample)
+
+  def handle_call({:set_pad, _pad, _params, _stop}, _from, %{busy: %{set_pad: n}} = s) when n > 0,
+    do: busy_reply(s, :set_pad)
+
   def handle_call({:load, id, source}, _from, s) do
     result = load(source)
     send(s.owner, {:magpie_audio, :loaded, id, result})
@@ -395,13 +409,15 @@ defmodule Magpie.Audio.Fake do
     end
   end
 
-  def handle_call({:set_pad, pad, nil}, _from, s),
-    do: {:reply, :ok, %{s | pads: Map.delete(s.pads, pad)}}
-
-  def handle_call({:set_pad, pad, params}, _from, s) do
-    if Map.has_key?(s.samples, params.sample),
-      do: {:reply, :ok, %{s | pads: Map.put(s.pads, pad, params)}},
-      else: {:reply, {:error, :unknown_sample}, s}
+  def handle_call({:set_pad, pad, params, stop}, _from, s) do
+    if params == nil or Map.has_key?(s.samples, params.sample) do
+      # `stop`: the pad's voices end (quantized launches start at once here).
+      s = if stop, do: voice_end(s, pad, :all), else: s
+      pads = if params, do: Map.put(s.pads, pad, params), else: Map.delete(s.pads, pad)
+      {:reply, :ok, %{s | pads: pads}}
+    else
+      {:reply, {:error, :unknown_sample}, s}
+    end
   end
 
   def handle_call({:set_pattern, pattern, at}, _from, s) do
@@ -443,6 +459,9 @@ defmodule Magpie.Audio.Fake do
     s = Enum.reduce(s.gated, s, fn {pad, key, _}, acc -> voice_end(acc, pad, key) end)
     {:reply, :ok, %{s | gated: [], playing: false, play_frame: frame(s), ticks: 0, local: 0}}
   end
+
+  defp busy_reply(s, call),
+    do: {:reply, {:error, :busy}, %{s | busy: Map.update!(s.busy, call, &(&1 - 1))}}
 
   # ── Voices ────────────────────────────────────────────────────────────────
   #

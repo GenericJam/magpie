@@ -39,14 +39,15 @@ defmodule Magpie.Audio.Native do
   def unload_sample(id), do: Nif.unload_sample(id)
 
   @impl true
-  def set_pad(pad, nil),
-    do: Nif.set_pad(pad, {nil, 0, 0, 0.0, 0.0, false, 0.0, 0.0, :one_shot, 0, 60})
+  def set_pad(pad, nil, stop),
+    do: Nif.set_pad(pad, {nil, 0, 0, 0.0, 0.0, false, 0.0, 0.0, :one_shot, 0, 60}, stop)
 
-  def set_pad(pad, p) do
+  def set_pad(pad, p, stop) do
     Nif.set_pad(
       pad,
       {p.sample, p.start, p.end, p.gain_db, p.pitch_st, p.reverse, p.fade_in_ms, p.fade_out_ms,
-       p.mode, p.choke, p.root}
+       p.mode, p.choke, p.root},
+      stop
     )
   end
 
