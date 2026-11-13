@@ -414,6 +414,14 @@ starts the take on the frame captured when its downbeat is heard.
   `trigger`: the voice starts.
 - **Import:** wav and mp3 through MediaCodec; AIFF → `:unsupported` from
   MediaCodec, imported through `Magpie.Aiff` (88 200 frames × 2, 44.1 kHz).
+- **Other apps:** the consent dialog ("Start now", tapped over adb), the
+  `mediaProjection` service and the playback-capture `AudioRecord` all
+  start (`:started`, 48 kHz stereo; the system registers the
+  remote-submix mix), and PCM arrives at the real rate (480 000 frames in
+  10 s). But Chrome playing a tone (its own AAudio player, usage MEDIA,
+  capture policy unset) came through as digital silence in three tries,
+  playing in front and behind. Not yet explained; a player on the plain
+  AudioTrack/mixer path (a music app, YouTube) is the next thing to try.
 
 ## Rules for Mob screens here (from Choir Coach and Humdinger)
 
