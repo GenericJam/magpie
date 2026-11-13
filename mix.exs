@@ -24,7 +24,8 @@ defmodule Magpie.MixProject do
 
   defp deps do
     [
-      {:mob, "~> 0.9.28"},
+      # 0.9.29: per-node multi-pointer on_touch (MOB-518), which the pads use.
+      {:mob, "~> 0.9.29"},
       {:mob_dev, "~> 0.7.31", only: :dev, runtime: false},
       # mix mob.icon renders the launcher icons with it.
       {:image, "~> 0.54", only: :dev, runtime: false},
