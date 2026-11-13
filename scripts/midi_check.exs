@@ -501,7 +501,7 @@ try do
   ])
 
   {errs, tempos, start_t} = follow.("120 bpm, ticks ±2 ms jitter", ["14", "120:24", "-1", "2"])
-  report_follow.(errs, tempos, start_t, [{"jittered", 8, 96, 1, 3.0}])
+  report_follow.(errs, tempos, start_t, [{"jittered", 8, 96, 1, 1.5}])
 
   {errs, _, _} = follow.("song position 8 + Continue at 120 bpm", ["8", "120:8", "8", "0"])
   IO.puts("  first step note error: #{fmt.(errs |> List.first() |> elem(2))} ms; from its 8th step: #{stats.(for {k, _, e} <- errs, k >= 8, do: e)} ms")

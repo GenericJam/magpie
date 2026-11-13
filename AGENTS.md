@@ -533,34 +533,37 @@ passes through the BEAM.
 
 Stream 48 kHz, 240-frame bursts, output latency 33–36 ms. All through the
 "Magpie" port (`dumpsys midi`: 1 input, 1 output) from another process.
+Ranges are over two runs.
 
 - **Notes in:** 36 note-ons + 36 note-offs (notes 36/38/42/46 and 60/64
   for a keys pad) → 72 received, 72 applied, voice starts exactly as
   mapped (6 per drum pad, 12 on the keys pad); channel 2 with
   `in_channel` 1: nothing. In → heard (the sender's timestamp → the first
-  frame heard) p50 34.7 ms, p95 35.0 ms: the output latency, as a touch
-  (NIF call → heard p50 33.7 ms).
+  frame heard) p50 33.8–34.7 ms, p95 33.9–35.0 ms: the output latency, as
+  a touch (NIF call → heard p50 33.7–34.4 ms).
 - **Notes out:** 20 touches → 20 note-ons + 20 note-offs on the pads'
   notes (keys pad: its root); each stamped with the frame heard (touch call
-  → stamp p50 33.9 ms = the trigger latency). Stamp → arrival at the other
-  process p50 0.6 ms, p95 1.8 ms; the sending thread calls send 0.23 ms
-  (p50) after the stamp (`out_late_us` p95 0.55–0.68 ms, max ~1 ms).
+  → stamp p50 33.9–34.4 ms = the trigger latency). Stamp → arrival at the
+  other process p50 0.6 ms, p95 1.2–1.8 ms; the sending thread calls send
+  0.23–0.29 ms (p50) after the stamp (`out_late_us` p95 0.4–0.7 ms, max
+  ~1 ms).
 - **Clock send** (120 bpm, 12 s): 673 ticks, none dropped. Stamps are the
   frames' heard times through the output timestamp, so they carry its
   noise: spacing − period p95 0.17 ms, max 0.58 ms. Arrival spacing at the
-  other process rms 0.28 ms (worst 1.7 ms); arrival − stamp p50 0.7 ms,
-  p95 2.0 ms. SPP 0 + Start + the first tick on one stamp, Stop; the clock
-  runs on while stopped. Sequenced notes: 33 on, 33 off, every note-on
-  stamped exactly on a tick (0 µs).
-- **Clock follow** against the probe's ticks (step note stamps vs the
+  other process rms 0.28–0.37 ms (worst 1.7 ms); arrival − stamp p50
+  0.7–0.9 ms, p95 1.8–2.0 ms. SPP 0 + Start + the first tick on one stamp,
+  Stop; the clock runs on while stopped. Sequenced notes: 33 on, 33 off,
+  every note-on stamped exactly on a tick (0 µs).
+- **Clock follow** against the probe's grid (step note stamps vs the
   master's tick for that step): downbeat 32–36 ms late (the write-ahead),
   then locked (8 steps in a row within 1 ms) from step 4 (0.5 s); 120 bpm
-  steps 8–63 rms 0.11 ms, worst 0.29 ms. 120 → 100 bpm: locked again 6
-  steps (0.9 s) after the change, then rms 0.11 ms, worst 0.35 ms. Tempo
-  shown 120.0 / 100.0 (±0.1). Ticks with ±2 ms jitter: rms 1.35 ms, worst
-  3.1 ms. Song position 8 + Continue: the first step is step 8, then rms
-  < 0.2 ms. Stop stops (heard ~34 ms after it: the write-ahead), and the
-  step due at the Stop's own time has already sounded.
+  steps 8–63 rms 0.11–0.13 ms, worst 0.36 ms. 120 → 100 bpm: locked again
+  6 steps (0.9 s) after the change, then rms 0.11–0.15 ms, worst 0.56 ms.
+  Tempo shown 120.0 / 100.0 (±0.1). Ticks sent with ±2 ms jitter: rms
+  0.48 ms, worst 1.05 ms off the master's grid. Song position 8 +
+  Continue: the first step is step 8, then worst 0.24 ms. Stop stops
+  (heard ~35 ms after it: the write-ahead), and the step due at the Stop's
+  own time has already sounded.
 - **Not measured:** USB and Bluetooth devices (no hardware here; the code
   paths are Kotlin only, covered by the Fake on the Elixir side).
 
