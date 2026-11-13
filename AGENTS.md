@@ -516,7 +516,8 @@ passes through the BEAM.
   so losses, clusters and dropouts keep the grid; position steered onto
   the fit half a beat ahead; downbeat late by the write-ahead, then on the
   master's grid. Start or Continue after the clock was silent > 3.5 ticks
-  (sent only while playing) starts a fresh line at the new tempo. One
+  (sent only while playing) starts a fresh line and count (the old tempo
+  judging gaps until the line has 6 ticks). One
   input's clock is followed (`follow_src`: the first to send a tick or
   transport message; another's Start, or song position / Continue while
   stopped, takes over from a fresh fit; its going away frees it, stopped:
@@ -587,10 +588,11 @@ Ranges are over two runs.
 
 ### Measured (MobDevFix_arm emulator, Android 15, `scripts/midi_check.exs`)
 
-At b72ab65 (two runs) and 069853c (one), no phone being free: stream 48
-kHz, 960-frame bursts, output latency 109–121 ms, so absolute latencies
-are the emulator's; one run had host stalls (its outliers are left out
-below and noted). Same port (`dumpsys midi`: 1 input, 1 output).
+At b72ab65 (two runs), 069853c and 7f30330 (one each), no phone being
+free: stream 48 kHz, 960-frame bursts, output latency 109–121 ms, so
+absolute latencies are the emulator's; one run had host stalls (its
+outliers are left out below and noted). Same port (`dumpsys midi`: 1
+input, 1 output).
 
 - **Notes in:** 72 sent, 72 applied, voice starts exactly as mapped;
   channel 2 with `in_channel` 1: nothing. In → heard p50 112–118 ms (the
@@ -598,15 +600,16 @@ below and noted). Same port (`dumpsys midi`: 1 input, 1 output).
 - **Notes out:** 20 touches → 20 note-ons + 20 note-offs; stamp → arrival
   p50 0.7–1.1 ms, p95 1.8–2.5 ms.
 - **Clock send:** 670–673 ticks, 0–3 late ticks dropped, arrival spacing
-  rms 1.2–1.3 ms (2.4 in the stalled run); sequenced notes exactly on a
+  rms 1.2–1.4 ms (2.4 in the stalled run); sequenced notes exactly on a
   tick (0 µs).
-- **Clock follow:** 120 bpm steps 8–63 rms 0.52 ms (1.56 with one −6.7 ms
-  excursion; 2.9 in the stalled run); 100 bpm after the change rms 0.31
-  ms; ±2 ms jitter rms 0.53–2.14 ms (6.8 stalled). Lost ticks: one lost
-  rms 0.38–0.70 ms; two lost two apart worst 8.6–12.7 ms then locked;
-  four lost every other tick worst ~53 ms then locked within 8–12 steps;
-  a 1 s dropout then a lost tick rms 0.81–1.21 ms, worst ≤ 3.9 ms. Song
-  position 8 + Continue: from its 8th step worst ≤ 1.35 ms.
+- **Clock follow:** 120 bpm steps 8–63 rms 0.51–0.52 ms (1.56 with one
+  −6.7 ms excursion; 2.9 in the stalled run); 100 bpm after the change
+  rms 0.29–0.31 ms; ±2 ms jitter rms 0.53–2.14 ms (6.8 stalled). Lost
+  ticks: one lost rms 0.38–0.70 ms (2.93 with one −6.7 ms step); two lost
+  two apart worst 8.6–12.7 ms then locked; four lost every other tick
+  worst ~53 ms then locked within 8–12 steps; a 1 s dropout then a lost
+  tick rms 0.40–1.21 ms, worst ≤ 3.9 ms. Song position 8 + Continue: from
+  its 8th step worst ≤ 1.35 ms.
 
 ## The pads (`Magpie.PadsScreen`)
 

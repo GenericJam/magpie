@@ -1316,16 +1316,31 @@ static void midi_in_release(sp_engine *e, const sp_cmd *c) {
 
 static void follow_forget(sp_engine *e);
 
+/* The song position a Continue alone resumes from after a followed run
+ * stopped: the next 16th after the tick Stop came on (by then the clock
+ * running on may have settled the ticks held at Stop; those still held
+ * are taken as after lost ones, the likelier). */
+static void follow_stop_position(sp_engine *e) {
+    if (e->midi.stop_k < 0) return;
+    int64_t k = e->midi.stop_k, first = e->midi.ticks - e->midi.n_held + 1;
+    for (int i = 0; i < e->midi.n_held && first + i <= e->midi.stop_k; i++) k += e->midi.held[i].lost;
+    e->midi.spp = (int)ceil((e->midi.arm_pos / 4 + (double)(k - e->midi.k0 + 1)) / 6.0);
+    e->midi.stop_k = -1;
+}
+
 /* Input `src` closed (unplugged, its port gone): the voices it started end
  * as on their note-offs, and a followed clock from it is free to be taken
- * by the next input that sends one: stopped, from a fresh fit (playing, the
- * sequencer runs on as through a dropout, and the next input's ticks go on
- * from where it is). */
+ * by the next input that sends one: stopped, from a fresh fit, a Continue
+ * still resuming where the run stopped (playing, the sequencer runs on as
+ * through a dropout, and the next input's ticks go on from where it is). */
 static void midi_input_gone(sp_engine *e, int src) {
     midi_release(e, src, -1, -1, false);
     if (src != e->midi.follow_src) return;
     e->midi.follow_src = -1;
-    if (!e->seq.playing) follow_forget(e);
+    if (!e->seq.playing) {
+        follow_stop_position(e);
+        follow_forget(e);
+    }
 }
 
 /* The inputs gone (midi.gone) whose SP_CMD_MIDI_GONE the full command
@@ -1585,9 +1600,13 @@ static void follow_tick(sp_engine *e, double f) {
 
 /* Start or Continue after the followed clock fell silent for more than
  * 3.5 ticks (a master that sends clock only while playing, its tempo maybe
- * changed meanwhile): the ticks go on being counted but start a fresh line.
- * The old fit would judge the new tempo's gaps as lost ticks or bursts and
- * keep it off the grid. A clock running on while stopped keeps its line. */
+ * changed meanwhile, or a dropout): a fresh line, and the count starts
+ * again (the first tick after is counted, not judged as a gap: the old
+ * line would read the new tempo's gaps as lost ticks or its ticks as
+ * bursts and keep it off the grid). The old tempo stays the reference for
+ * judging gaps until the new line has 6 ticks, so a tick lost soon after
+ * is still renumbered. The song position and k0 don't depend on the
+ * earlier ticks. A clock running on while stopped keeps its line. */
 static void follow_after_silence(sp_engine *e, int64_t t_ns) {
     if (e->midi.ticks == 0) return;
     double kc, fc, P = e->midi.p_ref;
@@ -1596,7 +1615,8 @@ static void follow_after_silence(sp_engine *e, int64_t t_ns) {
     mi_fit_reset(&e->midi.fit);
     e->midi.n_held = 0;
     e->midi.misses = 0;
-    e->midi.p_ref = 0;
+    e->midi.p_ref = P;
+    e->midi.ticks = 0;
 }
 
 /* Clock follow: ticks, Start, Continue (from the song position), Stop, from
@@ -1630,16 +1650,7 @@ static void follow_realtime(sp_engine *e, const sp_cmd *c) {
         break;
     case 0xFB:
         if (!e->seq.playing) {
-            /* No song position since a followed run stopped: the next 16th
-             * after the tick it stopped on (by then the clock running on
-             * may have settled the ticks held at Stop; those still held are
-             * taken as after lost ones, the likelier). */
-            if (e->midi.stop_k >= 0) {
-                int64_t k = e->midi.stop_k, first = e->midi.ticks - e->midi.n_held + 1;
-                for (int i = 0; i < e->midi.n_held && first + i <= e->midi.stop_k; i++) k += e->midi.held[i].lost;
-                e->midi.spp = (int)ceil((e->midi.arm_pos / 4 + (double)(k - e->midi.k0 + 1)) / 6.0);
-                e->midi.stop_k = -1;
-            }
+            follow_stop_position(e);
             follow_after_silence(e, c->t_ns);
             e->midi.armed = true;
             e->midi.arm_pos = (double)e->midi.spp * SP_STEP;
