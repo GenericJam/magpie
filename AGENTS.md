@@ -517,7 +517,10 @@ passes through the BEAM.
   the fit half a beat ahead; downbeat late by the write-ahead, then on the
   master's grid. Start or Continue after the clock was silent > 3.5 ticks
   (sent only while playing) starts a fresh line and count (the old tempo
-  judging gaps until the line has 6 ticks). One
+  judges gaps only if the second tick keeps to it, else the new line from
+  4 ticks). Gaps under half a tick are a stalled sender's burst (counted,
+  out of the fit) only by a fit of ≥ 6 ticks; three in a row, alike and
+  well apart, are a tempo more than doubled (refit). One
   input's clock is followed (`follow_src`: the first to send a tick or
   transport message; another's Start, or song position / Continue while
   stopped, takes over from a fresh fit; its going away frees it, stopped:

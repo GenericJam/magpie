@@ -361,6 +361,9 @@ typedef struct {
         bool armed, following;
         int follow_src;   /* the input whose clock is followed (its last Start, else its first tick); < 0 none */
         int misses;       /* ticks in a row off the fitted line (signed: which way) */
+        int bursts;       /* bursts in a row, gaps alike and well apart (a faster tempo?) */
+        double burst_gap; /* the last of them's gap */
+        bool restarted;   /* a fresh line after a silence, not yet 6 ticks long */
         sp_held_tick held[SP_FOLLOW_HELD]; /* out of the fit until the next gap says what they were */
         int n_held;
         double p_ref;     /* frames per tick of the last fit of a dozen ticks, unless held ticks since showed a new tempo; 0 none */
@@ -1370,6 +1373,8 @@ static void follow_forget(sp_engine *e) {
     atomic_store_explicit(&e->midi.follow_bpm_milli, 0, memory_order_relaxed);
     e->midi.bpm_shown = 0;
     e->midi.misses = 0;
+    e->midi.bursts = 0;
+    e->midi.restarted = false;
     e->midi.n_held = 0;
     e->midi.p_ref = 0;
 }
@@ -1481,7 +1486,11 @@ static void follow_settle(sp_engine *e, bool lost, int refit) {
  *   From the second, the sequencer goes at the gaps' pace meanwhile, so a
  *   halved tempo doesn't leave it far ahead (lost ticks: it catches up).
  * - less than half a tick after the last (a burst: a stalled sender
- *   catching up): they were late; counted, left out of the fit.
+ *   catching up): they were late; counted, left out of the fit. Judged so
+ *   only by a fit of 6 ticks or more (not the last tempo alone: a restart
+ *   at more than twice it would be all bursts). Three in a row with alike
+ *   gaps, well apart (a stalled sender's go out together), are a tempo
+ *   more than doubled: the fit restarts from the last of them.
  * - anything else: after 2–3 tick gaps a tempo change (counted, the fit
  *   restarts); after a long gap the master played on at some new tempo
  *   (numbered by the time at the old one, the fit restarts).
@@ -1494,12 +1503,23 @@ static void follow_settle(sp_engine *e, bool lost, int refit) {
  * than jitter explains, are a tempo change; fit from those two on. Once a
  * beat the followed tempo goes to the BEAM. */
 static void follow_tick(sp_engine *e, double f) {
+    /* After a silence (follow_after_silence) the old tempo judges the new
+     * line's first gaps only if the second tick keeps to it (one or two old
+     * ticks after the first: a lost tick then is renumbered); else the new
+     * tempo is unknown: nothing is judged until the new line has 4 ticks,
+     * then by its own tempo. */
+    if (e->midi.restarted && e->midi.ticks == 1 && e->midi.p_ref > 0) {
+        double r = f - e->midi.last_tick, q = e->midi.p_ref;
+        double t = fmax(SP_FOLLOW_MISS_MS * e->rate / 1000.0, 0.15 * q);
+        if (fabs(r - q) > t && fabs(r - 2.0 * q) > t) e->midi.p_ref = 0;
+    }
     double kc, fc, P = 0;
     bool fit = mi_fit_line(&e->midi.fit, &kc, &fc, &P), line = fit && e->midi.fit.n >= 12;
     /* Gaps are judged by the fit's tempo once it has 6 ticks; before, by
      * the last full fit's (after a refit for two ticks off the line, most
      * often still right; a few jittery ticks' slope can be far off). */
-    if (!fit || e->midi.fit.n < 6) P = e->midi.p_ref;
+    if ((!fit || e->midi.fit.n < 6) && !(e->midi.restarted && e->midi.p_ref == 0 && fit && e->midi.fit.n >= 4))
+        P = e->midi.p_ref;
     bool have = P > 0;
     double raw = f - e->midi.last_tick, gap = raw;
     double tol = fmax(SP_FOLLOW_MISS_MS * e->rate / 1000.0, have ? 0.15 * P : 0);
@@ -1533,7 +1553,22 @@ static void follow_tick(sp_engine *e, double f) {
             on = true;
         }
         bool small = !big && on;
-        burst = raw < 0.5 * P && !next;
+        burst = raw < 0.5 * P && !next && fit && e->midi.fit.n >= 6;
+        double apart = fmax(0.15 * P, 2.0 * e->rate / 1000.0);
+        if (burst && raw > apart && e->midi.bursts > 0 && fabs(raw - e->midi.burst_gap) <= 0.5 * raw)
+            e->midi.bursts++;
+        else
+            e->midi.bursts = burst && raw > apart ? 1 : 0;
+        e->midi.burst_gap = raw;
+        if (e->midi.bursts >= 3) {
+            burst = false;
+            e->midi.bursts = 0;
+            e->midi.n_held = held = 0;
+            e->midi.misses = 0;
+            e->midi.p_ref = raw;
+            mi_fit_reset(&e->midi.fit);
+            mi_fit_add(&e->midi.fit, e->midi.ticks, e->midi.last_tick);
+        }
         if (held > 0) {
             const sp_held_tick *last = &e->midi.held[held - 1];
             settled = true;
@@ -1583,7 +1618,9 @@ static void follow_tick(sp_engine *e, double f) {
     if (!hold && !burst) mi_fit_add(&e->midi.fit, k, f);
     have = mi_fit_line(&e->midi.fit, &kc, &fc, &P);
     if (have && e->midi.fit.n >= 12) e->midi.p_ref = P;
-    if (e->midi.armed) follow_start(e, f, have ? P : 4.0 / sp_tpf(e->seq.bpm, e->rate));
+    if (e->midi.fit.n >= 6) e->midi.restarted = false;
+    if (e->midi.armed)
+        follow_start(e, f, have ? P : e->midi.p_ref > 0 ? e->midi.p_ref : 4.0 / sp_tpf(e->seq.bpm, e->rate));
     else if (!hold && !burst && e->midi.following && e->seq.playing) follow_steer(e);
     else if (hedge && e->midi.following && e->seq.playing) follow_pace(e, fmax(4.0 / raw, 1.0 / P));
     if (!hold && have && k % 24 == 0) {
@@ -1615,8 +1652,10 @@ static void follow_after_silence(sp_engine *e, int64_t t_ns) {
     mi_fit_reset(&e->midi.fit);
     e->midi.n_held = 0;
     e->midi.misses = 0;
+    e->midi.bursts = 0;
     e->midi.p_ref = P;
     e->midi.ticks = 0;
+    e->midi.restarted = true;
 }
 
 /* Clock follow: ticks, Start, Continue (from the song position), Stop, from

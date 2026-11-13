@@ -1237,6 +1237,35 @@ static void test_follow_silent(void) {
     follow_silent_run(120, 1.0, false, 1, 1);
     follow_silent_run(120, 1.0, false, 4, 1);
     follow_silent_run(120, 1.0, true, 3, 1);
+    follow_silent_run(260, 1.0, false, -1, 1);
+    follow_silent_run(300, 1.0, true, -1, 1);
+    follow_silent_run(150, 1.0, false, 5, 1);
+
+    /* A clock running all along whose tempo more than doubles (100 → 240
+     * bpm), playing, and stopped then Start: the gaps under half a tick are
+     * alike and well apart, the new tempo, not a stalled sender's burst. */
+    for (int playing = 0; playing < 2; playing++) {
+        static master_t r;
+        rng = 1;
+        sp_engine *e = new_engine();
+        sp_set_clock(e, 0, CLOCK0);
+        set_map(e, map_new(0, 1, SP_CLOCK_FOLLOW));
+        master_init(&r, (double)heard_ns(LAT + BLOCK), 100.0, 1.0);
+        for (int i = 0; i < 400; i++) follow_block(e, &r);
+        if (playing) midi(e, 0xFA, 0, 0, (int64_t)r.next_ns - 100000);
+        for (int i = 0; i < 400; i++) follow_block(e, &r);
+        r.change_ns = r.next_ns;
+        r.period2_ns = 60e9 / (240.0 * 24.0);
+        for (int i = 0; i < 400; i++) follow_block(e, &r);
+        if (!playing) midi(e, 0xFA, 0, 0, (int64_t)r.next_ns - 100000);
+        reset_log();
+        for (int i = 0; i < 2000; i++) follow_block(e, &r);
+        double seq_bpm = e->seq.tpf * 60.0 * RATE / SP_PPQN;
+        CHECK(e->seq.playing && fabs(last_tempo() - 240.0) < 0.5 && fabs(seq_bpm - 240.0) < 2.4,
+              "a running clock 100 → 240 bpm (%s): %.2f bpm shown, the sequencer at %.1f", playing ? "playing" : "then Start",
+              last_tempo(), seq_bpm);
+        free_engine(e);
+    }
 
     /* A clock running on while stopped, 6 ticks lost just before Start (a
      * dropout: taken as silence) and tick 2 after it: renumbered. */
