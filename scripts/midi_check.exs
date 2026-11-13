@@ -100,6 +100,9 @@ parse = fn text ->
       ["SENT", t | hex] ->
         [{:sent, String.to_integer(t), Enum.map(hex, &String.to_integer(&1, 16))}]
 
+      ["GRID", t] ->
+        [{:grid, String.to_integer(t)}]
+
       ["RECV", arrival, stamp | hex] ->
         a = String.to_integer(arrival)
         s = String.to_integer(stamp)
@@ -412,7 +415,8 @@ try do
     events = Task.await(probe.(["clock" | args]), :infinity)
     beam = report.()
 
-    sent_ticks = for {:sent, t, [0xF8]} <- events, do: t
+    # The master's grid (a jittered tick is stamped when it is sent).
+    sent_ticks = for {:grid, t} <- events, do: t
     [{start_t, _} | _] = for {:sent, t, [b | _]} <- events, b in [0xFA, 0xFB], do: {t, b}
     stop_t = Enum.find_value(events, fn {:sent, t, [0xFC]} -> t; _ -> nil end)
     step_ticks = sent_ticks |> Enum.take_every(6) |> Enum.with_index()

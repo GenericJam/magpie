@@ -466,13 +466,15 @@ static void test_clock_send(void) {
 #define CLOCK0 1000000000LL
 
 /* The master: ticks at `bpm` from time `t0` (ns), each arriving with a
- * uniform jitter of ±`jit_ms`. The engine hears frame f at CLOCK0 + f/RATE. */
+ * uniform jitter of ±`jit_ms`; ticks drop_lo..drop_hi − 1 are lost on the
+ * way. The engine hears frame f at CLOCK0 + f/RATE. */
 typedef struct {
     double t0, period_ns, jit_ms;
     int64_t k;          /* the next tick */
     double next_ns;     /* its nominal time */
     double change_ns;   /* from here at `bpm2` */
     double period2_ns;
+    int64_t drop_lo, drop_hi;
     double nominal[1 << 14]; /* nominal arrival of tick k */
 } master_t;
 
@@ -488,6 +490,7 @@ static void master_init(master_t *m, double t0, double bpm, double jit_ms) {
     m->jit_ms = jit_ms;
     m->k = 0;
     m->next_ns = t0;
+    m->drop_lo = m->drop_hi = -1;
 }
 
 /* Render one burst; before it, every tick that has arrived by the time the
@@ -496,7 +499,8 @@ static void follow_block(sp_engine *e, master_t *m) {
     double now = (double)heard_ns(e->frame - LAT);
     while (m->next_ns <= now) {
         if (m->k < (1 << 14)) m->nominal[m->k] = m->next_ns;
-        midi(e, 0xF8, 0, 0, (int64_t)(m->next_ns + m->jit_ms * 1e6 * unit()));
+        if (m->k < m->drop_lo || m->k >= m->drop_hi)
+            midi(e, 0xF8, 0, 0, (int64_t)(m->next_ns + m->jit_ms * 1e6 * unit()));
         m->k++;
         m->next_ns += m->next_ns >= m->change_ns ? m->period2_ns : m->period_ns;
     }
@@ -705,6 +709,135 @@ static void test_follow(void) {
     free_engine(e);
 }
 
+/* ── Clock follow: lost ticks, a dropout, a halved tempo ─────────────────── */
+
+/* Following a master at `bpm` (jitter ±1 ms): 1 s of clock, Start, 2 s. */
+static sp_engine *follow_run(master_t *m, double bpm, int64_t *k_start) {
+    sp_engine *e = new_engine();
+    sp_set_clock(e, 0, CLOCK0);
+    set_map(e, map_new(0, 1, SP_CLOCK_FOLLOW));
+    master_init(m, (double)heard_ns(LAT + BLOCK), bpm, 1.0);
+    for (int i = 0; i < 200; i++) follow_block(e, m);
+    midi(e, 0xFA, 0, 0, (int64_t)m->next_ns - 100000);
+    *k_start = m->k;
+    reset_log();
+    for (int i = 0; i < 400; i++) follow_block(e, m);
+    return e;
+}
+
+/* Every step whose tick is due from `from_ns` on, against that tick (lost
+ * or not): the worst error in ms, and how many steps. */
+static double worst_from(const master_t *m, int64_t k_start, double from_ns, int *count) {
+    double worst = 0;
+    int after = 0, steps = 0;
+    for (int i = 0; i < n_evs; i++) {
+        if (evs[i].type != SP_EV_PLAYHEAD) continue;
+        int64_t k = k_start + 6 * (int64_t)steps++;
+        if (k >= m->k || m->nominal[k] < from_ns) continue;
+        double err = fabs((double)evs[i].frame - ns_frame(m->nominal[k])) * 1000.0 / RATE;
+        if (err > worst) worst = err;
+        after++;
+    }
+    *count = after;
+    return worst;
+}
+
+static void test_follow_loss(void) {
+    printf("clock follow: lost ticks\n");
+    static master_t m;
+    int64_t k_start;
+    int n;
+
+    /* Ticks lost on the way while the master plays on: the steps stay on
+     * the master's grid (one or two: renumbered when the next tick comes;
+     * two seconds: numbered by the time gone by, the sequencer running on
+     * at the fitted tempo meanwhile). */
+    const int lost[] = {1, 2, 96};
+    for (size_t li = 0; li < sizeof(lost) / sizeof(lost[0]); li++) {
+        sp_engine *e = follow_run(&m, 120.0, &k_start);
+        m.drop_lo = m.k + 5;
+        m.drop_hi = m.drop_lo + lost[li];
+        for (int i = 0; i < 1200; i++) follow_block(e, &m);
+        int n_all;
+        double all = worst_from(&m, k_start, m.nominal[m.drop_lo], &n_all);
+        double worst = worst_from(&m, k_start, m.nominal[m.drop_hi] + 1e9, &n);
+        CHECK(n_all > 40 && all < 3.0 && worst < 1.0,
+              "%d tick%s lost at 120 bpm (jitter ±1 ms): worst %.3f ms over the %d steps from the loss on, %.3f ms from 1 s "
+              "after the ticks are back",
+              lost[li], lost[li] > 1 ? "s" : "", all, n_all, worst);
+        free_engine(e);
+    }
+
+    /* The tempo halved: gaps of two ticks, twice in a row, are a tempo
+     * change, not lost ticks (the sequencer, ahead of the slower grid, slows
+     * onto it over two beats: it never goes back). */
+    sp_engine *e = follow_run(&m, 120.0, &k_start);
+    m.change_ns = m.next_ns;
+    m.period2_ns = 2 * m.period_ns;
+    for (int i = 0; i < 1600; i++) follow_block(e, &m);
+    double worst = worst_from(&m, k_start, m.change_ns + 2.5e9, &n);
+    const sp_event *tempo = NULL;
+    for (int i = 0; i < n_evs; i++)
+        if (evs[i].type == SP_EV_TEMPO) tempo = &evs[i];
+    CHECK(tempo && fabs(tempo->a / 1000.0 - 60.0) < 0.3 && n > 20 && worst < 1.0,
+          "120 → 60 bpm: followed tempo %.2f; %d steps from 2.5 s (2.5 beats) after the change, worst %.3f ms",
+          tempo ? tempo->a / 1000.0 : 0, n, worst);
+    free_engine(e);
+}
+
+/* ── Notes out: one note open per channel and note; note-offs always out ── */
+
+static void test_out_pairing(void) {
+    printf("notes out: pairing\n");
+    sp_engine *e = new_engine();
+    load(e, 0, RATE * 10);
+    set_pad(e, 0, 0, SP_ONE_SHOT, 36, 0);
+    set_pad(e, 1, 0, SP_GATE, 38, 0);
+    sp_midi_map *m = map_new(0, 1, SP_CLOCK_INTERNAL);
+    m->out_note[0] = 36;
+    m->out_note[1] = 38;
+    set_map(e, m);
+    render(e, 100, 100);
+
+    reset_log();
+    trigger(e, 0, 100);
+    render(e, 100, 100);
+    trigger(e, 0, 90);
+    render(e, 100, 100);
+    CHECK(n_outs == 3 && outs[0].b[0] == 0x90 && outs[1].b[0] == 0x80 && outs[1].frame == 200 && outs[2].b[0] == 0x90 &&
+              outs[2].frame == 200 && outs[2].b[2] == 90,
+          "a one-shot retriggered while it rings: the first voice's note-off, then the new note-on, on one frame");
+    render(e, RATE * 11, 0);
+    CHECK(count_out(0x90) == 2 && count_out(0x80) == 2, "  and the second's note-off when it ends (%d on, %d off)",
+          count_out(0x90), count_out(0x80));
+
+    /* A voice ended while no audio runs (a pad change with stop, applied by
+     * sp_drain): its note-off waits for the next block, late, not lost. */
+    reset_log();
+    trigger(e, 1, 100);
+    render(e, 100, 100);
+    sp_pad one_shot = {.slot = 0, .gain = 1.0f, .mode = SP_ONE_SHOT, .root = 38};
+    push(e, (sp_cmd){.type = SP_CMD_PAD, .pad = 1, .stop = 1, .u.pad = one_shot});
+    sp_drain(e, false);
+    collect(e);
+    int offs_offline = count_out(0x80);
+    render(e, 100, 100);
+    CHECK(count_out(0x90) == 1 && offs_offline == 0 && count_out(0x80) == 1 && voices_on(e, 1) == 0,
+          "a gate voice cut with no stream: its note-off goes out with the next block");
+    free_engine(e);
+
+    /* The out queue keeps its last places for note-offs. */
+    static mo_ring r;
+    memset(&r, 0, sizeof(r));
+    mo_event tick = {.frame = 0, .len = 1, .kind = MO_CLOCK, .b = {0xF8}};
+    mo_event off = {.frame = 0, .len = 3, .kind = MO_NOTE, .b = {0x80, 36, 64}};
+    int in = 0;
+    while (mo_push(&r, &tick, SP_VOICES)) in++;
+    int offs = 0;
+    while (mo_push(&r, &off, 0)) offs++;
+    CHECK(in == MO_RING - SP_VOICES && offs == SP_VOICES, "a full out queue: %d ticks in, then still %d note-offs", in, offs);
+}
+
 /* ── MIDI hits while playing ──────────────────────────────────────────────── */
 
 static void test_hits(void) {
@@ -745,6 +878,8 @@ int main(void) {
     test_notes_out();
     test_clock_send();
     test_follow();
+    test_follow_loss();
+    test_out_pairing();
     test_hits();
     printf(failures ? "FAILED: %d\n" : "passed: 0 failures\n", failures);
     return failures ? 1 : 0;

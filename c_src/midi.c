@@ -106,6 +106,12 @@ static void mi_fit_add(mi_fit *t, int64_t k, double f) {
     if (t->n < MI_FIT) t->n++;
 }
 
+/* The newest tick turns out to be `by` ticks later than counted (ticks were
+ * lost before it). */
+static void mi_fit_renumber_newest(mi_fit *t, int64_t by) {
+    if (t->n > 0) t->k[(t->head + MI_FIT - 1) % MI_FIT] += by;
+}
+
 /* Least squares f = fc + P·(k − kc): the centroid (kc, fc) and the slope P
  * (frames per tick). False with fewer than two ticks or a slope that isn't
  * positive. Sums relative to the newest tick, so large frame counts keep
@@ -151,10 +157,12 @@ typedef struct {
     _Atomic uint64_t dropped;
 } mo_ring;
 
-static bool mo_push(mo_ring *r, const mo_event *ev) {
+/* Queue `ev` unless fewer than `reserve` + 1 places are free (the renderer
+ * keeps the last places for note-offs). */
+static bool mo_push(mo_ring *r, const mo_event *ev, uint32_t reserve) {
     uint32_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
     uint32_t head = atomic_load_explicit(&r->head, memory_order_acquire);
-    if (tail - head >= MO_RING) {
+    if (tail - head >= MO_RING - reserve) {
         atomic_fetch_add_explicit(&r->dropped, 1, memory_order_relaxed);
         return false;
     }

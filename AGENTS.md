@@ -499,12 +499,16 @@ passes through the BEAM.
 - **Rule:** a note plays every non-keys pad whose `midi_note` it is (any
   bank); unclaimed notes go to every keys pad (chromatic from its root);
   note-off releases gate/loop/keys; CC 120/123 release MIDI voices.
-  Played voices (touch, sequencer) send note-on/off; MIDI voices don't
-  echo. Out channel = `in_channel` or 1. Clock `send`: tick every 4 seq
-  ticks, SPP 0 + Start on play, Stop, free-running while stopped.
-  `follow`: LS fit over 24 ticks (reset after two same-side misses > 3 ms),
-  position steered onto it half a beat ahead; downbeat late by the
-  write-ahead, then on the master's grid.
+  Played voices (touch, sequencer) send note-on/off (one note open per
+  channel and note; note-offs never dropped: they wait out a stream
+  restart); MIDI voices don't echo. Out channel = `in_channel` or 1.
+  Clock `send`: tick every 4 seq ticks, SPP 0 + Start on play, Stop,
+  free-running while stopped. `follow`: LS fit over 24 ticks (reset after
+  two same-side misses > 3 ms), ticks numbered by time (lost ticks and
+  dropouts keep the grid), position steered onto it half a beat ahead;
+  downbeat late by the write-ahead, then on the master's grid. Kotlin: one
+  C parser per output port (each delivers on its own thread), reset when
+  a slot is reused.
 - **Elixir:** `Magpie.Midi.Map.config/1` / `route/2` (the table and the
   rule), `Engine.set_midi/1` (KitSession pushes it on every kit change),
   `KitSession.set_midi(%{in_channel, clock})`, `Magpie.Midi` (devices:
@@ -517,7 +521,48 @@ passes through the BEAM.
 - **Checking it:** `cc -O2 -Wall -Wextra -Wno-unused-function -o
   /tmp/midi_host c_src/test/midi_host.c -lm && /tmp/midi_host` (also with
   `-fsanitize=address,undefined`); `mix test test/magpie/midi_*_test.exs
-  test/magpie/kit_session_midi_test.exs`. Not yet measured on a device.
+  test/magpie/kit_session_midi_test.exs`. On a phone:
+  `SERIAL=<serial> mix run --no-start scripts/midi_check.exs` (after
+  `mix mob.deploy --native` and `mix mob.connect`): it drives
+  `plugins/magpie_midi/tools/MidiProbe.java`, a client of the "Magpie"
+  port run as the shell user (`app_process`; `midi_probe.sh` builds and
+  runs it by hand), against test tones on bank A pads 0..4, and puts the
+  kit back. `MIDI_SERIES=1` prints every followed step's error.
+
+### Measured (moto e 2020, Android 10, `scripts/midi_check.exs`)
+
+Stream 48 kHz, 240-frame bursts, output latency 33–36 ms. All through the
+"Magpie" port (`dumpsys midi`: 1 input, 1 output) from another process.
+
+- **Notes in:** 36 note-ons + 36 note-offs (notes 36/38/42/46 and 60/64
+  for a keys pad) → 72 received, 72 applied, voice starts exactly as
+  mapped (6 per drum pad, 12 on the keys pad); channel 2 with
+  `in_channel` 1: nothing. In → heard (the sender's timestamp → the first
+  frame heard) p50 34.7 ms, p95 35.0 ms: the output latency, as a touch
+  (NIF call → heard p50 33.7 ms).
+- **Notes out:** 20 touches → 20 note-ons + 20 note-offs on the pads'
+  notes (keys pad: its root); each stamped with the frame heard (touch call
+  → stamp p50 33.9 ms = the trigger latency). Stamp → arrival at the other
+  process p50 0.6 ms, p95 1.8 ms; the sending thread calls send 0.23 ms
+  (p50) after the stamp (`out_late_us` p95 0.55–0.68 ms, max ~1 ms).
+- **Clock send** (120 bpm, 12 s): 673 ticks, none dropped. Stamps are the
+  frames' heard times through the output timestamp, so they carry its
+  noise: spacing − period p95 0.17 ms, max 0.58 ms. Arrival spacing at the
+  other process rms 0.28 ms (worst 1.7 ms); arrival − stamp p50 0.7 ms,
+  p95 2.0 ms. SPP 0 + Start + the first tick on one stamp, Stop; the clock
+  runs on while stopped. Sequenced notes: 33 on, 33 off, every note-on
+  stamped exactly on a tick (0 µs).
+- **Clock follow** against the probe's ticks (step note stamps vs the
+  master's tick for that step): downbeat 32–36 ms late (the write-ahead),
+  then locked (8 steps in a row within 1 ms) from step 4 (0.5 s); 120 bpm
+  steps 8–63 rms 0.11 ms, worst 0.29 ms. 120 → 100 bpm: locked again 6
+  steps (0.9 s) after the change, then rms 0.11 ms, worst 0.35 ms. Tempo
+  shown 120.0 / 100.0 (±0.1). Ticks with ±2 ms jitter: rms 1.35 ms, worst
+  3.1 ms. Song position 8 + Continue: the first step is step 8, then rms
+  < 0.2 ms. Stop stops (heard ~34 ms after it: the write-ahead), and the
+  step due at the Stop's own time has already sounded.
+- **Not measured:** USB and Bluetooth devices (no hardware here; the code
+  paths are Kotlin only, covered by the Fake on the Elixir side).
 
 ## The pads (`Magpie.PadsScreen`)
 

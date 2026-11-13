@@ -15,14 +15,15 @@
 //       plan: <bpm>:<beats>[,<bpm>:<beats>...]. After 500 ms: Start (spp
 //       < 0) or song position spp + Continue, then a tick every 1/24 beat
 //       through the plan (each tick sent ±jitter ms off its grid time and
-//       stamped with the time it is sent), then Stop; listens until
-//       seconds are up.
+//       stamped with the time it is sent; GRID gives the grid time), then
+//       Stop; listens until seconds are up.
 //
 // Output, one line each (times in ns, CLOCK_MONOTONIC):
 //
 //   DEVICE id=.. name=.. type=.. in=.. out=..
 //   OPEN id=.. sending=true|false listening=true|false
 //   SENT <stamp> <hex bytes>
+//   GRID <grid time of the tick just sent>
 //   RECV <arrival> <stamp> <hex bytes>
 //   DONE
 //
@@ -170,6 +171,7 @@ public final class MidiProbe {
                 long off = jitter > 0 ? (long) ((random.nextDouble() * 2 - 1) * jitter) : 0;
                 waitUntil((long) grid + off);
                 send(port, (byte) 0xf8);
+                say("GRID " + (long) grid);
                 grid += period;
             }
         }

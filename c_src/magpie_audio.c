@@ -1610,6 +1610,10 @@ static struct {
     pthread_t out;
     bool out_started;
     _Atomic bool out_run;
+    /* Note-offs left in the out queue by an earlier stream (midi_start_locked
+     * fills it, the new thread sends it). */
+    mo_event stale[MO_RING];
+    int n_stale;
     _Atomic uint64_t received, sent, late_dropped;
     /* Under E.stats_lock: send time − stamp (µs); MIDI timestamp → heard (ms). */
     float late_us[MIDI_STATS], in_ms[MIDI_STATS];
@@ -1644,6 +1648,15 @@ static void JNICALL native_in(JNIEnv *j, jclass cls, jint source, jbyteArray dat
         mi_parse(&MI.parsers[source], buf, n, midi_emit, &ctx);
         done += n;
     }
+}
+
+/* MagpieMidi.nativeReset(source): a source taken by a newly opened port
+ * starts with a fresh parser (no running status or SysEx left by the port
+ * that had it before). */
+static void JNICALL native_reset(JNIEnv *j, jclass cls, jint source) {
+    (void)j;
+    (void)cls;
+    if (source >= 0 && source < MIDI_SOURCES) MI.parsers[source] = (mi_parser){0};
 }
 
 /* MagpieMidi.nativeEvent(tag, json): a device event for the listener. */
@@ -1696,6 +1709,7 @@ static bool midi_bind(JNIEnv *j) {
             JNINativeMethod natives[] = {
                 {"nativeIn", "(I[BIIJ)V", (void *)native_in},
                 {"nativeEvent", "(Ljava/lang/String;[B)V", (void *)native_event},
+                {"nativeReset", "(I)V", (void *)native_reset},
             };
             MI.attach = static_method(j, cls, "attach", "()V");
             MI.send = static_method(j, cls, "send", "([BIJ)V");
@@ -1706,7 +1720,7 @@ static bool midi_bind(JNIEnv *j) {
             MI.ble_connect = static_method(j, cls, "bleConnect", "(Ljava/lang/String;)Ljava/lang/String;");
             MI.ble_disconnect = static_method(j, cls, "bleDisconnect", "(Ljava/lang/String;)V");
             if (MI.attach && MI.send && MI.devices && MI.open && MI.close && MI.ble_scan && MI.ble_connect &&
-                MI.ble_disconnect && (*j)->RegisterNatives(j, cls, natives, 2) == 0 && !jni_failed(j)) {
+                MI.ble_disconnect && (*j)->RegisterNatives(j, cls, natives, 3) == 0 && !jni_failed(j)) {
                 MI.cls = (jclass)(*j)->NewGlobalRef(j, cls);
                 ok = MI.cls != NULL;
             }
@@ -1738,13 +1752,22 @@ static JNIEnv *midi_env(bool *attached) {
     return j;
 }
 
-/* When engine frame `frame` is heard (CLOCK_MONOTONIC), or now without a
- * timestamp yet. */
-static int64_t frame_ns(int64_t frame) {
+/* The sending thread's copy of the clock map: a read that loses to the
+ * event thread's update (sp_get_clock gives up rather than spin) uses the
+ * last one instead of sending early. */
+typedef struct {
+    int64_t frame, ns;
+    int rate;
+} midi_clock;
+
+/* When engine frame `frame` is heard (CLOCK_MONOTONIC), or now before
+ * there has been a timestamp. */
+static int64_t frame_ns(midi_clock *c, int64_t frame) {
     int64_t cf, cns;
     int rate = atomic_load(&E.rate);
-    if (!sp_get_clock(&SP, &cf, &cns) || rate <= 0) return now_ns();
-    return cns + (int64_t)((double)(frame - cf) * 1e9 / rate);
+    if (sp_get_clock(&SP, &cf, &cns) && rate > 0) *c = (midi_clock){cf, cns, rate};
+    if (c->rate <= 0) return now_ns();
+    return c->ns + (int64_t)((double)(frame - c->frame) * 1e9 / c->rate);
 }
 
 static void sleep_until(int64_t t) {
@@ -1775,13 +1798,26 @@ static void *midi_out_main(void *arg) {
     jbyteArray arr = local ? (jbyteArray)(*j)->NewGlobalRef(j, local) : NULL;
     if (local) (*j)->DeleteLocalRef(j, local);
     uint8_t buf[MIDI_SEND_MAX];
+    midi_clock clk = {0, 0, 0};
+    for (int i = 0; arr && i < MI.n_stale;) {
+        int n = 0, count = 0;
+        for (; i < MI.n_stale && n + MI.stale[i].len <= MIDI_SEND_MAX; i++, count++) {
+            memcpy(buf + n, MI.stale[i].b, MI.stale[i].len);
+            n += MI.stale[i].len;
+        }
+        (*j)->SetByteArrayRegion(j, arr, 0, n, (const jbyte *)buf);
+        (*j)->CallStaticVoidMethod(j, MI.cls, MI.send, arr, (jint)n, (jlong)now_ns());
+        jni_failed(j);
+        atomic_fetch_add_explicit(&MI.sent, (uint64_t)count, memory_order_relaxed);
+    }
+    MI.n_stale = 0;
     while (arr && atomic_load(&MI.out_run)) {
         mo_event ev;
         if (!mo_peek(&SP.midi.out, &ev)) {
             usleep(1000);
             continue;
         }
-        int64_t t = frame_ns(ev.frame), now = now_ns();
+        int64_t t = frame_ns(&clk, ev.frame), now = now_ns();
         if (t - now > 5000000LL) {
             /* Far ahead (the stream renders ~20–40 ms ahead): look again
              * shortly, so a stop doesn't wait and the clock map stays fresh. */
@@ -1791,7 +1827,7 @@ static void *midi_out_main(void *arg) {
         if (t > now) sleep_until(t);
         int n = 0, count = 0;
         while (mo_peek(&SP.midi.out, &ev) && n + ev.len <= MIDI_SEND_MAX) {
-            int64_t te = frame_ns(ev.frame);
+            int64_t te = frame_ns(&clk, ev.frame);
             if (te > t + MIDI_BATCH_NS) break;
             mo_drop(&SP.midi.out);
             if (ev.kind == MO_CLOCK && now_ns() - te > MIDI_LATE_CLOCK_NS) {
@@ -1815,9 +1851,10 @@ static void *midi_out_main(void *arg) {
     return NULL;
 }
 
-/* Bind MIDI and start the sending thread (dropping what is left in the out
- * queue from an earlier stream: nobody consumes it before the thread
- * starts). Caller holds E.lock. */
+/* Bind MIDI and start the sending thread. What is left in the out queue
+ * from an earlier stream is stale: its note-offs go out first, at once (a
+ * note-on that went out keeps its note-off), the rest is dropped. Caller
+ * holds E.lock; the queue has no consumer until the thread starts. */
 static void midi_start_locked(void) {
     bool attached;
     JNIEnv *j = midi_env(&attached);
@@ -1825,8 +1862,9 @@ static void midi_start_locked(void) {
     jni_done(attached);
     if (MI.out_started) return;
     mo_event ev;
-    while (mo_pop(&SP.midi.out, &ev)) {
-    }
+    MI.n_stale = 0;
+    while (mo_pop(&SP.midi.out, &ev))
+        if (midi_is_note_off(&ev)) MI.stale[MI.n_stale++] = ev;
     atomic_store(&MI.out_run, true);
     MI.out_started = pthread_create(&MI.out, NULL, midi_out_main, NULL) == 0;
     if (!MI.out_started) {
@@ -2772,7 +2810,9 @@ static ERL_NIF_TERM nif_set_midi(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     return ok_atom(env);
 }
 
-/* midi_listen(Pid) -> ok | {error, unavailable}: device events to Pid.
+/* midi_listen(Pid) -> ok | {error, unavailable}: device events to Pid,
+ * starting with the port's connection counts now (attach sends them; the
+ * one sent when MIDI was bound may have gone before there was a listener).
  * Dirty IO (binds MIDI on first use). */
 static ERL_NIF_TERM nif_midi_listen(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
@@ -2785,6 +2825,8 @@ static ERL_NIF_TERM nif_midi_listen(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     bool attached;
     JNIEnv *j = midi_env(&attached);
     if (!j) return error_tuple(env, "unavailable");
+    (*j)->CallStaticVoidMethod(j, MI.cls, MI.attach);
+    jni_failed(j);
     jni_done(attached);
     return ok_atom(env);
 }

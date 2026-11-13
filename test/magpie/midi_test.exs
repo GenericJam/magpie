@@ -86,6 +86,18 @@ defmodule Magpie.MidiTest do
     assert Midi.set_open(99, true) == {:error, :unknown_device}
   end
 
+  test "a device turned off while it was opening closes again when the open completes" do
+    start!()
+    Fake.plug(@usb)
+    await(&(device(&1, 11) && device(&1, 11).status == :open))
+    :ok = Midi.set_open(11, false)
+    await(&(device(&1, 11).status == :closed))
+
+    # Kotlin's openDevice callback lands after the close it raced.
+    Fake.midi_event(:opened, %{id: 11})
+    assert %{status: :closed, wanted: false} = device(Midi.snapshot(), 11)
+  end
+
   test "a device that can't open says why" do
     :ok = Fake.fail_midi_open(:open_failed)
     start!()

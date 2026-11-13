@@ -59,11 +59,14 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
     private const val TAG = "MagpieMidi"
 
     // Registered by magpie_audio.c. `source` picks the C parser (0: the port,
-    // 1..15: an opened device), so one source's bytes are never parsed on two
-    // threads at once.
+    // 1..15: an opened device's output ports, one each: every MidiOutputPort
+    // delivers on its own thread), so one source's bytes are never parsed on
+    // two threads at once.
     @JvmStatic external fun nativeIn(source: Int, data: ByteArray, offset: Int, count: Int, timestamp: Long)
 
     @JvmStatic external fun nativeEvent(tag: String, json: ByteArray)
+
+    @JvmStatic external fun nativeReset(source: Int)
 
     private const val SOURCES = 16
 
@@ -170,7 +173,7 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
 
     private class Opened(
         val device: MidiDevice,
-        val source: Int,
+        val sources: List<Int>,
         val input: MidiInputPort?,
         val outputs: List<MidiOutputPort>,
     )
@@ -178,6 +181,7 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
     private val opened = ConcurrentHashMap<Int, Opened>()
     private val sourceLock = Any()
     private val sourcesUsed = BooleanArray(SOURCES).also { it[0] = true }
+    private var lastSource = 0 // under sourceLock
 
     private fun midiManager(): MidiManager? =
         appContext?.getSystemService(Context.MIDI_SERVICE) as? MidiManager
@@ -232,24 +236,48 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
         return ""
     }
 
+    // Main thread, like closeDevice and the device callback.
+    @Suppress("DEPRECATION")
     private fun connect(id: Int, device: MidiDevice) {
-        val source = takeSource()
-        if (source < 0) {
+        // Opened twice before the first open finished, or removed meanwhile.
+        val existing = opened[id]
+        if (existing != null || midiManager()?.devices?.none { it.id == id } != false) {
             closeQuietly(device)
-            event("open_failed", JSONObject().put("id", id).put("reason", "unavailable"))
+            if (existing != null) {
+                event(
+                    "opened",
+                    JSONObject().put("id", id).put("receiving", existing.outputs.size)
+                        .put("sending", existing.input != null),
+                )
+            } else {
+                event("open_failed", JSONObject().put("id", id).put("reason", "unknown_device"))
+            }
             return
         }
         // An input port has one opener at a time: null while another app has it.
         val input = if (device.info.inputPortCount > 0) device.openInputPort(0) else null
-        val outputs = (0 until device.info.outputPortCount).mapNotNull { device.openOutputPort(it) }
+        val outputs = ArrayList<MidiOutputPort>()
+        val sources = ArrayList<Int>()
+        var outOfSources = false
+        for (i in 0 until device.info.outputPortCount) {
+            val port = device.openOutputPort(i) ?: continue
+            val source = takeSource()
+            if (source < 0) {
+                closeQuietly(port)
+                outOfSources = true
+                break
+            }
+            port.connect(Receiver(source))
+            outputs.add(port)
+            sources.add(source)
+        }
         if (input == null && outputs.isEmpty()) {
             closeQuietly(device)
-            giveSource(source)
-            event("open_failed", JSONObject().put("id", id).put("reason", "open_failed"))
+            val reason = if (outOfSources) "unavailable" else "open_failed"
+            event("open_failed", JSONObject().put("id", id).put("reason", reason))
             return
         }
-        outputs.forEach { it.connect(Receiver(source)) }
-        opened[id] = Opened(device, source, input, outputs)
+        opened[id] = Opened(device, sources, input, outputs)
         rebuildDestinations()
         event(
             "opened",
@@ -268,7 +296,7 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
         o.outputs.forEach { closeQuietly(it) }
         o.input?.let { closeQuietly(it) }
         closeQuietly(o.device)
-        giveSource(o.source)
+        o.sources.forEach { giveSource(it) }
         if (tell) event("closed", JSONObject().put("id", id))
     }
 
@@ -276,12 +304,19 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
         destinations = opened.values.mapNotNull { it.input }.toTypedArray()
     }
 
-    private fun takeSource(): Int =
+    // Round robin from the last one taken, so a slot just given back (its
+    // closed port's thread may still be delivering a last message) is taken
+    // again only when no other is free; its parser starts afresh.
+    private fun takeSource(): Int {
         synchronized(sourceLock) {
-            val i = sourcesUsed.indexOfFirst { !it }
-            if (i >= 0) sourcesUsed[i] = true
-            i
+            val i = (1 until SOURCES).map { (lastSource + it - 1) % (SOURCES - 1) + 1 }.firstOrNull { !sourcesUsed[it] }
+                ?: return -1
+            sourcesUsed[i] = true
+            lastSource = i
+            if (attached) nativeReset(i)
+            return i
         }
+    }
 
     private fun giveSource(i: Int) {
         synchronized(sourceLock) { if (i > 0) sourcesUsed[i] = false }

@@ -345,6 +345,7 @@ typedef struct {
         int spp;          /* song position (16ths) for Continue */
         bool armed, following;
         int misses;       /* ticks in a row off the fitted line (signed: which way) */
+        int64_t lost;     /* ticks the last gap says were lost, if the next tick confirms it */
         _Atomic uint64_t in_messages;
         _Atomic int64_t follow_bpm_milli; /* 0: no clock to follow yet */
         double bpm_shown;                 /* the followed tempo as reported */
@@ -541,28 +542,24 @@ static void sp_init(sp_engine *e, int rate) {
 
 /* ── MIDI out (renderer) ──────────────────────────────────────────────────── */
 
-/* A message for engine frame `frame` into this block's list (sorted and
- * queued at the block's end). Nothing goes out while no audio runs
- * (sp_drain): it would be stamped in the past. */
-static void midi_push(sp_engine *e, int64_t frame, uint8_t kind, uint8_t len, uint8_t b0, uint8_t b1, uint8_t b2) {
-    if (e->offline) return;
-    if (e->midi.n_block >= SP_MIDI_BLOCK) {
-        atomic_fetch_add_explicit(&e->midi.out.dropped, 1, memory_order_relaxed);
-        return;
-    }
-    e->midi.block[e->midi.n_block++] = (mo_event){.frame = frame, .len = len, .kind = kind, .b = {b0, b1, b2}};
-}
+static bool midi_is_note_off(const mo_event *ev) { return ev->kind == MO_NOTE && (ev->b[0] & 0xF0) == 0x80; }
 
-/* The note-on of a voice of `pad` starting at `frame`: the pad's note, or
- * for a keys pad the note it plays (`played`). Returns the note sent, −1
- * when the pad sends nothing. */
-static int16_t midi_note_on(sp_engine *e, int pad, int played, int vel, int64_t frame, uint8_t *ch) {
-    const sp_midi_map *m = e->midi.map;
-    if (!m || e->offline || m->out_note[pad] < 0) return -1;
-    int note = played >= 0 ? played : m->out_note[pad];
-    *ch = (uint8_t)((m->out_channel - 1) & 0x0F);
-    midi_push(e, frame, MO_NOTE, 3, (uint8_t)(0x90 | *ch), (uint8_t)note, (uint8_t)vel);
-    return (int16_t)note;
+/* A message for engine frame `frame` into this block's list (sorted and
+ * queued at the block's end). A note-off always gets in: the list keeps
+ * room for one per voice, so every note-on that went out gets its
+ * note-off. While no audio runs (sp_drain) only note-offs go in, and wait
+ * there for the next block (they go out late, not never); anything else
+ * would be stamped in the past. */
+static bool midi_push(sp_engine *e, int64_t frame, uint8_t kind, uint8_t len, uint8_t b0, uint8_t b1, uint8_t b2) {
+    mo_event ev = {.frame = frame, .len = len, .kind = kind, .b = {b0, b1, b2}};
+    bool off = midi_is_note_off(&ev);
+    if (e->offline && !off) return false;
+    if (e->midi.n_block >= (off ? SP_MIDI_BLOCK : SP_MIDI_BLOCK - SP_VOICES)) {
+        atomic_fetch_add_explicit(&e->midi.out.dropped, 1, memory_order_relaxed);
+        return false;
+    }
+    e->midi.block[e->midi.n_block++] = ev;
+    return true;
 }
 
 /* The voice stops sounding at full (its release starts, it is cut, or it
@@ -571,6 +568,25 @@ static void voice_note_off(sp_engine *e, sp_voice *v, int64_t frame) {
     if (v->state != SP_V_ON || v->out_note < 0) return;
     midi_push(e, frame, MO_NOTE, 3, (uint8_t)(0x80 | v->out_ch), (uint8_t)v->out_note, 64);
     v->out_note = -1;
+}
+
+/* The note-on of voice `v` of `pad` starting at `frame`: the pad's note,
+ * or for a keys pad the note it plays (`played`). Another voice still
+ * holding that note on that channel sends its note-off first (receivers
+ * keep one note per channel and note: its later note-off would end this
+ * one). Returns the note sent, −1 when nothing was. */
+static int16_t midi_note_on(sp_engine *e, sp_voice *v, int pad, int played, int vel, int64_t frame) {
+    const sp_midi_map *m = e->midi.map;
+    if (!m || e->offline || m->out_note[pad] < 0) return -1;
+    int note = played >= 0 ? played : m->out_note[pad];
+    uint8_t ch = (uint8_t)((m->out_channel - 1) & 0x0F);
+    for (int i = 0; i < SP_VOICES; i++) {
+        sp_voice *w = &e->voices[i];
+        if (w != v && w->state == SP_V_ON && w->out_note == note && w->out_ch == ch) voice_note_off(e, w, frame);
+    }
+    if (!midi_push(e, frame, MO_NOTE, 3, (uint8_t)(0x90 | ch), (uint8_t)note, (uint8_t)vel)) return -1;
+    v->out_ch = ch;
+    return (int16_t)note;
 }
 
 /* ── Voices ───────────────────────────────────────────────────────────────── */
@@ -717,7 +733,7 @@ static bool voice_start(sp_engine *e, int pad, int vel, int note, double gate_at
         .serial = ++e->serial,
         .from_midi = src == SP_SRC_MIDI,
     };
-    v->out_note = src == SP_SRC_PLAYED ? midi_note_on(e, pad, played, vel, frame, &v->out_ch) : -1;
+    v->out_note = src == SP_SRC_PLAYED ? midi_note_on(e, v, pad, played, vel, frame) : -1;
     s->refs++;
     e->pad_voices[pad]++;
     sp_emit(e, &(sp_event){.type = SP_EV_VOICE_START, .pad = (uint8_t)pad, .frame = frame});
@@ -1285,30 +1301,61 @@ static void follow_steer(sp_engine *e) {
     e->seq.tpf = tpf;
 }
 
-/* An incoming clock tick, heard at frame `f`. A gap of more than 3 ticks
- * (or half a second before there is a tempo) starts the fit afresh. Once
- * a beat the followed tempo goes to the BEAM. */
+/* An incoming clock tick, heard at frame `f`. Ticks are numbered by the
+ * time between them, not only counted, so the sequencer keeps the master's
+ * phase when ticks don't arrive while the master plays on (a cable, a
+ * Bluetooth dropout, a stalled sender, a full command queue):
+ *
+ * - A gap of more than 3 ticks (or half a second before there is a tempo):
+ *   this tick is numbered by the time gone by at the fitted tempo (the
+ *   sequencer ran on at it meanwhile, so it stays on the grid) and the fit
+ *   starts afresh.
+ * - A gap of n ≥ 2 ticks to within the miss tolerance, then a tick one
+ *   tick later: n − 1 ticks were lost; the earlier tick is renumbered (in
+ *   the fit too). Without that second tick (two such gaps in a row: a
+ *   tempo halved) nothing is renumbered and the miss rule below sees a
+ *   tempo change.
+ * - Two ticks in a row off the line the same way, by more than jitter
+ *   explains: the tempo changed; fit from those two on.
+ *
+ * Once a beat the followed tempo goes to the BEAM. */
 static void follow_tick(sp_engine *e, double f) {
     double kc, fc, P;
     bool have = mi_fit_line(&e->midi.fit, &kc, &fc, &P);
-    int64_t k = e->midi.ticks + 1;
-    if (e->midi.ticks > 0 && f - e->midi.last_tick > (have ? 3.0 * P : 0.5 * e->rate)) {
+    double gap = f - e->midi.last_tick;
+    int64_t lost = e->midi.lost;
+    e->midi.lost = 0;
+    if (e->midi.ticks > 0 && gap > (have ? 3.0 * P : 0.5 * e->rate)) {
+        if (have) e->midi.ticks += llround(gap / P) - 1;
         mi_fit_reset(&e->midi.fit);
         e->midi.misses = 0;
     } else if (have && e->midi.fit.n >= 12) {
-        /* Two ticks in a row off the line the same way, by more than
-         * jitter explains: the tempo changed. Fit from those two on (and
-         * look again once there are a dozen). */
-        double miss = f - (fc + P * ((double)k - kc));
-        bool off = fabs(miss) > fmax(SP_FOLLOW_MISS_MS * e->rate / 1000.0, 0.15 * P);
-        int sign = miss > 0 ? 1 : -1;
-        e->midi.misses = off ? (e->midi.misses * sign > 0 ? e->midi.misses + sign : sign) : 0;
-        if (abs(e->midi.misses) >= 2) {
-            mi_fit_reset(&e->midi.fit);
-            mi_fit_add(&e->midi.fit, k - 1, e->midi.last_tick);
-            e->midi.misses = 0;
+        double tol = fmax(SP_FOLLOW_MISS_MS * e->rate / 1000.0, 0.15 * P);
+        int64_t n = llround(gap / P);
+        if (lost > 0 && fabs(gap - P) <= tol) {
+            /* The run's first tick keeps being its first. */
+            if (e->midi.k0 == e->midi.ticks) e->midi.k0 += lost;
+            e->midi.ticks += lost;
+            mi_fit_renumber_newest(&e->midi.fit, lost);
+            have = mi_fit_line(&e->midi.fit, &kc, &fc, &P);
+        } else if (n >= 2 && fabs(gap - (double)n * P) <= tol && lost == 0) {
+            e->midi.lost = n - 1;
+        }
+        if (have) {
+            int64_t k = e->midi.ticks + 1;
+            double miss = f - (fc + P * ((double)k - kc));
+            bool off = fabs(miss) > tol;
+            int sign = miss > 0 ? 1 : -1;
+            e->midi.misses = off ? (e->midi.misses * sign > 0 ? e->midi.misses + sign : sign) : 0;
+            if (abs(e->midi.misses) >= 2) {
+                mi_fit_reset(&e->midi.fit);
+                mi_fit_add(&e->midi.fit, k - 1, e->midi.last_tick);
+                e->midi.misses = 0;
+                e->midi.lost = 0;
+            }
         }
     }
+    int64_t k = e->midi.ticks + 1;
     e->midi.ticks = k;
     e->midi.last_tick = f;
     mi_fit_add(&e->midi.fit, k, f);
@@ -1400,6 +1447,7 @@ static void set_midi_map(sp_engine *e, sp_midi_map *map) {
         atomic_store_explicit(&e->midi.follow_bpm_milli, 0, memory_order_relaxed);
         e->midi.bpm_shown = 0;
         e->midi.misses = 0;
+        e->midi.lost = 0;
     }
     if (!map || map->clock != SP_CLOCK_SEND) e->midi.free_next = -1;
 }
@@ -1429,7 +1477,7 @@ static void midi_flush(sp_engine *e, int frames) {
         }
         b[j + 1] = x;
     }
-    for (int i = 0; i < e->midi.n_block; i++) mo_push(&e->midi.out, &b[i]);
+    for (int i = 0; i < e->midi.n_block; i++) mo_push(&e->midi.out, &b[i], midi_is_note_off(&b[i]) ? 0 : SP_VOICES);
     e->midi.n_block = 0;
 }
 

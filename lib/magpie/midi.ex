@@ -168,7 +168,12 @@ defmodule Magpie.Midi do
 
   defp event(s, :added, data), do: add(s, device(data))
   defp event(s, :removed, %{"id" => id}), do: %{s | devices: Map.delete(s.devices, id)}
-  defp event(s, :opened, %{"id" => id}), do: status(s, id, :open)
+  # Turned off while it was opening: it closes again.
+  defp event(s, :opened, %{"id" => id}) do
+    s = status(s, id, :open)
+    if Map.has_key?(s.devices, id), do: apply_policy(s, id), else: s
+  end
+
   defp event(s, :closed, %{"id" => id}), do: status(s, id, :closed)
 
   defp event(s, :open_failed, %{"id" => id} = data),
