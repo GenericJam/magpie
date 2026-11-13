@@ -96,7 +96,12 @@ static sp_midi_map *map_new(int in_channel, int out_channel, int clock) {
 static void set_map(sp_engine *e, sp_midi_map *m) { push(e, (sp_cmd){.type = SP_CMD_MIDI_MAP, .u.map = m}); }
 
 static void midi(sp_engine *e, uint8_t status, uint8_t d1, uint8_t d2, int64_t t_ns) {
-    push(e, (sp_cmd){.type = SP_CMD_MIDI, .u.midi = {status, d1, d2}, .t_ns = t_ns});
+    push(e, (sp_cmd){.type = SP_CMD_MIDI, .u.midi = {status, d1, d2, 0}, .t_ns = t_ns});
+}
+
+/* A message from input `src` (0: the Magpie port, 1..15: devices). */
+static void midi_from(sp_engine *e, uint8_t src, uint8_t status, uint8_t d1, uint8_t d2) {
+    push(e, (sp_cmd){.type = SP_CMD_MIDI, .u.midi = {status, d1, d2, src}});
 }
 
 static void trigger(sp_engine *e, int pad, int vel) {
@@ -355,6 +360,48 @@ static void test_table_change(void) {
     midi(e, 0x80, 41, 0, 0);
     render(e, 256, 256);
     CHECK(voices_on(e, 1) == 0, "a touched gate voice: the pad's note-off still releases it, through the table");
+
+    /* CC 123 on the channel a voice was started on, after the table moved to
+     * another channel: released. */
+    set_map(e, table_map(1, 38, -1));
+    render(e, 256, 256);
+    midi(e, 0x90, 38, 100, 0);
+    render(e, 256, 256);
+    set_map(e, table_map(2, 38, -1));
+    render(e, 256, 256);
+    midi(e, 0xB1, 123, 0, 0);
+    render(e, 256, 256);
+    bool kept = voices_on(e, 1) == 1;
+    midi(e, 0xB0, 123, 0, 0);
+    render(e, 256, 256);
+    CHECK(kept && voices_on(e, 1) == 0,
+          "CC 123: another channel's leaves a voice; its own channel's releases it after the table moved off it");
+
+    /* Inputs: a note-off from another input leaves a voice; the input gone
+     * releases what it held (a one-shot rings on). */
+    set_map(e, table_map(0, 38, 36));
+    render(e, 256, 256);
+    midi_from(e, 3, 0x90, 38, 100);
+    midi_from(e, 3, 0x90, 36, 100);
+    midi_from(e, 4, 0x90, 67, 100);
+    render(e, 256, 256);
+    midi_from(e, 4, 0x80, 38, 0);
+    render(e, 256, 256);
+    kept = voices_on(e, 1) == 1;
+    push(e, (sp_cmd){.type = SP_CMD_MIDI_GONE, .u.midi = {.src = 3}});
+    render(e, 256, 256);
+    CHECK(kept && voices_on(e, 1) == 0 && voices_on(e, 0) == 1 && voices_on(e, 13) == 1,
+          "another input's note-off leaves a voice; its input gone releases its gate voice, the one-shot rings, "
+          "another input's keys voice sounds");
+
+    /* No stream: a note-off still releases (applied offline, at once);
+     * a note-on doesn't play. */
+    midi_from(e, 4, 0x80, 67, 0);
+    midi_from(e, 4, 0x90, 38, 100);
+    sp_drain(e, false);
+    collect(e);
+    CHECK(voices_on(e, 13) == 0 && voices_on(e, 1) == 0, "no stream: a note-off releases its voice, a note-on plays "
+                                                         "nothing");
     set_map(e, NULL);
     render(e, 256, 256);
     free_engine(e);

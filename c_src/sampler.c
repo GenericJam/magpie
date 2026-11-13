@@ -157,6 +157,7 @@ enum {
     SP_CMD_RESET,
     SP_CMD_COUNT_IN,
     SP_CMD_MIDI,
+    SP_CMD_MIDI_GONE,
     SP_CMD_MIDI_MAP,
 };
 
@@ -183,6 +184,7 @@ typedef struct {
         } count_in;
         struct {
             uint8_t status, d1, d2; /* one message; t_ns is when it arrived */
+            uint8_t src;            /* the input it came from (MIDI_GONE: the input gone) */
         } midi;
         sp_midi_map *map; /* NULL: MIDI off */
     } u;
@@ -235,7 +237,8 @@ typedef struct {
     float level;          /* gain × envelope at the last frame, for stealing */
     uint64_t serial;      /* start order */
     bool from_midi;       /* started by a MIDI note … */
-    uint8_t in_ch, in_note; /* … this one on this channel: its note-off releases it, whatever the table says now */
+    uint8_t in_src, in_ch, in_note; /* … this one on this channel from this input: its note-off (or CC 120/123,
+                                       or the input going) releases it, whatever the table says now */
     uint8_t out_ch;       /* the channel its note-on went out on … */
     int16_t out_note;     /* … and the note; −1: nothing sent (or its note-off is out) */
 } sp_voice;
@@ -1248,9 +1251,9 @@ static void seq_started(sp_engine *e) {
 /* Note-on (or off) `c->u.midi.d1`: every pad the kit's table lists for it.
  * A keys pad plays the note chromatically, any other pad triggers; off
  * releases the played (touch, sequencer) voices of gate, loop and keys pads
- * (keys: that note's voice); MIDI's own go by midi_release_note. Voices started
- * here send no MIDI out and remember the channel and note that started
- * them. */
+ * (keys: that note's voice); MIDI's own go by midi_in_release. Voices
+ * started here send no MIDI out and remember the input, channel and note
+ * that started them. */
 static void midi_note(sp_engine *e, const sp_cmd *c, bool on) {
     int note = c->u.midi.d1 & 0x7F, vel = c->u.midi.d2 & 0x7F;
     uint64_t pads = e->midi.map->notes[note];
@@ -1268,6 +1271,7 @@ static void midi_note(sp_engine *e, const sp_cmd *c, bool on) {
             for (int i = 0; e->serial != before && i < SP_VOICES; i++) {
                 sp_voice *v = &e->voices[i];
                 if (v->state != SP_V_ON || v->serial != e->serial) continue;
+                v->in_src = c->u.midi.src;
                 v->in_ch = c->u.midi.status & 0x0F;
                 v->in_note = (uint8_t)note;
                 break;
@@ -1282,25 +1286,29 @@ static void midi_note(sp_engine *e, const sp_cmd *c, bool on) {
     }
 }
 
-/* A note-off on channel `ch` (any, the table may have changed since):
- * the gate, loop and keys voices its note-on started. */
-static void midi_release_note(sp_engine *e, uint8_t ch, uint8_t note) {
+/* Voices MIDI started from input `src` on channel `ch` (< 0: any) with
+ * `note` (< 0: any): gate, loop and keys voices fade as on their release;
+ * with `sound` every one is cut fast. */
+static void midi_release(sp_engine *e, int src, int ch, int note, bool sound) {
     for (int i = 0; i < SP_VOICES; i++) {
         sp_voice *v = &e->voices[i];
-        if (v->state != SP_V_ON || !v->from_midi || v->in_ch != ch || v->in_note != note) continue;
-        if (v->mode == SP_GATE || v->mode == SP_LOOP || v->mode == SP_KEYS) voice_release(e, v, v->release_frames);
-    }
-}
-
-/* CC 123 (all notes off): the voices MIDI started that a note-off would
- * release; CC 120 (all sound off): every voice MIDI started, fast. */
-static void midi_all_off(sp_engine *e, bool sound) {
-    for (int i = 0; i < SP_VOICES; i++) {
-        sp_voice *v = &e->voices[i];
-        if (v->state != SP_V_ON || !v->from_midi) continue;
+        if (v->state != SP_V_ON || !v->from_midi || v->in_src != src) continue;
+        if ((ch >= 0 && v->in_ch != ch) || (note >= 0 && v->in_note != note)) continue;
         if (sound) voice_release(e, v, cut_frames(e));
         else if (v->mode == SP_GATE || v->mode == SP_LOOP || v->mode == SP_KEYS) voice_release(e, v, v->release_frames);
     }
+}
+
+/* What in an incoming message releases voices MIDI started, by the input,
+ * channel and note that started them: not through the table or its channel
+ * filter (either may have changed since), and with no stream running too.
+ * A note-off: that note's; CC 123 (all notes off): the channel's; CC 120
+ * (all sound off): the channel's, fast. */
+static void midi_in_release(sp_engine *e, const sp_cmd *c) {
+    uint8_t st = c->u.midi.status, kind = st & 0xF0, d1 = c->u.midi.d1 & 0x7F;
+    if (st >= 0xF0) return;
+    if (kind == 0x80 || (kind == 0x90 && c->u.midi.d2 == 0)) midi_release(e, c->u.midi.src, st & 0x0F, d1, false);
+    else if (kind == 0xB0 && (d1 == 120 || d1 == 123)) midi_release(e, c->u.midi.src, st & 0x0F, -1, d1 == 120);
 }
 
 /* Following: the sequencer starts on the tick after Start / Continue, which
@@ -1571,14 +1579,13 @@ static void follow_realtime(sp_engine *e, const sp_cmd *c) {
     }
 }
 
-/* One incoming message, through the kit's table: notes on its channel,
- * CC 120 / 123, and with clock follow the clock and transport. A note-off
- * first reaches the voices its note started, past the table. */
+/* One incoming message: first what releases MIDI voices (midi_in_release),
+ * then through the kit's table: notes on its channel, and with clock follow
+ * the clock and transport. */
 static void midi_in(sp_engine *e, const sp_cmd *c) {
     const sp_midi_map *m = e->midi.map;
-    uint8_t st = c->u.midi.status, kind = st & 0xF0;
-    if (st < 0xF0 && (kind == 0x80 || (kind == 0x90 && c->u.midi.d2 == 0)))
-        midi_release_note(e, st & 0x0F, c->u.midi.d1 & 0x7F);
+    uint8_t st = c->u.midi.status;
+    midi_in_release(e, c);
     if (!m) return;
     if (st >= 0xF0) {
         if (m->clock == SP_CLOCK_FOLLOW) follow_realtime(e, c);
@@ -1591,9 +1598,6 @@ static void midi_in(sp_engine *e, const sp_cmd *c) {
         break;
     case 0x80:
         midi_note(e, c, false);
-        break;
-    case 0xB0:
-        if (c->u.midi.d1 == 120 || c->u.midi.d1 == 123) midi_all_off(e, c->u.midi.d1 == 120);
         break;
     }
 }
@@ -1841,10 +1845,18 @@ static void apply(sp_engine *e, const sp_cmd *c, bool live) {
         else e->click.beats = 0;
         break;
     case SP_CMD_MIDI:
+        /* With no stream (offline) only releases: a note held across a
+         * route change still ends. */
         if (live) {
             atomic_fetch_add_explicit(&e->midi.in_messages, 1, memory_order_relaxed);
             midi_in(e, c);
+        } else {
+            midi_in_release(e, c);
         }
+        break;
+    case SP_CMD_MIDI_GONE:
+        /* An input closed (unplugged, its port gone): what it held ends. */
+        midi_release(e, c->u.midi.src, -1, -1, false);
         break;
     case SP_CMD_MIDI_MAP:
         set_midi_map(e, c->u.map);

@@ -61,10 +61,11 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
     // Registered by magpie_audio.c. `source` picks the C parser (0: the port,
     // 1..15: an opened device's output ports, one each). A source gets a new,
     // higher `generation` when a port takes it, when it is given back and
-    // when the port's service is created (renew), and C hears of it
-    // (nativeActivate) before that port can deliver: C parses under the
-    // source's lock only the current generation's bytes, from a fresh parser
-    // (a closed port's thread may still deliver a last message).
+    // when the port's service is created or destroyed (renew), and C hears
+    // of it (nativeActivate) before that port can deliver: C parses under
+    // the source's lock only the current generation's bytes, from a fresh
+    // parser (a closed port's thread may still deliver a last message), and
+    // ends the voices the source's earlier port held (unplugged mid-note).
     @JvmStatic external fun nativeIn(source: Int, generation: Long, data: ByteArray, offset: Int, count: Int, timestamp: Long)
 
     @JvmStatic external fun nativeActivate(source: Int, generation: Long)
@@ -98,9 +99,11 @@ object MagpieMidi : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionP
         service = s
     }
 
+    // The port's last sender is gone too: what it held ends (renew).
     internal fun serviceDestroyed(s: MagpieMidiService) {
         if (service === s) {
             service = null
+            synchronized(sourceLock) { renew(0) }
             portStatus(0, 0)
         }
     }

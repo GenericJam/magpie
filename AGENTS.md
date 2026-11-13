@@ -498,8 +498,10 @@ passes through the BEAM.
   stamped with engine frames, follows an incoming clock.
 - **Rule:** a note plays every non-keys pad whose `midi_note` it is (any
   bank); unclaimed notes go to every keys pad (chromatic from its root);
-  note-off releases gate/loop/keys (a MIDI voice: by the channel and note
-  that started it, past table changes); CC 120/123 release MIDI voices.
+  note-off releases gate/loop/keys; a MIDI voice goes by the input,
+  channel and note that started it, past table changes and with no stream
+  running: its note-off, CC 123 (CC 120: fast) on its channel, or its
+  input closing (unplugged, port gone).
   Played voices (touch, sequencer) send note-on/off (one note open per
   channel and note; note-offs never dropped: they wait out a stream
   restart, which drops an unsent note-on with its note-off and sends a

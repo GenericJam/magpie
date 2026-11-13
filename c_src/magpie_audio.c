@@ -1630,13 +1630,49 @@ static struct {
 
 typedef struct {
     int64_t t_ns;
+    uint8_t src;
 } midi_ctx;
 
+/* A MIDI command for the renderer; with no stream rendering, the control
+ * path applies it now (only releases count then, see apply), or the
+ * stream being reopened does first. */
+static void midi_push_cmd(const sp_cmd *c) {
+    if (atomic_load(&E.running)) {
+        push_cmd(c);
+        return;
+    }
+    pthread_mutex_lock(&E.ctl);
+    ctl_push(c);
+    pthread_mutex_unlock(&E.ctl);
+}
+
+/* With no stream only what releases voices goes (a note-off, CC 120/123):
+ * a note held across a route change still ends. */
 static void midi_emit(void *ctx, mi_msg m) {
     atomic_fetch_add_explicit(&MI.received, 1, memory_order_relaxed);
-    if (!atomic_load(&E.running)) return;
-    sp_cmd c = {.type = SP_CMD_MIDI, .u.midi = {m.status, m.d1, m.d2}, .t_ns = ((midi_ctx *)ctx)->t_ns};
-    push_cmd(&c);
+    const midi_ctx *x = ctx;
+    sp_cmd c = {.type = SP_CMD_MIDI, .u.midi = {m.status, m.d1, m.d2, x->src}, .t_ns = x->t_ns};
+    uint8_t kind = m.status & 0xF0;
+    bool release = m.status < 0xF0 && (kind == 0x80 || (kind == 0x90 && m.d2 == 0) ||
+                                       (kind == 0xB0 && (m.d1 == 120 || m.d1 == 123)));
+    if (atomic_load(&E.running)) push_cmd(&c);
+    else if (release) midi_push_cmd(&c);
+}
+
+/* Under the source's lock: `generation` becomes current, from a fresh
+ * parser. True if it is newer: the port that had the source is done. */
+static bool source_renew_locked(midi_source *s, int64_t generation) {
+    if (generation <= s->generation) return false;
+    s->generation = generation;
+    s->parser = (mi_parser){0};
+    return true;
+}
+
+/* What the input that had `source` held ends; under the source's lock, so
+ * it goes before anything the new one sends. */
+static void source_gone(int source) {
+    sp_cmd c = {.type = SP_CMD_MIDI_GONE, .u.midi = {.src = (uint8_t)source}};
+    midi_push_cmd(&c);
 }
 
 /* MagpieMidi.nativeIn(source, generation, data, offset, count, timestamp): a
@@ -1655,14 +1691,12 @@ static void JNICALL native_in(JNIEnv *j, jclass cls, jint source, jlong generati
     (void)cls;
     if (source < 0 || source >= MIDI_SOURCES || count <= 0 || !data) return;
     int64_t now = now_ns();
-    midi_ctx ctx = {.t_ns = timestamp > now - 1000000000LL && timestamp < now + 1000000000LL ? timestamp : now};
+    midi_ctx ctx = {.t_ns = timestamp > now - 1000000000LL && timestamp < now + 1000000000LL ? timestamp : now,
+                    .src = (uint8_t)source};
     uint8_t buf[256];
     midi_source *s = &MI.sources[source];
     pthread_mutex_lock(&s->lock);
-    if (generation > s->generation) {
-        s->generation = generation;
-        s->parser = (mi_parser){0};
-    }
+    if (source_renew_locked(s, generation)) source_gone(source);
     for (jint done = 0; generation == s->generation && done < count;) {
         jint n = count - done > (jint)sizeof(buf) ? (jint)sizeof(buf) : count - done;
         (*j)->GetByteArrayRegion(j, data, offset + done, n, (jbyte *)buf);
@@ -1674,17 +1708,15 @@ static void JNICALL native_in(JNIEnv *j, jclass cls, jint source, jlong generati
 }
 
 /* MagpieMidi.nativeActivate(source, generation): from now on only that
- * generation's bytes are parsed on the source, from a fresh parser. */
+ * generation's bytes are parsed on the source, from a fresh parser; what
+ * the port that had it held ends. */
 static void JNICALL native_activate(JNIEnv *j, jclass cls, jint source, jlong generation) {
     (void)j;
     (void)cls;
     if (source < 0 || source >= MIDI_SOURCES) return;
     midi_source *s = &MI.sources[source];
     pthread_mutex_lock(&s->lock);
-    if (generation > s->generation) {
-        s->generation = generation;
-        s->parser = (mi_parser){0};
-    }
+    if (source_renew_locked(s, generation)) source_gone(source);
     pthread_mutex_unlock(&s->lock);
 }
 
