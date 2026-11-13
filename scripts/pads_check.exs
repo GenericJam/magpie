@@ -294,7 +294,8 @@ parse_frames = fn text ->
   |> Enum.take_while(&(&1 =~ ~r/^\d/))
   |> Enum.map(fn line ->
     v = line |> String.split(",") |> Enum.map(&(Integer.parse(&1) |> then(fn {n, _} -> n; :error -> 0 end)))
-    get = fn name -> Enum.at(v, cols[name]) end
+    # Older Androids (10 on the moto e) have no DisplayPresentTime: it reads nil.
+    get = fn name -> cols[name] && Enum.at(v, cols[name]) end
     completed = get.("FrameCompleted")
     present = get.("DisplayPresentTime")
 
