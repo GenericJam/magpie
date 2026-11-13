@@ -468,15 +468,16 @@ static void test_clock_send(void) {
 
 /* The master: ticks at `bpm` from time `t0` (ns), each arriving with a
  * uniform jitter of ±`jit_ms`; ticks drop_lo..drop_hi − 1, and those marked
- * in `lost`, are lost on the way. The engine hears frame f at CLOCK0 +
- * f/RATE. */
+ * in `lost`, are lost on the way; ticks stall_lo..stall_hi − 1 are held up
+ * by a stalled sender and go out together, stamped 50 µs apart from the
+ * last one's time. The engine hears frame f at CLOCK0 + f/RATE. */
 typedef struct {
     double t0, period_ns, jit_ms;
     int64_t k;          /* the next tick */
     double next_ns;     /* its nominal time */
     double change_ns;   /* from here at `bpm2` */
     double period2_ns;
-    int64_t drop_lo, drop_hi;
+    int64_t drop_lo, drop_hi, stall_lo, stall_hi;
     bool lost[1 << 14];
     double nominal[1 << 14]; /* nominal arrival of tick k */
 } master_t;
@@ -493,7 +494,7 @@ static void master_init(master_t *m, double t0, double bpm, double jit_ms) {
     m->jit_ms = jit_ms;
     m->k = 0;
     m->next_ns = t0;
-    m->drop_lo = m->drop_hi = -1;
+    m->drop_lo = m->drop_hi = m->stall_lo = m->stall_hi = -1;
     memset(m->lost, 0, sizeof(m->lost));
 }
 
@@ -503,7 +504,11 @@ static void follow_block(sp_engine *e, master_t *m) {
     double now = (double)heard_ns(e->frame - LAT);
     while (m->next_ns <= now) {
         if (m->k < (1 << 14)) m->nominal[m->k] = m->next_ns;
-        if ((m->k < m->drop_lo || m->k >= m->drop_hi) && !(m->k < (1 << 14) && m->lost[m->k]))
+        bool stalled = m->k >= m->stall_lo && m->k < m->stall_hi;
+        if (stalled && m->k == m->stall_hi - 1)
+            for (int64_t j = m->stall_lo; j < m->stall_hi; j++)
+                midi(e, 0xF8, 0, 0, (int64_t)(m->next_ns + 5e4 * (double)(j - m->stall_lo)));
+        else if (!stalled && (m->k < m->drop_lo || m->k >= m->drop_hi) && !(m->k < (1 << 14) && m->lost[m->k]))
             midi(e, 0xF8, 0, 0, (int64_t)(m->next_ns + m->jit_ms * 1e6 * unit()));
         m->k++;
         m->next_ns += m->next_ns >= m->change_ns ? m->period2_ns : m->period_ns;
@@ -790,28 +795,33 @@ static void test_follow_loss(void) {
     free_engine(e);
 
     /* Lost ticks soon after the fit restarts, in clusters, with more
-     * jitter; tempo drops to under a third. Ticks are offsets from the
-     * scenario's start (the tempo change, if any). Whatever happens, the
-     * ticks end numbered as the master's and the steps back on its grid. */
+     * jitter; tempo drops to under a third; a stalled sender. Ticks are
+     * offsets from the scenario's start (the tempo change, if any).
+     * Whatever happens, every step plays once, in order, and the ticks end
+     * numbered as the master's with the steps back on its grid. */
     static const struct {
         const char *what;
         double bpm, bpm2, jit, settle_s; /* bpm2 > 0: the master goes to it at the start */
         int run_at, run;                 /* ticks run_at .. run_at + run − 1 lost */
         int at[4];                       /* and these (0: none) */
+        int stall_at, stall;             /* ticks stall_at .. + stall − 1 go out together */
     } cases[] = {
-        {"two ticks lost two apart (gaps of 2, 2, then 1 tick)", 120, 0, 1, 4, 0, 0, {5, 7}},
-        {"four lost, every other tick", 120, 0, 1, 4, 0, 0, {5, 7, 9, 11}},
-        {"a 1 s dropout, then a tick lost 4 ticks after it", 120, 0, 1, 4, 5, 48, {57}},
-        {"120 → 130 bpm, a tick lost 3 ticks after the change", 120, 130, 1, 4, 0, 0, {3}},
-        {"120 → 130 bpm, a tick lost 8 ticks after the change", 120, 130, 1, 4, 0, 0, {8}},
-        {"jitter ±2 ms: a tick lost", 120, 0, 2, 4, 0, 0, {5}},
-        {"jitter ±2 ms: a 1 s dropout, then a tick lost 4 ticks after it", 120, 0, 2, 4, 5, 48, {57}},
-        {"150 → 45 bpm (gaps of 3.3 ticks)", 150, 45, 1, 5, 0, 0, {0}},
-        {"150 → 40 bpm (gaps of 3.75 ticks)", 150, 40, 1, 5, 0, 0, {0}},
+        {"two ticks lost two apart (gaps of 2, 2, then 1 tick)", 120, 0, 1, 4, 0, 0, {5, 7}, 0, 0},
+        {"four lost, every other tick", 120, 0, 1, 4, 0, 0, {5, 7, 9, 11}, 0, 0},
+        {"a 1 s dropout, then a tick lost 4 ticks after it", 120, 0, 1, 4, 5, 48, {57}, 0, 0},
+        {"120 → 130 bpm, a tick lost 3 ticks after the change", 120, 130, 1, 4, 0, 0, {3}, 0, 0},
+        {"120 → 130 bpm, a tick lost 8 ticks after the change", 120, 130, 1, 4, 0, 0, {8}, 0, 0},
+        {"jitter ±2 ms: a tick lost", 120, 0, 2, 4, 0, 0, {5}, 0, 0},
+        {"jitter ±2 ms: a 1 s dropout, then a tick lost 4 ticks after it", 120, 0, 2, 4, 5, 48, {57}, 0, 0},
+        {"150 → 45 bpm (gaps of 3.3 ticks)", 150, 45, 1, 5, 0, 0, {0}, 0, 0},
+        {"150 → 40 bpm (gaps of 3.75 ticks)", 150, 40, 1, 5, 0, 0, {0}, 0, 0},
+        {"a sender stalled a tick (gaps of 2, then 0 ticks)", 120, 0, 1, 4, 0, 0, {0}, 5, 2},
+        {"a sender stalled 3 ticks, twice, then a tick lost", 120, 0, 1, 4, 0, 0, {30}, 5, 4},
     };
     for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
         e = follow_run(&m, cases[ci].bpm, &k_start);
         int64_t base = m.k;
+        int first_ev = n_evs;
         m.jit_ms = cases[ci].jit;
         if (cases[ci].bpm2 > 0) {
             m.change_ns = m.next_ns;
@@ -820,11 +830,32 @@ static void test_follow_loss(void) {
         for (int i = 0; i < cases[ci].run; i++) m.lost[base + cases[ci].run_at + i] = true;
         for (int i = 0; i < 4; i++)
             if (cases[ci].at[i] > 0) m.lost[base + cases[ci].at[i]] = true;
-        for (int i = 0; i < 1600; i++) follow_block(e, &m);
+        if (cases[ci].stall > 0) {
+            m.stall_lo = base + cases[ci].stall_at;
+            m.stall_hi = m.stall_lo + cases[ci].stall;
+        }
+        bool second = cases[ci].stall > 2;
+        for (int i = 0; i < 1600; i++) {
+            follow_block(e, &m);
+            /* The second stall, 12 ticks after the first. */
+            if (second && m.k >= m.stall_hi + 12) {
+                m.stall_lo = m.k;
+                m.stall_hi = m.k + cases[ci].stall;
+                second = false;
+            }
+        }
+        bool in_order = true;
+        int last_step = -1;
+        for (int i = first_ev; i < n_evs; i++) {
+            if (evs[i].type != SP_EV_PLAYHEAD) continue;
+            if (last_step >= 0 && evs[i].a != (last_step + 1) % 16) in_order = false;
+            last_step = evs[i].a;
+        }
         worst = worst_from(&m, k_start, m.nominal[base] + cases[ci].settle_s * 1e9, &n);
         double bound = 0.5 + 0.5 * cases[ci].jit; /* as for lock above */
-        CHECK(e->midi.ticks == m.k && n > 5 && worst <= bound,
-              "%s: ticks numbered as the master's (%lld / %lld), %d steps from %.0f s on, worst %.3f ms (≤ %.1f)",
+        CHECK(in_order && e->midi.ticks == m.k && n > 5 && worst <= bound,
+              "%s: steps in order, ticks numbered as the master's (%lld / %lld), %d steps from %.0f s on, worst %.3f "
+              "ms (≤ %.1f)",
               cases[ci].what, (long long)e->midi.ticks, (long long)m.k, n, cases[ci].settle_s, worst, bound);
         free_engine(e);
     }
