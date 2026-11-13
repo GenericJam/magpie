@@ -25,6 +25,8 @@ defmodule Magpie.MixProject do
       # mix mob.icon renders the launcher icons with it.
       {:image, "~> 0.54", only: :dev, runtime: false},
       {:ecto_sqlite3, "~> 0.18"},
+      # Tests check kit files against design/kit.schema.json itself.
+      {:jsv, "~> 0.27.0", only: :test},
       # Code quality — Credo + ex_slop (catches AI-generated patterns
       # like blanket rescue, narrator docs, redundant Enum chains, etc).
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

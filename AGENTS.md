@@ -60,20 +60,26 @@ installed and no account; pairing only adds.
   extension come later.
 - **Pads use Mob's per-node multi-pointer `on_touch` (MOB-518)**, built
   into Mob first rather than a pad view of the app's own.
-- **Design companion files are coming from Kevin:** `family_style.ex`,
-  `magpie_style.ex`, `kit.schema.json` (+ `kits/dusty-breaks.kit.json`),
-  `protocol.md`, `creature.md`. Don't invent `Magpie.Style`, the kit format
-  or the pairing protocol before they arrive.
 
 ### Design references (read before building a screen)
 
-`design/HANDOFF.md` is the spec. `design/boards/*.dc.html` are the boards
-(unpacked from the designer's bundled `Magpie.html`; they render with
-JavaScript, so open them in a browser): measurements and colours only, not
-code to ship. "Not designed yet (ask before inventing)": kit save/load
-sheet, first run (mic permission, empty kit), the library's Kits tab, kit
-export/share, error states. `design/choir-coach-handoff.md` is the lessons
-note from the previous app.
+`design/HANDOFF.md` is the spec; read it first. Beside it:
+
+- `family_style.ex` (the family tokens, = FMutate's `style.ex`) and
+  `magpie_style.ex`: the designer's token files, ported in `Magpie.Style`.
+- `kit.schema.json` and `kits/dusty-breaks.kit.json`: the kit format,
+  implemented by `Magpie.Kit`.
+- `creature.md`: the magpie's geometry, moods and animation.
+- `protocol.md`: Magpie's part of the family protocol (later milestone).
+- `boards/*.dc.html`: the designer's source boards; `Magpie.html` is the
+  same boards bundled to render (open it in a browser). Measurements and
+  colours only, not code to ship. `boards/icon-tile.html` is the app icon
+  tile, extracted from the rendered Identity board.
+
+"Not designed yet (ask before inventing)": kit save/load sheet, first run
+(mic permission, empty kit), the library's Kits tab, kit export/share, error
+states. `design/choir-coach-handoff.md` is the lessons note from the
+previous app.
 
 | Screen | Board | Module (planned) |
 |---|---|---|
@@ -85,7 +91,7 @@ note from the previous app.
 | Pad settings (long-press) | `PadSheet` | sheet in `PadsScreen` |
 | Bus mode (portrait 4 × 4) | `Bus` | `Magpie.BusScreen` |
 | Library (the stash) | `Library` | `Magpie.LibraryScreen` |
-| Pair an app | (`Connect`, not in the bundle) | later |
+| Pair an app | `Connect` | later |
 
 ### App icon
 
@@ -95,6 +101,32 @@ note from the previous app.
 art at 60 % of the canvas for the Android adaptive foreground, so round
 launcher masks keep the whole nest. Regenerate every launcher icon with
 `mise exec -- mix run --no-start scripts/render_icon.exs`.
+
+## Shared modules (in place; extend, don't fork)
+
+- **`Magpie.Style`**: the token maps of `design/family_style.ex` and
+  `design/magpie_style.ex`, copied verbatim (hex strings) and converted to
+  ARGB at compile time; a test fails if either drifts from the design file.
+  `color(token)`, `pad_color(name)`, `pad_palette/0`, `pad_fill(name, :idle
+  | :loop | :playing)` (opaque, over `raised`), `bird(:awake | :asleep)`,
+  `space/1`, `edge_gutter/0` (28), `radius/1` (family; pads use
+  `pad().radius`, 14), `type/1`, `motion/0`, `pad/0`, `sequencer/0`,
+  `grid_for/2`, `velocity(y, height)` (127 at the top … 19 at the bottom),
+  `fixed_velocity/0`, `pitch_color/2` (ARGB; the family file returns
+  `{h, s, l}`), `hsl/3`, `alpha/2`, `blend/3`, `theme/0` (set in
+  `App.on_start`; fonts in `priv/fonts`: `:default` Inter, `:medium`,
+  `:semibold`, `:bold`, `:mono` JetBrains Mono, `:mono_semibold`,
+  `:mono_bold`, `:display` Bricolage Grotesque 800).
+- **`Magpie.Kit`**: `magpie.kit/1`. `load/1`, `decode(json | map) :: {:ok,
+  Kit} | {:error, [{path, message}]}` (every problem, as JSON paths),
+  `encode/1`, `to_json/1`, `pad_index(bank, slot)` (0..63) and
+  `bank_slot/1`. Structs `Kit` (banks `%{"A".."D" => %{slot => Pad}}`),
+  `Pad`, `Region` (seconds; `stop: nil` = to the end; the JSON key is
+  `end`), `Pattern` (lanes `%{slot => %{mute, steps}}`), `Step` (`step`,
+  `vel`, `tick` −12..12 at 96 PPQN, `note`). Tests validate encoded kits
+  against `design/kit.schema.json` with JSV, and check that every invalid
+  case the decoder rejects the schema rejects too. One rule beyond the
+  schema: `step < length`.
 
 ## Architecture (planned)
 

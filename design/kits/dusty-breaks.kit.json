@@ -1,0 +1,46 @@
+{
+  "format": "magpie.kit/1",
+  "id": "dusty-breaks",
+  "name": "Dusty Breaks",
+  "tempo": 96,
+  "swing": 0.54,
+  "snap": true,
+  "midi": { "in_channel": "all", "clock": "internal" },
+  "banks": [
+    {
+      "id": "A",
+      "pads": [
+        { "slot": 0, "name": "KICK", "color": "coral", "sample": { "id": "s_kick01" }, "midi_note": 36 },
+        { "slot": 1, "name": "SNARE", "color": "coral", "sample": { "id": "s_snare01" }, "midi_note": 38 },
+        { "slot": 2, "name": "HAT", "color": "amber", "sample": { "id": "s_hat01" }, "choke": 1, "midi_note": 42 },
+        { "slot": 3, "name": "OPEN HAT", "color": "amber", "sample": { "id": "s_ohat01" }, "choke": 1, "midi_note": 46 },
+        { "slot": 4, "name": "CLAP", "color": "pink", "sample": { "id": "s_clap01" }, "midi_note": 39 },
+        { "slot": 5, "name": "RIM", "color": "pink", "sample": { "id": "s_rim01" }, "midi_note": 37 },
+        { "slot": 6, "name": "HEY!", "color": "teal", "sample": { "id": "s_hey" }, "mode": "gate", "midi_note": 40 },
+        { "slot": 7, "name": "FM STAB", "color": "sky", "sample": { "id": "s_fmstab_c4" }, "midi_note": 41 },
+        { "slot": 8, "name": "CHOP 1", "color": "violet", "sample": { "id": "s_break96", "start": 0.0, "end": 0.48 }, "midi_note": 48 },
+        { "slot": 9, "name": "CHOP 2", "color": "violet", "sample": { "id": "s_break96", "start": 0.48, "end": 0.98 }, "choke": 2, "midi_note": 49 },
+        { "slot": 10, "name": "CHOP 3", "color": "violet", "sample": { "id": "s_break96", "start": 0.98, "end": 1.46 }, "choke": 2, "midi_note": 50 },
+        { "slot": 11, "name": "CHOP 4", "color": "violet", "sample": { "id": "s_break96", "start": 1.46, "end": 2.0 }, "choke": 2, "midi_note": 51 },
+        { "slot": 12, "name": "BREAK", "color": "lime", "sample": { "id": "s_break96" }, "mode": "loop", "midi_note": 52 },
+        { "slot": 13, "name": "PAD", "color": "cream", "sample": { "id": "s_glassbell", "fade_out_ms": 400 }, "mode": "keys", "midi_note": 60 }
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "id": "A1",
+      "bank": "A",
+      "length": 16,
+      "lanes": [
+        { "slot": 0, "steps": [{ "step": 0, "vel": 100 }, { "step": 4, "vel": 100 }, { "step": 8, "vel": 100 }, { "step": 10, "vel": 45 }, { "step": 12, "vel": 100 }] },
+        { "slot": 1, "steps": [{ "step": 4, "vel": 95 }, { "step": 12, "vel": 95 }, { "step": 15, "vel": 35 }] },
+        { "slot": 2, "steps": [{ "step": 0, "vel": 70 }, { "step": 2, "vel": 45 }, { "step": 4, "vel": 70 }, { "step": 6, "vel": 45 }, { "step": 8, "vel": 70 }, { "step": 10, "vel": 45 }, { "step": 12, "vel": 70 }] },
+        { "slot": 3, "steps": [{ "step": 14, "vel": 80 }] },
+        { "slot": 4, "steps": [{ "step": 12, "vel": 75 }] },
+        { "slot": 9, "steps": [{ "step": 3, "vel": 60 }, { "step": 7, "vel": 85 }, { "step": 11, "vel": 60 }] }
+      ]
+    }
+  ],
+  "meta": { "note": "Sample ids are placeholders; real ids are content hashes from the library." }
+}

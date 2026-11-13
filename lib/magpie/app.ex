@@ -29,6 +29,7 @@ defmodule Magpie.App do
       Ecto.Migrator.run(repo, migrations_dir(), :up, all: true)
     end)
 
+    Mob.Theme.set(Magpie.Style.theme())
     Mob.Screen.start_root(Magpie.HomeScreen)
     Mob.Dist.ensure_started(node: :"magpie_android@127.0.0.1", cookie: :mob_secret)
   end
