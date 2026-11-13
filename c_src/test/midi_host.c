@@ -1188,6 +1188,66 @@ static void test_follow_two(void) {
     free_engine(e);
 }
 
+/* ── Clock follow: a clock silent while stopped, restarted at a new tempo ── */
+
+/* A master that sends clock only while playing: 120 bpm, Stop, silent for
+ * `gap_s`, then Start (or song position 0 + Continue) at `bpm2`. The old
+ * line must not number the new tempo's ticks: the steps end on the new grid
+ * and the tempo shown is the new one. The jitter is seeded: at 240 bpm
+ * whether the old line took the new ticks for bursts depended on it. */
+static void follow_silent_run(double bpm2, double gap_s, bool cont, unsigned seed) {
+    static master_t m;
+    rng = seed;
+    sp_engine *e = new_engine();
+    sp_set_clock(e, 0, CLOCK0);
+    set_map(e, map_new(0, 1, SP_CLOCK_FOLLOW));
+    master_init(&m, (double)heard_ns(LAT + BLOCK), 120.0, 1.0);
+    midi(e, 0xFA, 0, 0, (int64_t)m.next_ns - 100000);
+    for (int i = 0; i < 600; i++) follow_block(e, &m);
+    midi(e, 0xFC, 0, 0, (int64_t)m.next_ns - 1000000);
+    m.next_ns = INFINITY;
+    for (int i = 0; i < (int)(gap_s * 200); i++) follow_block(e, &m);
+    int64_t k0 = m.k;
+    m.period_ns = m.period2_ns = 60e9 / (bpm2 * 24.0);
+    m.next_ns = (double)heard_ns(e->frame - LAT) + 7.3e6;
+    if (cont) midi(e, 0xF2, 0, 0, (int64_t)m.next_ns - 100000);
+    midi(e, cont ? 0xFB : 0xFA, 0, 0, (int64_t)m.next_ns - 100000);
+    reset_log();
+    for (int i = 0; i < 20 * 200; i++) follow_block(e, &m);
+    int n;
+    double worst = worst_from(&m, k0, m.nominal[k0] + 17e9, &n);
+    CHECK(n >= 6 && worst < 1.0 && fabs(last_tempo() - bpm2) < 0.5,
+          "120 bpm, Stop, %.1f s silent, %s at %.0f bpm: worst %.3f ms over the last 3 s (%d steps), %.2f bpm shown",
+          gap_s, cont ? "song position 0 + Continue" : "Start", bpm2, worst, n, last_tempo());
+    free_engine(e);
+}
+
+static void test_follow_silent(void) {
+    printf("clock follow: silent while stopped, restarted at a new tempo\n");
+    unsigned saved = rng;
+    follow_silent_run(60, 0.3, false, 1);
+    follow_silent_run(40, 1.0, false, 1);
+    follow_silent_run(240, 1.0, false, 3 * 7919u);
+    follow_silent_run(240, 5.0, false, 6 * 7919u);
+    follow_silent_run(60, 1.0, true, 1);
+    rng = saved;
+
+    /* The followed input gone while stopped: free, and from a fresh fit. */
+    static master_t m;
+    sp_engine *e = new_engine();
+    sp_set_clock(e, 0, CLOCK0);
+    set_map(e, map_new(0, 1, SP_CLOCK_FOLLOW));
+    master_init(&m, (double)heard_ns(LAT + BLOCK), 120.0, 1.0);
+    for (int i = 0; i < 200; i++) follow_block(e, &m);
+    bool had = e->midi.follow_src == 0 && e->midi.fit.n > 0;
+    push(e, (sp_cmd){.type = SP_CMD_MIDI_GONE, .u.midi = {.src = 0}});
+    sp_render(e, scratch, 1);
+    CHECK(had && e->midi.follow_src == -1 && e->midi.fit.n == 0 && e->midi.ticks == 0,
+          "the followed input gone while stopped: free (%d), its fit forgotten (%d ticks in it)", e->midi.follow_src,
+          e->midi.fit.n);
+    free_engine(e);
+}
+
 /* ── Notes out: one note open per channel and note; note-offs always out ── */
 
 static void test_out_pairing(void) {
@@ -1336,6 +1396,7 @@ int main(void) {
     test_follow();
     test_follow_loss();
     test_follow_two();
+    test_follow_silent();
     test_out_pairing();
     test_hits();
     printf(failures ? "FAILED: %d\n" : "passed: 0 failures\n", failures);

@@ -1314,12 +1314,18 @@ static void midi_in_release(sp_engine *e, const sp_cmd *c) {
     else if (kind == 0xB0 && (d1 == 120 || d1 == 123)) midi_release(e, c->u.midi.src, st & 0x0F, -1, d1 == 120);
 }
 
+static void follow_forget(sp_engine *e);
+
 /* Input `src` closed (unplugged, its port gone): the voices it started end
  * as on their note-offs, and a followed clock from it is free to be taken
- * by the next input that sends one. */
+ * by the next input that sends one: stopped, from a fresh fit (playing, the
+ * sequencer runs on as through a dropout, and the next input's ticks go on
+ * from where it is). */
 static void midi_input_gone(sp_engine *e, int src) {
     midi_release(e, src, -1, -1, false);
-    if (src == e->midi.follow_src) e->midi.follow_src = -1;
+    if (src != e->midi.follow_src) return;
+    e->midi.follow_src = -1;
+    if (!e->seq.playing) follow_forget(e);
 }
 
 /* The inputs gone (midi.gone) whose SP_CMD_MIDI_GONE the full command
@@ -1577,6 +1583,22 @@ static void follow_tick(sp_engine *e, double f) {
     }
 }
 
+/* Start or Continue after the followed clock fell silent for more than
+ * 3.5 ticks (a master that sends clock only while playing, its tempo maybe
+ * changed meanwhile): the ticks go on being counted but start a fresh line.
+ * The old fit would judge the new tempo's gaps as lost ticks or bursts and
+ * keep it off the grid. A clock running on while stopped keeps its line. */
+static void follow_after_silence(sp_engine *e, int64_t t_ns) {
+    if (e->midi.ticks == 0) return;
+    double kc, fc, P = e->midi.p_ref;
+    if (e->midi.fit.n >= 6) mi_fit_line(&e->midi.fit, &kc, &fc, &P);
+    if (heard_frame(e, t_ns) - e->midi.last_tick <= (P > 0 ? 3.5 * P : 0.5 * e->rate)) return;
+    mi_fit_reset(&e->midi.fit);
+    e->midi.n_held = 0;
+    e->midi.misses = 0;
+    e->midi.p_ref = 0;
+}
+
 /* Clock follow: ticks, Start, Continue (from the song position), Stop, from
  * one input: the last to start its transport (Start; song position or
  * Continue while stopped), else the first to send a tick or transport
@@ -1600,6 +1622,7 @@ static void follow_realtime(sp_engine *e, const sp_cmd *c) {
         break;
     case 0xFA:
         if (e->seq.playing) stop_sequencer(e);
+        follow_after_silence(e, c->t_ns);
         e->midi.armed = true;
         e->midi.arm_pos = 0;
         e->midi.spp = 0;
@@ -1617,6 +1640,7 @@ static void follow_realtime(sp_engine *e, const sp_cmd *c) {
                 e->midi.spp = (int)ceil((e->midi.arm_pos / 4 + (double)(k - e->midi.k0 + 1)) / 6.0);
                 e->midi.stop_k = -1;
             }
+            follow_after_silence(e, c->t_ns);
             e->midi.armed = true;
             e->midi.arm_pos = (double)e->midi.spp * SP_STEP;
         }
