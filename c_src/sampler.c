@@ -234,7 +234,8 @@ typedef struct {
     double gate_at;       /* sequencer position of an automatic release (a sequenced step's end); < 0 none */
     float level;          /* gain × envelope at the last frame, for stealing */
     uint64_t serial;      /* start order */
-    bool from_midi;       /* started by a MIDI note */
+    bool from_midi;       /* started by a MIDI note … */
+    uint8_t in_ch, in_note; /* … this one on this channel: its note-off releases it, whatever the table says now */
     uint8_t out_ch;       /* the channel its note-on went out on … */
     int16_t out_note;     /* … and the note; −1: nothing sent (or its note-off is out) */
 } sp_voice;
@@ -352,7 +353,8 @@ typedef struct {
         double last_tick; /* its heard frame */
         int64_t k0;       /* the tick the run started on */
         double arm_pos;   /* the position the tick after Start / Continue is */
-        int spp;          /* song position (16ths) for Continue */
+        int spp;          /* song position (16ths) for Continue … */
+        int64_t stop_k;   /* … unless a followed run stopped on this tick since (moved as held ticks settle); < 0 none */
         bool armed, following;
         int misses;       /* ticks in a row off the fitted line (signed: which way) */
         sp_held_tick held[SP_FOLLOW_HELD]; /* out of the fit until the next gap says what they were */
@@ -550,6 +552,7 @@ static void sp_init(sp_engine *e, int rate) {
     e->click.t = -1;
     atomic_store(&e->step_now, -1);
     e->midi.free_next = -1;
+    e->midi.stop_k = -1;
 }
 
 /* ── MIDI out (renderer) ──────────────────────────────────────────────────── */
@@ -586,7 +589,8 @@ static void voice_note_off(sp_engine *e, sp_voice *v, int64_t frame) {
  * or for a keys pad the note it plays (`played`). Another voice still
  * holding that note on that channel sends its note-off first (receivers
  * keep one note per channel and note: its later note-off would end this
- * one). Returns the note sent, −1 when nothing was. */
+ * one). Returns the note queued, −1 when nothing was (if the ring refuses
+ * it at the block's end, midi_unsent takes it back from the voice). */
 static int16_t midi_note_on(sp_engine *e, sp_voice *v, int pad, int played, int vel, int64_t frame) {
     const sp_midi_map *m = e->midi.map;
     if (!m || e->offline || m->out_note[pad] < 0) return -1;
@@ -1243,8 +1247,10 @@ static void seq_started(sp_engine *e) {
 
 /* Note-on (or off) `c->u.midi.d1`: every pad the kit's table lists for it.
  * A keys pad plays the note chromatically, any other pad triggers; off
- * releases gate, loop and keys pads (keys: that note's voice). Voices
- * started here send no MIDI out. */
+ * releases the played (touch, sequencer) voices of gate, loop and keys pads
+ * (keys: that note's voice); MIDI's own go by midi_release_note. Voices started
+ * here send no MIDI out and remember the channel and note that started
+ * them. */
 static void midi_note(sp_engine *e, const sp_cmd *c, bool on) {
     int note = c->u.midi.d1 & 0x7F, vel = c->u.midi.d2 & 0x7F;
     uint64_t pads = e->midi.map->notes[note];
@@ -1255,12 +1261,34 @@ static void midi_note(sp_engine *e, const sp_cmd *c, bool on) {
         bool keys = mode == SP_KEYS;
         if (on) {
             if (e->seq.playing) report_hit(e, pad, vel, keys ? note : e->pads[pad].root, c->t_ns);
+            uint64_t before = e->serial;
             if (voice_start(e, pad, vel, keys ? note : -1, -1, e->frame, SP_SRC_MIDI))
                 sp_emit(e, &(sp_event){.type = SP_EV_TRIGGERED, .pad = (uint8_t)pad, .b = 1, .frame = e->frame,
                                        .t_ns = c->t_ns});
+            for (int i = 0; e->serial != before && i < SP_VOICES; i++) {
+                sp_voice *v = &e->voices[i];
+                if (v->state != SP_V_ON || v->serial != e->serial) continue;
+                v->in_ch = c->u.midi.status & 0x0F;
+                v->in_note = (uint8_t)note;
+                break;
+            }
         } else if (mode == SP_GATE || mode == SP_LOOP || keys) {
-            release_pad_voices(e, pad, keys ? note : -1);
+            for (int i = 0; i < SP_VOICES; i++) {
+                sp_voice *v = &e->voices[i];
+                if (v->state != SP_V_ON || v->from_midi || v->pad != pad || (keys && v->note != note)) continue;
+                voice_release(e, v, v->release_frames);
+            }
         }
+    }
+}
+
+/* A note-off on channel `ch` (any, the table may have changed since):
+ * the gate, loop and keys voices its note-on started. */
+static void midi_release_note(sp_engine *e, uint8_t ch, uint8_t note) {
+    for (int i = 0; i < SP_VOICES; i++) {
+        sp_voice *v = &e->voices[i];
+        if (v->state != SP_V_ON || !v->from_midi || v->in_ch != ch || v->in_note != note) continue;
+        if (v->mode == SP_GATE || v->mode == SP_LOOP || v->mode == SP_KEYS) voice_release(e, v, v->release_frames);
     }
 }
 
@@ -1330,12 +1358,13 @@ static int64_t follow_pending(const sp_engine *e) {
 enum { SP_REFIT_NONE, SP_REFIT_KEEP_NEWEST, SP_REFIT_ALL };
 
 /* Settle the held ticks into the fit: `lost` numbers each by the gap
- * before it (the ticks lost there count; the run's first tick, if held,
- * moves with it), else they are counted. `refit`: keep the fit; start it
- * afresh from its newest tick (the tempo changed at the held ticks); or
- * from the held ticks alone (the tempo is unknown across a dropout). */
+ * before it (the ticks lost there count; the run's first tick and the tick
+ * it stopped on, if held, move with it), else they are counted. `refit`:
+ * keep the fit; start it afresh from its newest tick (the tempo changed at
+ * the held ticks); or from the held ticks alone (the tempo is unknown
+ * across a dropout). */
 static void follow_settle(sp_engine *e, bool lost, int refit) {
-    int64_t first = e->midi.ticks - e->midi.n_held + 1, shift = 0, k0 = e->midi.k0;
+    int64_t first = e->midi.ticks - e->midi.n_held + 1, shift = 0, k0 = e->midi.k0, stop_k = e->midi.stop_k;
     if (refit != SP_REFIT_NONE) {
         e->midi.p_ref = 0;
         int64_t kn = 0;
@@ -1348,6 +1377,7 @@ static void follow_settle(sp_engine *e, bool lost, int refit) {
         if (lost) {
             shift += e->midi.held[i].lost;
             if (k0 >= first + i) e->midi.k0 += e->midi.held[i].lost;
+            if (stop_k >= first + i) e->midi.stop_k += e->midi.held[i].lost;
         }
         mi_fit_add(&e->midi.fit, first + i + shift, e->midi.held[i].f);
     }
@@ -1509,34 +1539,47 @@ static void follow_realtime(sp_engine *e, const sp_cmd *c) {
         e->midi.armed = true;
         e->midi.arm_pos = 0;
         e->midi.spp = 0;
+        e->midi.stop_k = -1;
         break;
     case 0xFB:
         if (!e->seq.playing) {
+            /* No song position since a followed run stopped: the next 16th
+             * after the tick it stopped on (by then the clock running on
+             * may have settled the ticks held at Stop; those still held are
+             * taken as after lost ones, the likelier). */
+            if (e->midi.stop_k >= 0) {
+                int64_t k = e->midi.stop_k, first = e->midi.ticks - e->midi.n_held + 1;
+                for (int i = 0; i < e->midi.n_held && first + i <= e->midi.stop_k; i++) k += e->midi.held[i].lost;
+                e->midi.spp = (int)ceil((e->midi.arm_pos / 4 + (double)(k - e->midi.k0 + 1)) / 6.0);
+                e->midi.stop_k = -1;
+            }
             e->midi.armed = true;
             e->midi.arm_pos = (double)e->midi.spp * SP_STEP;
         }
         break;
     case 0xFC:
         e->midi.armed = false;
-        /* A Continue with no song position resumes from the next 16th
-         * (held ticks taken as after lost ones, the likelier). */
-        if (e->midi.following)
-            e->midi.spp =
-                (int)ceil((e->midi.arm_pos / 4 + (double)(e->midi.ticks + follow_pending(e) - e->midi.k0 + 1)) / 6.0);
+        if (e->midi.following) e->midi.stop_k = e->midi.ticks;
         if (e->seq.playing) stop_sequencer(e);
         break;
     case 0xF2:
-        if (!e->seq.playing) e->midi.spp = c->u.midi.d1 | (c->u.midi.d2 << 7);
+        if (!e->seq.playing) {
+            e->midi.spp = c->u.midi.d1 | (c->u.midi.d2 << 7);
+            e->midi.stop_k = -1;
+        }
         break;
     }
 }
 
 /* One incoming message, through the kit's table: notes on its channel,
- * CC 120 / 123, and with clock follow the clock and transport. */
+ * CC 120 / 123, and with clock follow the clock and transport. A note-off
+ * first reaches the voices its note started, past the table. */
 static void midi_in(sp_engine *e, const sp_cmd *c) {
     const sp_midi_map *m = e->midi.map;
+    uint8_t st = c->u.midi.status, kind = st & 0xF0;
+    if (st < 0xF0 && (kind == 0x80 || (kind == 0x90 && c->u.midi.d2 == 0)))
+        midi_release_note(e, st & 0x0F, c->u.midi.d1 & 0x7F);
     if (!m) return;
-    uint8_t st = c->u.midi.status;
     if (st >= 0xF0) {
         if (m->clock == SP_CLOCK_FOLLOW) follow_realtime(e, c);
         return;
@@ -1568,6 +1611,7 @@ static void set_midi_map(sp_engine *e, sp_midi_map *map) {
         }
         e->midi.armed = false;
         e->midi.ticks = 0;
+        e->midi.stop_k = -1;
         mi_fit_reset(&e->midi.fit);
         atomic_store_explicit(&e->midi.follow_bpm_milli, 0, memory_order_relaxed);
         e->midi.bpm_shown = 0;
@@ -1576,6 +1620,28 @@ static void set_midi_map(sp_engine *e, sp_midi_map *map) {
         e->midi.p_ref = 0;
     }
     if (!map || map->clock != SP_CLOCK_SEND) e->midi.free_next = -1;
+}
+
+/* The note-on at `i` in this block's list didn't get into the ring: it was
+ * never sent, so neither is its note-off. That is the first for its channel
+ * and note later in the list (any other voice's went before the note-on),
+ * dropped (len 0); else the voice holding the note has none open. */
+static void midi_unsent(sp_engine *e, int i) {
+    mo_event *b = e->midi.block;
+    uint8_t ch = b[i].b[0] & 0x0F, note = b[i].b[1];
+    for (int j = i + 1; j < e->midi.n_block; j++) {
+        if (midi_is_note_off(&b[j]) && (b[j].b[0] & 0x0F) == ch && b[j].b[1] == note) {
+            b[j].len = 0;
+            return;
+        }
+    }
+    for (int v = 0; v < SP_VOICES; v++) {
+        sp_voice *w = &e->voices[v];
+        if (w->state == SP_V_ON && w->out_note == note && w->out_ch == ch) {
+            w->out_note = -1;
+            return;
+        }
+    }
 }
 
 /* This block's MIDI out, sorted by frame (stable: a play's Start before its
@@ -1603,7 +1669,11 @@ static void midi_flush(sp_engine *e, int frames) {
         }
         b[j + 1] = x;
     }
-    for (int i = 0; i < e->midi.n_block; i++) mo_push(&e->midi.out, &b[i], midi_is_note_off(&b[i]) ? 0 : SP_VOICES);
+    for (int i = 0; i < e->midi.n_block; i++) {
+        if (b[i].len == 0) continue;
+        bool off = midi_is_note_off(&b[i]);
+        if (!mo_push(&e->midi.out, &b[i], off ? 0 : SP_VOICES) && b[i].kind == MO_NOTE && !off) midi_unsent(e, i);
+    }
     e->midi.n_block = 0;
 }
 

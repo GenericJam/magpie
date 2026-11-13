@@ -498,10 +498,12 @@ passes through the BEAM.
   stamped with engine frames, follows an incoming clock.
 - **Rule:** a note plays every non-keys pad whose `midi_note` it is (any
   bank); unclaimed notes go to every keys pad (chromatic from its root);
-  note-off releases gate/loop/keys; CC 120/123 release MIDI voices.
+  note-off releases gate/loop/keys (a MIDI voice: by the channel and note
+  that started it, past table changes); CC 120/123 release MIDI voices.
   Played voices (touch, sequencer) send note-on/off (one note open per
   channel and note; note-offs never dropped: they wait out a stream
-  restart); MIDI voices don't echo. Out channel = `in_channel` or 1.
+  restart; a note-on the full out ring refuses sends no note-off); MIDI
+  voices don't echo. Out channel = `in_channel` or 1.
   Clock `send`: tick every 4 seq ticks, SPP 0 + Start on play, Stop,
   free-running while stopped. `follow`: LS fit over 24 ticks (reset after
   two same-side misses > 3 ms), ticks numbered by time: a tick after a gap

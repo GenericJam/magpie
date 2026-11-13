@@ -293,6 +293,73 @@ static void test_notes_in(void) {
     free_engine(e);
 }
 
+/* A new table while MIDI voices sound: each is released by the note-off of
+ * the note and channel that started it, whatever the table says now. */
+static sp_midi_map *table_map(int in_channel, int gate_note, int drum_note) {
+    sp_midi_map *m = map_new(in_channel, 1, SP_CLOCK_INTERNAL);
+    m->notes[gate_note] = 1ull << 1;
+    if (drum_note >= 0) m->notes[drum_note] = 1ull << 0;
+    for (int n = 0; n < 128; n++)
+        if (!m->notes[n]) m->notes[n] = 1ull << 13;
+    return m;
+}
+
+static void test_table_change(void) {
+    printf("notes in: the table changes while voices sound\n");
+    sp_engine *e = new_engine();
+    load(e, 0, RATE * 10);
+    set_pad(e, 0, 0, SP_ONE_SHOT, 36, 0);
+    set_pad(e, 1, 0, SP_GATE, 38, 0);
+    set_pad(e, 13, 0, SP_KEYS, 60, 0);
+    set_map(e, table_map(1, 38, -1));
+    render(e, 256, 256);
+
+    midi(e, 0x90, 38, 100, 0);
+    render(e, 256, 256);
+    set_map(e, table_map(2, 38, -1));
+    render(e, 256, 256);
+    midi(e, 0x80, 38, 0, 0);
+    render(e, 256, 256);
+    CHECK(voices_on(e, 1) == 0, "a gate voice from channel 1, the table moved to channel 2: its channel-1 note-off "
+                                "releases it");
+
+    set_map(e, table_map(0, 38, -1));
+    render(e, 256, 256);
+    midi(e, 0x90, 67, 100, 0);
+    render(e, 256, 256);
+    set_map(e, table_map(0, 38, 67));
+    render(e, 256, 256);
+    midi(e, 0x80, 67, 0, 0);
+    render(e, 256, 256);
+    CHECK(voices_on(e, 13) == 0, "a keys note held, its note given to a drum pad: the note-off releases the keys voice");
+
+    midi(e, 0x90, 38, 100, 0);
+    render(e, 256, 256);
+    set_map(e, table_map(0, 41, -1)); /* the gate pad's midi_note changed */
+    render(e, 256, 256);
+    midi(e, 0x90, 38, 0, 0);
+    render(e, 256, 256);
+    CHECK(voices_on(e, 1) == 0, "a gate pad's note changed while it sounds: the old note's note-off releases it");
+
+    midi(e, 0x90, 41, 100, 0);
+    render(e, 256, 256);
+    midi(e, 0x82, 41, 0, 0);
+    render(e, 256, 256);
+    CHECK(voices_on(e, 1) == 1, "omni: a note-off on another channel leaves the voice its note started on channel 1");
+    midi(e, 0x80, 41, 0, 0);
+    render(e, 256, 256);
+    CHECK(voices_on(e, 1) == 0, "  its own channel's releases it");
+
+    trigger(e, 1, 100);
+    render(e, 256, 256);
+    midi(e, 0x80, 41, 0, 0);
+    render(e, 256, 256);
+    CHECK(voices_on(e, 1) == 0, "a touched gate voice: the pad's note-off still releases it, through the table");
+    set_map(e, NULL);
+    render(e, 256, 256);
+    free_engine(e);
+}
+
 /* ── Notes out ────────────────────────────────────────────────────────────── */
 
 static void test_notes_out(void) {
@@ -799,25 +866,59 @@ static void test_follow_loss(void) {
 
     /* Stop right after a tick held after a lost one, then Continue with no
      * song position: it resumes on the 16th after the master's last tick
-     * (the held tick taken as after the lost one). The lost tick is placed
+     * (the held tick taken as after the lost one), whether the clock running
+     * on has settled the held tick by then or not. The lost tick is placed
      * so that counting it or not changes that 16th. */
+    int want = 0;
+    const sp_event *cont = NULL;
+    for (int settle = 1; settle >= 0; settle--) {
+        e = follow_run(&m, 120.0, &k_start);
+        int64_t lost_k = m.k + 2;
+        while ((lost_k + 1 - k_start) % 6 != 0) lost_k++;
+        m.lost[lost_k] = true;
+        while (m.k < lost_k + 2) follow_block(e, &m);
+        midi(e, 0xFC, 0, 0, (int64_t)(m.next_ns - 1e6));
+        for (int i = 0; i < 40 * settle; i++) follow_block(e, &m);
+        int held_at_continue = e->midi.n_held;
+        want = (int)((lost_k + 2 - k_start + 5) / 6);
+        reset_log();
+        midi(e, 0xFB, 0, 0, (int64_t)m.next_ns);
+        for (int i = 0; i < 40; i++) follow_block(e, &m);
+        cont = NULL;
+        for (int i = 0; i < n_evs && !cont; i++)
+            if (evs[i].type == SP_EV_PLAYHEAD) cont = &evs[i];
+        CHECK(held_at_continue == 1 - settle && cont && cont->a == want % 16,
+              "Stop just after a tick held after a lost one, Continue %s: resumes at step %d (%d, the next 16th)",
+              settle ? "once the clock settled it" : "while it is held", cont ? cont->a : -1, want % 16);
+        free_engine(e);
+    }
+
+    /* Stop while ticks are held that turn out to be a slower tempo (the
+     * master goes from 120 to 60 bpm; Stop after the fourth slow gap, before
+     * the fifth says what they were): the stopped clock settles them as
+     * counted, and Continue with no song position resumes on the 16th after
+     * the master's last tick before Stop. The change is placed so that
+     * counting the four gaps as lost ticks changes that 16th. */
     e = follow_run(&m, 120.0, &k_start);
-    int64_t lost_k = m.k + 2;
-    while ((lost_k + 1 - k_start) % 6 != 0) lost_k++;
-    m.lost[lost_k] = true;
-    while (m.k < lost_k + 2) follow_block(e, &m);
+    while ((m.k + 5 - k_start) % 6 != 0) follow_block(e, &m);
+    int64_t change_k = m.k;
+    m.change_ns = m.next_ns;
+    m.period2_ns = 2 * m.period_ns;
+    while (m.k < change_k + 5) follow_block(e, &m);
+    int held_at_stop = e->midi.n_held;
     midi(e, 0xFC, 0, 0, (int64_t)(m.next_ns - 1e6));
-    for (int i = 0; i < 40; i++) follow_block(e, &m);
-    int want = (int)((lost_k + 2 - k_start + 5) / 6);
+    for (int i = 0; i < 100; i++) follow_block(e, &m);
+    want = (int)((change_k + 4 - k_start + 6) / 6);
     reset_log();
     midi(e, 0xFB, 0, 0, (int64_t)m.next_ns);
-    for (int i = 0; i < 40; i++) follow_block(e, &m);
-    const sp_event *cont = NULL;
+    for (int i = 0; i < 80; i++) follow_block(e, &m);
+    cont = NULL;
     for (int i = 0; i < n_evs && !cont; i++)
         if (evs[i].type == SP_EV_PLAYHEAD) cont = &evs[i];
-    CHECK(cont && cont->a == want % 16,
-          "Stop just after a tick held after a lost one, Continue: resumes at step %d (%d, the next 16th)",
-          cont ? cont->a : -1, want % 16);
+    CHECK(held_at_stop == SP_FOLLOW_HELD && cont && cont->a == want % 16,
+          "Stop with %d ticks held that the stopped clock shows were 120 → 60 bpm, Continue: resumes at step %d (%d, the "
+          "next 16th)",
+          held_at_stop, cont ? cont->a : -1, want % 16);
     free_engine(e);
 
     /* Lost ticks soon after the fit restarts, in clusters, with more
@@ -936,6 +1037,38 @@ static void test_out_pairing(void) {
           "a gate voice cut with no stream: its note-off goes out with the next block");
     free_engine(e);
 
+    /* The out queue full of other messages: a note-on that doesn't get in
+     * leaves its voice with no note open, so no note-off follows it
+     * (released in a later block, or in the same one). */
+    e = new_engine();
+    load(e, 0, RATE * 10);
+    set_pad(e, 1, 0, SP_GATE, 38, 0);
+    m = map_new(0, 1, SP_CLOCK_INTERNAL);
+    m->out_note[1] = 38;
+    set_map(e, m);
+    render(e, 100, 100);
+    mo_event fill = {.frame = 0, .len = 1, .kind = MO_CLOCK, .b = {0xF8}};
+    for (int same = 0; same < 2; same++) {
+        reset_log();
+        while (mo_push(&e->midi.out, &fill, SP_VOICES)) continue;
+        trigger(e, 1, 100);
+        if (same) release(e, 1);
+        sp_render(e, scratch, 100);
+        collect(e);
+        release(e, 1);
+        render(e, 100, 100);
+        CHECK(count_out(0x90) == 0 && count_out(0x80) == 0,
+              "out queue full: a gate's note-on refused, no note-off when it is released %s (%d on, %d off)",
+              same ? "in the same block" : "a block later", count_out(0x90), count_out(0x80));
+    }
+    reset_log();
+    trigger(e, 1, 100);
+    render(e, 100, 100);
+    release(e, 1);
+    render(e, 100, 100);
+    CHECK(count_out(0x90) == 1 && count_out(0x80) == 1, "  with room again, note-on and note-off");
+    free_engine(e);
+
     /* The out queue keeps its last places for note-offs. */
     static mo_ring r;
     memset(&r, 0, sizeof(r));
@@ -985,6 +1118,7 @@ static void test_hits(void) {
 int main(void) {
     test_parser();
     test_notes_in();
+    test_table_change();
     test_notes_out();
     test_clock_send();
     test_follow();
