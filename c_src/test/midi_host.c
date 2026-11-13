@@ -1079,6 +1079,26 @@ static void test_out_pairing(void) {
     int offs = 0;
     while (mo_push(&r, &off, 0)) offs++;
     CHECK(in == MO_RING - SP_VOICES && offs == SP_VOICES, "a full out queue: %d ticks in, then still %d note-offs", in, offs);
+
+    /* A stream restart: what an earlier stream left in the queue goes on as
+     * the notes whose other half went out. */
+    memset(&r, 0, sizeof(r));
+    const mo_event left[] = {
+        {.len = 3, .kind = MO_NOTE, .b = {0x80, 40, 64}},  /* its note-on went out: goes */
+        {.len = 3, .kind = MO_NOTE, .b = {0x90, 36, 100}}, /* never out … */
+        tick,
+        {.len = 3, .kind = MO_NOTE, .b = {0x80, 36, 64}},  /* … nor its note-off */
+        {.len = 3, .kind = MO_NOTE, .b = {0x91, 36, 100}}, /* another channel, still held: goes */
+        {.len = 3, .kind = MO_NOTE, .b = {0x90, 38, 100}}, /* still held: goes */
+    };
+    for (size_t i = 0; i < sizeof(left) / sizeof(left[0]); i++) mo_push(&r, &left[i], 0);
+    static mo_event stale[MO_RING];
+    int n_stale = mo_take_stale(&r, stale);
+    CHECK(n_stale == 3 && stale[0].b[0] == 0x80 && stale[0].b[1] == 40 && stale[1].b[0] == 0x91 &&
+              stale[2].b[0] == 0x90 && stale[2].b[1] == 38,
+          "a stream restart: an unsent note-on and its note-off are dropped; a sent one's note-off and a held "
+          "voice's note-on go (%d)",
+          n_stale);
 }
 
 /* ── MIDI hits while playing ──────────────────────────────────────────────── */

@@ -193,3 +193,28 @@ MI_UNUSED static bool mo_pop(mo_ring *r, mo_event *ev) {
     mo_drop(r);
     return true;
 }
+
+/* What an earlier stream left in the queue, taken into `out` (MO_RING
+ * places): the notes whose other half went out. A note-off whose note-on
+ * is still here was never sounding for the receiver: neither goes. A
+ * note-on with no note-off after it belongs to a voice still holding the
+ * note: it goes, late, so the voice's note-off has its note-on. A
+ * note-off whose note-on went out goes. Clock and transport go stale.
+ * Returns how many. */
+MI_UNUSED static int mo_take_stale(mo_ring *r, mo_event *out) {
+    int n = 0;
+    mo_event ev;
+    while (mo_pop(r, &ev)) {
+        if (ev.kind != MO_NOTE) continue;
+        bool off = (ev.b[0] & 0xF0) == 0x80;
+        int last = n - 1;
+        while (last >= 0 && !(((out[last].b[0] ^ ev.b[0]) & 0x0F) == 0 && out[last].b[1] == ev.b[1])) last--;
+        if (off && last >= 0 && (out[last].b[0] & 0xF0) != 0x80) {
+            memmove(&out[last], &out[last + 1], (size_t)(n - last - 1) * sizeof(mo_event));
+            n--;
+        } else {
+            out[n++] = ev;
+        }
+    }
+    return n;
+}

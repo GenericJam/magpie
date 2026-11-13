@@ -1618,7 +1618,7 @@ static struct {
     pthread_t out;
     bool out_started;
     _Atomic bool out_run;
-    /* Note-offs left in the out queue by an earlier stream (midi_start_locked
+    /* Notes left in the out queue by an earlier stream (midi_start_locked
      * fills it, the new thread sends it). */
     mo_event stale[MO_RING];
     int n_stale;
@@ -1640,15 +1640,16 @@ static void midi_emit(void *ctx, mi_msg m) {
 }
 
 /* MagpieMidi.nativeIn(source, generation, data, offset, count, timestamp): a
- * receiver's thread. Kotlin gives each port that takes a source a higher
- * generation than the one before it. Under the source's lock, a newer
- * generation starts a fresh parser (no running status or SysEx left by the
- * port that had the source before) and an older one's bytes are dropped (a
- * closed port's thread delivering a last message after its source was taken
- * again). So two threads never parse on one source at once, and one port's
- * bytes never land in another's stream. A timestamp of 0 (senders that
- * don't stamp) or more than a second off isn't System.nanoTime: the message
- * counts as arriving now. */
+ * receiver's thread. Kotlin gives a source a new, higher generation when a
+ * port takes it, when it is given back and when the Magpie port's service
+ * is created, and tells C (nativeActivate) before the port can deliver.
+ * Under the source's lock, a newer generation starts a fresh parser (no
+ * running status or SysEx left by the port that had the source before) and
+ * an older one's bytes are dropped (a closed port's thread delivering a
+ * last message). So two threads never parse on one source at once, and one
+ * port's bytes never land in another's stream. A timestamp of 0 (senders
+ * that don't stamp) or more than a second off isn't System.nanoTime: the
+ * message counts as arriving now. */
 static void JNICALL native_in(JNIEnv *j, jclass cls, jint source, jlong generation, jbyteArray data, jint offset,
                               jint count, jlong timestamp) {
     (void)cls;
@@ -1668,6 +1669,21 @@ static void JNICALL native_in(JNIEnv *j, jclass cls, jint source, jlong generati
         if (jni_failed(j)) break;
         mi_parse(&s->parser, buf, n, midi_emit, &ctx);
         done += n;
+    }
+    pthread_mutex_unlock(&s->lock);
+}
+
+/* MagpieMidi.nativeActivate(source, generation): from now on only that
+ * generation's bytes are parsed on the source, from a fresh parser. */
+static void JNICALL native_activate(JNIEnv *j, jclass cls, jint source, jlong generation) {
+    (void)j;
+    (void)cls;
+    if (source < 0 || source >= MIDI_SOURCES) return;
+    midi_source *s = &MI.sources[source];
+    pthread_mutex_lock(&s->lock);
+    if (generation > s->generation) {
+        s->generation = generation;
+        s->parser = (mi_parser){0};
     }
     pthread_mutex_unlock(&s->lock);
 }
@@ -1721,6 +1737,7 @@ static bool midi_bind(JNIEnv *j) {
         if (cls) {
             JNINativeMethod natives[] = {
                 {"nativeIn", "(IJ[BIIJ)V", (void *)native_in},
+                {"nativeActivate", "(IJ)V", (void *)native_activate},
                 {"nativeEvent", "(Ljava/lang/String;[B)V", (void *)native_event},
             };
             MI.attach = static_method(j, cls, "attach", "()V");
@@ -1732,7 +1749,7 @@ static bool midi_bind(JNIEnv *j) {
             MI.ble_connect = static_method(j, cls, "bleConnect", "(Ljava/lang/String;)Ljava/lang/String;");
             MI.ble_disconnect = static_method(j, cls, "bleDisconnect", "(Ljava/lang/String;)V");
             if (MI.attach && MI.send && MI.devices && MI.open && MI.close && MI.ble_scan && MI.ble_connect &&
-                MI.ble_disconnect && (*j)->RegisterNatives(j, cls, natives, 2) == 0 && !jni_failed(j)) {
+                MI.ble_disconnect && (*j)->RegisterNatives(j, cls, natives, 3) == 0 && !jni_failed(j)) {
                 MI.cls = (jclass)(*j)->NewGlobalRef(j, cls);
                 ok = MI.cls != NULL;
             }
@@ -1864,19 +1881,17 @@ static void *midi_out_main(void *arg) {
 }
 
 /* Bind MIDI and start the sending thread. What is left in the out queue
- * from an earlier stream is stale: its note-offs go out first, at once (a
- * note-on that went out keeps its note-off), the rest is dropped. Caller
- * holds E.lock; the queue has no consumer until the thread starts. */
+ * from an earlier stream is stale: the notes whose other half went out go
+ * first, at once (mo_take_stale: a note-on that went out keeps its note-off,
+ * a voice still holding its note gets its note-on), the rest is dropped.
+ * Caller holds E.lock; the queue has no consumer until the thread starts. */
 static void midi_start_locked(void) {
     bool attached;
     JNIEnv *j = midi_env(&attached);
     if (!j) return;
     jni_done(attached);
     if (MI.out_started) return;
-    mo_event ev;
-    MI.n_stale = 0;
-    while (mo_pop(&SP.midi.out, &ev))
-        if (midi_is_note_off(&ev)) MI.stale[MI.n_stale++] = ev;
+    MI.n_stale = mo_take_stale(&SP.midi.out, MI.stale);
     atomic_store(&MI.out_run, true);
     MI.out_started = pthread_create(&MI.out, NULL, midi_out_main, NULL) == 0;
     if (!MI.out_started) {

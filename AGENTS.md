@@ -502,8 +502,9 @@ passes through the BEAM.
   that started it, past table changes); CC 120/123 release MIDI voices.
   Played voices (touch, sequencer) send note-on/off (one note open per
   channel and note; note-offs never dropped: they wait out a stream
-  restart; a note-on the full out ring refuses sends no note-off); MIDI
-  voices don't echo. Out channel = `in_channel` or 1.
+  restart, which drops an unsent note-on with its note-off and sends a
+  held voice's late; a note-on the full out ring refuses sends no
+  note-off); MIDI voices don't echo. Out channel = `in_channel` or 1.
   Clock `send`: tick every 4 seq ticks, SPP 0 + Start on play, Stop,
   free-running while stopped. `follow`: LS fit over 24 ticks (reset after
   two same-side misses > 3 ms), ticks numbered by time: a tick after a gap
@@ -513,8 +514,10 @@ passes through the BEAM.
   so losses, clusters and dropouts keep the grid; position steered onto
   the fit half a beat ahead; downbeat late by the write-ahead, then on the
   master's grid. Kotlin: one C parser per output port, under its source's
-  lock; a port that takes a reused source has a higher generation, which
-  resets the parser and drops the closed port's late bytes.
+  lock; a source gets a new generation when a port takes it, it is given
+  back or the port's service is created, made current in C
+  (`nativeActivate`) before the port delivers: a fresh parser, and the
+  closed port's late bytes dropped.
 - **Elixir:** `Magpie.Midi.Map.config/1` / `route/2` (the table and the
   rule), `Engine.set_midi/1` (KitSession pushes it on every kit change),
   `KitSession.set_midi(%{in_channel, clock})`, `Magpie.Midi` (devices:
