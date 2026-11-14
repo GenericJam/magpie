@@ -567,42 +567,56 @@ through the BEAM.
 
 ### Measured (moto e 2020, Android 10, `scripts/midi_check.exs`)
 
-Stream 48 kHz, 240-frame bursts, output latency 33–36 ms. All through the
-"Magpie" port (`dumpsys midi`: 1 input, 1 output) from another process.
-Ranges are over two runs.
+Through mob_midi (three runs: two on mob_midi#6's head 4e7437d, one on
+Hex 0.3.0 with mob 0.9.30, the same mob_midi code). Stream 48 kHz,
+240-frame bursts, output latency 35.9–36.8 ms. All through Magpie's device
+(`dumpsys midi`: "Magpie", 1 input, 1 output, service
+`io.mob.midi.MobMidiDeviceService`) from another process. "Before": the
+Kotlin plugin (two runs).
 
-- **Notes in:** 36 note-ons + 36 note-offs (notes 36/38/42/46 and 60/64
-  for a keys pad) → 72 received, 72 applied, voice starts exactly as
-  mapped (6 per drum pad, 12 on the keys pad); channel 2 with
-  `in_channel` 1: nothing. In → heard (the sender's timestamp → the first
-  frame heard) p50 33.8–34.7 ms, p95 33.9–35.0 ms: the output latency, as
-  a touch (NIF call → heard p50 33.7–34.4 ms).
-- **Notes out:** 20 touches → 20 note-ons + 20 note-offs on the pads'
-  notes (keys pad: its root); each stamped with the frame heard (touch call
-  → stamp p50 33.9–34.4 ms = the trigger latency). Stamp → arrival at the
-  other process p50 0.6 ms, p95 1.2–1.8 ms; the sending thread calls send
-  0.23–0.29 ms (p50) after the stamp (`out_late_us` p95 0.4–0.7 ms, max
-  ~1 ms).
-- **Clock send** (120 bpm, 12 s): 673 ticks, none dropped. Stamps are the
-  frames' heard times through the output timestamp, so they carry its
-  noise: spacing − period p95 0.17 ms, max 0.58 ms. Arrival spacing at the
-  other process rms 0.28–0.37 ms (worst 1.7 ms); arrival − stamp p50
-  0.7–0.9 ms, p95 1.8–2.0 ms. SPP 0 + Start + the first tick on one stamp,
-  Stop; the clock runs on while stopped. Sequenced notes: 33 on, 33 off,
-  every note-on stamped exactly on a tick (0 µs).
+- **Notes in:** 72 sent, 72 received, 72 applied, voice starts exactly as
+  mapped (6 per drum pad, 12 on the keys pad); channel 2 with `in_channel`
+  1: nothing. In → heard p50 34.5–37.2 ms, p95 36.6–39.4 ms, against a
+  touch's NIF call → heard p50 34.0–34.7 ms in the same runs: +0.4 to
+  +2.8 ms (before: 33.8–34.7 vs 33.7–34.4, +0.1 to +0.3; mob_midi's own
+  sender → sink p50 is 1.1–1.3 ms on this phone).
+- **Notes out:** 20 touches → 20 note-ons + 20 note-offs; touch call →
+  stamp p50 34.1–34.9 ms (the trigger latency). Stamp → arrival p50
+  1.16–1.25 ms, p95 2.5–2.8 ms (before 0.6, 1.2–1.8): mob_midi's
+  per-port dispatch thread is one more hop. The sending thread calls
+  `mob_midi_send` 0.26–0.29 ms (p50) after the stamp (before 0.23–0.29).
+- **Clock send** (120 bpm, 12 s): 672–673 ticks, none dropped. Stamp
+  spacing − period p95 0.16–0.18 ms. Arrival spacing rms 0.56–0.82 ms
+  (before 0.28–0.37), worst ±1.6–2.0 ms, one run ±7 ms around a 10 ms
+  sending-thread wake-up (`out_late_us` max); arrival − stamp p50
+  1.69–1.79 ms, p95 2.26–2.40 ms (before 0.7–0.9, 1.8–2.0). SPP 0 + Start
+  + the first tick on one stamp, Stop; the clock runs on while stopped.
+  Sequenced notes: 33 on, 33 off, every note-on exactly on a tick (0 µs).
+- **Clock in** (192 ticks with Start / Stop / SPP + Continue): applied,
+  ignored (not playing, no steps, nothing out).
+- **A listener that stops reading** (240 bpm clock send, two pads on every
+  step, the probe blocked 15 s): 1369–1370 messages refused, one queue
+  discard, 2 owed note-offs sent once it read again; 1000–1001 messages
+  arrived after, 172 note-ons and 174 note-offs, no note left sounding;
+  the output stopped refusing. (Before, the Kotlin `send` blocked the
+  sending thread instead.)
+- **A sender that leaves mid-note** (the probe killed 1 s after a note-on
+  to a loop pad): the voice ended at once (`midi_sources_changed`); with
+  the note-off sent, it ended on the note-off.
 - **Clock follow:** numbers from the removed heuristic implementation
   (branch `midi-follow-heuristic`), not what ships: locked from step 4,
   120 bpm rms 0.11–0.13 ms.
-- **Not measured:** USB and Bluetooth devices (no hardware here; the code
-  paths are Kotlin only, covered by the Fake on the Elixir side).
+- **Not measured:** USB and Bluetooth devices (no hardware here; mob_midi
+  hasn't verified them either), `open_input(port: :all)` on a device other
+  than Magpie's own (covered by the Fake on the Elixir side).
 
 ### Measured (MobDevFix_arm emulator, Android 15, `scripts/midi_check.exs`)
 
-At b72ab65 (two runs), 069853c and 7f30330 (one each), no phone being
-free: stream 48 kHz, 960-frame bursts, output latency 109–121 ms, so
-absolute latencies are the emulator's; one run had host stalls (its
-outliers are left out below and noted). Same port (`dumpsys midi`: 1
-input, 1 output).
+With the Kotlin plugin (before mob_midi), at b72ab65 (two runs), 069853c
+and 7f30330 (one each), no phone being free: stream 48 kHz, 960-frame
+bursts, output latency 109–121 ms, so absolute latencies are the
+emulator's; one run had host stalls (its outliers are left out below and
+noted). Same port (`dumpsys midi`: 1 input, 1 output).
 
 - **Notes in:** 72 sent, 72 applied, voice starts exactly as mapped;
   channel 2 with `in_channel` 1: nothing. In → heard p50 112–118 ms (the
