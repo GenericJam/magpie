@@ -75,8 +75,9 @@ defmodule Magpie.MidiScreenTest do
   end
 
   test "a kit saying follow shows internal (what plays); a tap goes to send" do
+    kit = KitSession.snapshot().kit
     stop_supervised!(KitSession)
-    start_session!(%{KitSession.snapshot().kit | midi: %{in_channel: :all, clock: :follow}})
+    start_session!(%{kit | midi: %{in_channel: :all, clock: :follow}})
     view = mount()
     assert "internal" in texts(view)
     _view = press(view, :clock)
