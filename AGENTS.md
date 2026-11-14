@@ -484,16 +484,32 @@ starts the take on the frame captured when its downbeat is heard.
 
 ## MIDI
 
-Why it is built this way: `decisions/2026-11-13-midi.md`. No MIDI byte
-passes through the BEAM.
+Why it is built this way: `decisions/2026-11-13-midi.md` (and the move to
+mob_midi: `decisions/2026-11-13-midi-on-mob-midi.md`). No MIDI byte passes
+through the BEAM.
 
-- **Native:** `plugins/magpie_midi` (Kotlin only, `MagpieMidi.kt`): the
-  `MagpieMidiService` port "Magpie" (one input, one output), the device
-  watcher, open/close of devices (all output ports in, input port 0 out),
-  Bluetooth-MIDI scan/connect (`:midi_bluetooth` capability). The
-  `magpie_audio` NIF registers its natives (`nativeIn`, `nativeEvent`) and
-  starts a sending thread in `open/1`. `c_src/midi.c` (plain C): parser,
-  the out ring. `c_src/sampler.c` "MIDI in/out": the renderer maps notes
+- **Devices and ports: mob_midi** (`~> 0.3.0` from Hex, signed with the
+  shared key and trusted in `mob.exs`). Magpie's own
+  device "Magpie" (one input, one output) is declared by `mix
+  mob_midi.gen.virtual_device` from `config :mob_midi, :virtual_device`
+  (`res/xml/mob_midi_device.xml` + a fenced `<service>` for
+  `io.mob.midi.MobMidiDeviceService` in the manifest, both committed; see
+  "Working on it" for why `--check` isn't in the gate). Bluetooth-MIDI scan/connect and the
+  `:midi_bluetooth` capability are mob_midi's too.
+- **Native:** `c_src/magpie_audio.c` includes
+  `deps/mob_midi/priv/include/mob_midi.h`. In: `midi_sink`, registered
+  with `mob_midi_set_sink` at NIF load, gets every input opened with
+  `deliver: :native` as (source 1..63, generation, bytes, timestamp) on
+  mob_midi's receive thread; one parser per source, a new generation is a
+  fresh parser and ends what the old port held; `midi_sources_changed/0`
+  (from `Magpie.Midi` when a device closes or goes, or another app starts
+  or stops sending into Magpie's device) ends what closed sources held
+  (`mob_midi_source_info`). Out: the sending thread (started in `open/1`)
+  sleeps until a message's frame is heard and calls `mob_midi_send(handle,
+  bytes, len, t)` per output (`midi_outputs/1`: Magpie's own output and
+  each opened device's input port 0). `c_src/midi_out.c`: what each output
+  took, refused and is owed (below). `c_src/midi.c` (plain C): parser, the
+  out ring. `c_src/sampler.c` "MIDI in/out": the renderer maps notes
   through the kit's table, sends notes/clock stamped with engine frames.
 - **Rule:** a note plays every non-keys pad whose `midi_note` it is (any
   bank); unclaimed notes go to every keys pad (chromatic from its root);
@@ -514,29 +530,40 @@ passes through the BEAM.
   saying it loads, round-trips and plays on the internal clock
   (`Midi.Map.config/1` compiles it to `:internal`); `KitSession.set_midi/1`
   refuses `:follow` and `Magpie.MidiScreen` offers internal ↔ send.
-  Kotlin: one C parser per output port, under its source's
-  lock; a source gets a new generation when a port takes it, it is given
-  back or the port's service is created, made current in C
-  (`nativeActivate`) before the port delivers: a fresh parser, and the
-  closed port's late bytes dropped.
+  A port whose listener stops reading fills mob_midi's queue (256 chunks):
+  the send is refused (`MOB_MIDI_ERR_QUEUE_FULL`) and so is every send
+  until it has drained. At the first refusal the output's queue is
+  discarded (late notes and clock, like the late ticks dropped below);
+  note-offs it refused or that the discard may have dropped are owed and go
+  first once it takes sends again (retried every 10 ms with nothing else
+  to send), except for notes held again since (their own note-off ends
+  them); a refused note-on owes nothing. Nobody listening to Magpie's own
+  output (`MOB_MIDI_ERR_NO_LISTENER`): nothing owed.
 - **Elixir:** `Magpie.Midi.Map.config/1` / `route/2` (the table and the
   rule), `Engine.set_midi/1` (KitSession pushes it on every kit change),
-  `KitSession.set_midi(%{in_channel, clock})`, `Magpie.Midi` (devices:
-  USB/BLE auto-open, other apps' ports on request, choices in `Mob.State`;
-  `subscribe/1`, `set_open/2`, `ble_scan/0`, `ble_connect/1`),
-  `Engine.state/0` `midi`, `info/0` `midi` stats. `Magpie.MidiScreen`
-  (plain, not designed) behind the magpie button.
+  `KitSession.set_midi(%{in_channel, clock})`, `Magpie.Midi` (devices
+  through `MobMidi`, `Magpie.Midi.Fake` in tests: USB/BLE auto-open
+  (`open_input(port: :all, deliver: :native)` + `open_output` port 0),
+  other apps' ports on request, choices in `Mob.State`; `open_virtual("Magpie",
+  deliver: :native)`; `subscribe/1`, `set_open/2`, `ble_scan/0`,
+  `ble_connect/1`; it hands the engine the output handles), `Engine.state/0`
+  `midi`, `info/0` `midi` stats (`refused`, `discards`, `offs_owed`,
+  `outputs`, `refusing` besides the counts and latencies).
+  `Magpie.MidiScreen` (plain, not designed) behind the magpie button.
 - **Checking it:** `cc -O2 -Wall -Wextra -Wno-unused-function -o
   /tmp/midi_host c_src/test/midi_host.c -lm && /tmp/midi_host` (also with
-  `-fsanitize=address,undefined`); `mix test test/magpie/midi_*_test.exs
-  test/magpie/kit_session_midi_test.exs`. On a phone:
-  `SERIAL=<serial> mix run --no-start scripts/midi_check.exs` (after
+  `-fsanitize=address,undefined`; it needs `deps/mob_midi` for the header
+  and runs `midi_out.c` against a fake port that stalls); `mix test
+  test/magpie/midi_*_test.exs test/magpie/kit_session_midi_test.exs`. On a
+  phone: `SERIAL=<serial> mix run --no-start scripts/midi_check.exs` (after
   `mix mob.deploy --native` and `mix mob.connect`): it drives
-  `plugins/magpie_midi/tools/MidiProbe.java`, a client of the "Magpie"
-  port run as the shell user (`app_process`; `midi_probe.sh` builds and
-  runs it by hand), against test tones on bank A pads 0..4, and puts the
-  kit back; `MidiProbe ... clock <s> <bpm> <beats>` sends a clock with
-  Start / Stop / song position + Continue (Magpie must ignore it).
+  `scripts/midi_probe/MidiProbe.java`, a client of Magpie's device run as
+  the shell user (`app_process`; `midi_probe.sh` builds and runs it by
+  hand), against test tones on bank A pads 0..4, and puts the kit back;
+  `MidiProbe ... clock <s> <bpm> <beats>` sends a clock with Start / Stop /
+  song position + Continue (Magpie must ignore it), `stall <s>` stops
+  reading for all but the last 3 s. (mob_midi's `tools/MidiProbe.java` has
+  no channel / note list / clock modes, so Magpie keeps its own.)
 
 ### Measured (moto e 2020, Android 10, `scripts/midi_check.exs`)
 
@@ -706,7 +733,14 @@ these), 16 loaded pads (every one asking for moves), 40 rounds:
   toolchain (zig 0.17.0; the nightly in `~/.local/bin` fails the native
   build).
 - Gate before every commit: `mix format`, `mix compile --warnings-as-errors`,
-  `mix credo --strict`, `mix test`.
+  `mix credo --strict`, `mix test`, and the host C tests (`midi_host`,
+  `sampler_host`, also under ASan/UBSan). Not `mix
+  mob_midi.gen.virtual_device --check`: the task puts its `<service>` block
+  last in `<application>` and mob_dev's native build moves its own
+  `mob:plugin-components` block back after it, so the check fails after
+  every native build (a mob_midi gap). The committed manifest has mob_dev's
+  order; after changing `config :mob_midi, :virtual_device`, run the task,
+  then a native build, and commit what that leaves.
 - Devices are shared with other agents: lease first (`agent-lease acquire
   <name> --serial <serial>`), release when done (see `~/AGENTS.md`).
 - Android: `mix mob.deploy --native --android --device <serial>` after

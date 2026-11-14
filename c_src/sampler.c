@@ -64,6 +64,7 @@
 #define SP_ACTIONS 512   /* sequencer actions in one block */
 #define SP_MAX_STEPS 4096 /* events in one pattern */
 #define SP_MIDI_BLOCK 256 /* MIDI out messages in one block */
+#define SP_MIDI_SOURCES 64 /* MIDI inputs (sources 0..63): the bits of midi.gone, mob_midi's MOB_MIDI_MAX_SOURCES */
 
 #define SP_PPQN 96
 #define SP_STEP 24
@@ -337,7 +338,7 @@ typedef struct {
         mo_ring out;
         double free_next; /* clock send while stopped: the next tick's frame; < 0 from the next block */
         _Atomic uint64_t in_messages;
-        _Atomic uint32_t gone;            /* a bit per input gone whose MIDI_GONE the full queue refused */
+        _Atomic uint64_t gone;            /* a bit per input gone whose MIDI_GONE the full queue refused */
     } midi;
 
     /* Counters for info (relaxed). */
@@ -1279,14 +1280,14 @@ static void midi_input_gone(sp_engine *e, int src) { midi_release(e, src, -1, -1
  * after them: everything an input sent before its bit was set has been
  * applied by then, so a note-on still queued can't outlive the release
  * (one sent after it, by the input's next port, may end early). */
-static uint32_t midi_gone_take(sp_engine *e) {
+static uint64_t midi_gone_take(sp_engine *e) {
     if (!atomic_load_explicit(&e->midi.gone, memory_order_relaxed)) return 0;
     return atomic_exchange_explicit(&e->midi.gone, 0, memory_order_acq_rel);
 }
 
-static void midi_gone_apply(sp_engine *e, uint32_t gone) {
+static void midi_gone_apply(sp_engine *e, uint64_t gone) {
     while (gone) {
-        int src = __builtin_ctz(gone);
+        int src = __builtin_ctzll(gone);
         gone &= gone - 1;
         midi_input_gone(e, src);
     }
@@ -1574,7 +1575,7 @@ static void sp_render(sp_engine *e, float *out, int frames) {
     e->offline = false;
     e->at = e->frame;
     sp_cmd c;
-    uint32_t gone = midi_gone_take(e);
+    uint64_t gone = midi_gone_take(e);
     while (sp_pop_cmd(e, &c)) apply(e, &c, true);
     midi_gone_apply(e, gone);
 
@@ -1633,7 +1634,7 @@ static void sp_drain(sp_engine *e, bool live) {
     e->offline = true;
     e->at = e->frame;
     sp_cmd c;
-    uint32_t gone = midi_gone_take(e);
+    uint64_t gone = midi_gone_take(e);
     while (sp_pop_cmd(e, &c)) apply(e, &c, live);
     midi_gone_apply(e, gone);
     reclaim(e);

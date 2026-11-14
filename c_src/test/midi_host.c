@@ -1,11 +1,14 @@
 /*
- * Host harness for Magpie's MIDI in c_src/sampler.c and c_src/midi.c:
- * the parser, notes in through the kit's table (channel filter, keys
- * mode, releases, all-notes-off, no echo), notes out (note-on on the
- * voice's first frame, note-off when it stops sounding at full), clock
- * send (every tick on its exact frame through tempo changes, Start / song
- * position / Stop, the free-running clock while stopped), an incoming
- * clock ignored (not followed yet).
+ * Host harness for Magpie's MIDI in c_src/sampler.c, c_src/midi.c and
+ * c_src/midi_out.c: the parser, notes in through the kit's table (channel
+ * filter, keys mode, releases, all-notes-off, no echo), notes out (note-on
+ * on the voice's first frame, note-off when it stops sounding at full),
+ * clock send (every tick on its exact frame through tempo changes, Start /
+ * song position / Stop, the free-running clock while stopped), an incoming
+ * clock ignored (not followed yet), and the outputs against a fake mob_midi
+ * port that stalls (refused and discarded note-offs still go out).
+ *
+ * Needs deps/mob_midi (mix deps.get) for mob_midi.h.
  *
  *   cc -O2 -Wall -Wextra -o /tmp/midi_host c_src/test/midi_host.c -lm && /tmp/midi_host
  *   cc -g -O1 -fsanitize=address,undefined -o /tmp/midi_host_asan c_src/test/midi_host.c -lm && /tmp/midi_host_asan
@@ -16,7 +19,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "../../deps/mob_midi/priv/include/mob_midi.h"
+
 #include "../sampler.c"
+#include "../midi_out.c"
 
 #define RATE 48000
 
@@ -373,17 +379,18 @@ static void test_table_change(void) {
           "CC 123: another channel's leaves a voice; its own channel's releases it after the table moved off it");
 
     /* Inputs: a note-off from another input leaves a voice; the input gone
-     * releases what it held (a one-shot rings on). */
+     * releases what it held (a one-shot rings on). Input 63: mob_midi's
+     * highest source id, the top bit of the gone mask. */
     set_map(e, table_map(0, 38, 36));
     render(e, 256, 256);
-    midi_from(e, 3, 0x90, 38, 100);
-    midi_from(e, 3, 0x90, 36, 100);
+    midi_from(e, 63, 0x90, 38, 100);
+    midi_from(e, 63, 0x90, 36, 100);
     midi_from(e, 4, 0x90, 67, 100);
     render(e, 256, 256);
     midi_from(e, 4, 0x80, 38, 0);
     render(e, 256, 256);
     kept = voices_on(e, 1) == 1;
-    atomic_fetch_or(&e->midi.gone, 1u << 3);
+    atomic_fetch_or(&e->midi.gone, 1ull << 63);
     for (int i = 0; i < SP_CMDS; i++) push(e, (sp_cmd){.type = SP_CMD_SWING, .u.value = 0.5}); /* the queue full */
     render(e, 256, 256);
     CHECK(kept && voices_on(e, 1) == 0 && voices_on(e, 0) == 1 && voices_on(e, 13) == 1,
@@ -780,6 +787,195 @@ static void test_hits(void) {
     free_engine(e);
 }
 
+/* ── Outputs (midi_out.c) against a fake mob_midi port ──────────────────── */
+
+/* The port: mob_midi_send answers `mode`; what it takes queues until
+ * port_deliver hands it to the listener, whose sounding notes it tracks; a
+ * discard drops the queue. */
+static struct {
+    int mode;
+    uint8_t queued[16384];
+    size_t n_queued;
+    bool sounding[MIDI_NOTES];
+    int discards;
+} port;
+
+int mob_midi_send(mob_midi_port handle, const uint8_t *bytes, size_t len, int64_t at_ns) {
+    (void)handle;
+    (void)at_ns;
+    if (port.mode != MOB_MIDI_OK) return port.mode;
+    if (port.n_queued + len > sizeof(port.queued)) return MOB_MIDI_ERR_QUEUE_FULL;
+    memcpy(port.queued + port.n_queued, bytes, len);
+    port.n_queued += len;
+    return MOB_MIDI_OK;
+}
+
+int mob_midi_discard(mob_midi_port handle) {
+    (void)handle;
+    port.discards++;
+    port.n_queued = 0;
+    return port.discards;
+}
+
+/* Every message is whole, with its status byte (the renderer's). */
+static void port_deliver(void) {
+    for (size_t i = 0; i < port.n_queued;) {
+        uint8_t st = port.queued[i];
+        if (st >= 0xF0) {
+            i++;
+            continue;
+        }
+        int b = (st & 0x0F) * 128 + port.queued[i + 1];
+        if ((st & 0xF0) == 0x90 && port.queued[i + 2] > 0) port.sounding[b] = true;
+        else if ((st & 0xF0) == 0x80 || (st & 0xF0) == 0x90) port.sounding[b] = false;
+        i += 3;
+    }
+    port.n_queued = 0;
+}
+
+static int port_sounding(void) {
+    int n = 0;
+    for (int i = 0; i < MIDI_NOTES; i++) n += port.sounding[i];
+    return n;
+}
+
+static void port_reset(int mode) {
+    memset(&port, 0, sizeof(port));
+    port.mode = mode;
+}
+
+static mo_event ev_note(bool on, int ch, int note) {
+    return (mo_event){.kind = MO_NOTE, .len = 3, .b = {(uint8_t)((on ? 0x90 : 0x80) | ch), (uint8_t)note, on ? 100 : 64}};
+}
+
+static const mo_event EV_TICK = {.kind = MO_CLOCK, .len = 1, .b = {0xF8}};
+
+static void out_batch(midi_out *o, const mo_event *evs, int count) {
+    uint8_t buf[256];
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        memcpy(buf + n, evs[i].b, evs[i].len);
+        n += evs[i].len;
+    }
+    out_send(o, buf, n, evs, count, 0);
+}
+
+static void out_one(midi_out *o, mo_event ev) { out_batch(o, &ev, 1); }
+
+static void test_outputs(void) {
+    printf("outputs (a port that stalls)\n");
+    midi_out o = {.handle = 1};
+    port_reset(MOB_MIDI_OK);
+
+    /* A note-off refused: owed, and first out once the port drained. */
+    out_one(&o, ev_note(true, 0, 36));
+    port_deliver();
+    port.mode = MOB_MIDI_ERR_QUEUE_FULL;
+    out_one(&o, ev_note(false, 0, 36));
+    out_one(&o, EV_TICK);
+    out_one(&o, ev_note(true, 0, 38));
+    bool refusing = o.refusing && port.discards == 1 && port_sounding() == 1;
+    port.mode = MOB_MIDI_OK;
+    out_one(&o, EV_TICK);
+    bool first = port.n_queued == 4 && port.queued[0] == 0x80 && port.queued[1] == 36 && port.queued[3] == 0xF8;
+    port_deliver();
+    out_one(&o, ev_note(false, 0, 38));
+    port_deliver();
+    CHECK(refusing && first && !o.refusing && port_sounding() == 0,
+          "a refused note-off: one discard while refusing, owed and sent before the next batch once drained; the "
+          "note-on refused meanwhile owes nothing");
+
+    /* A note-off the port took, dropped by the discard at the refusal: owed,
+     * and sent with nothing else to send (out_retry). */
+    uint64_t paid = OUT_STATS.offs_owed;
+    out_one(&o, ev_note(true, 2, 40));
+    port_deliver();
+    out_one(&o, ev_note(false, 2, 40));
+    port.mode = MOB_MIDI_ERR_QUEUE_FULL;
+    out_one(&o, EV_TICK);
+    out_retry(&o);
+    bool still = port_sounding() == 1 && o.refusing;
+    port.mode = MOB_MIDI_OK;
+    out_retry(&o);
+    port_deliver();
+    CHECK(still && !o.refusing && port_sounding() == 0 && OUT_STATS.offs_owed > paid,
+          "a note-off the discard dropped: owed, sent by the retry once drained (none while still refusing)");
+
+    /* The note held again (a note-on taken after its note-off): the owed
+     * note-off isn't sent, so it doesn't cut the note; its own one ends it.
+     * (A fresh output: note-offs taken since the last refusal, 36 and 40
+     * above, would be owed too, harmless extra ones.) */
+    o = (midi_out){.handle = 1};
+    port_reset(MOB_MIDI_OK);
+    out_one(&o, ev_note(true, 0, 42));
+    port_deliver();
+    out_one(&o, ev_note(false, 0, 42));
+    out_one(&o, ev_note(true, 0, 42));
+    port.mode = MOB_MIDI_ERR_QUEUE_FULL;
+    out_one(&o, EV_TICK);
+    port.mode = MOB_MIDI_OK;
+    out_retry(&o);
+    out_one(&o, EV_TICK);
+    bool kept = port.n_queued == 1 && port.queued[0] == 0xF8;
+    port_deliver();
+    kept = kept && port.sounding[42];
+    out_one(&o, ev_note(false, 0, 42));
+    port_deliver();
+    CHECK(kept && port_sounding() == 0, "a note held again isn't sent its owed note-off; its voice's own ends it");
+
+    /* Nobody listening (Magpie's own output): nothing is owed. */
+    out_one(&o, ev_note(true, 0, 50));
+    port_deliver();
+    port.mode = MOB_MIDI_ERR_NO_LISTENER;
+    out_one(&o, ev_note(false, 0, 50));
+    CHECK(!o.refusing && !out_owes(&o) && !bit_test(o.held, 50), "no listener: nothing held or owed");
+
+    /* Random stalls under a renderer's notes (one open per channel and
+     * note, every note-on its note-off): once every voice has ended and the
+     * port drained, nothing sounds at the listener. */
+    rng = 7;
+    int stuck_runs = 0;
+    for (int run = 0; run < 200; run++) {
+        o = (midi_out){.handle = 1};
+        port_reset(MOB_MIDI_OK);
+        bool open[8] = {false};
+        for (int k = 0; k < 400; k++) {
+            unsigned r = next_rand() % 100;
+            if (r < 8) port.mode = port.mode == MOB_MIDI_OK ? MOB_MIDI_ERR_QUEUE_FULL : MOB_MIDI_OK;
+            if (r < 30 && port.mode == MOB_MIDI_OK) port_deliver();
+            mo_event evs[4];
+            int count = 0;
+            int msgs = 1 + (int)(next_rand() % 3);
+            for (int m = 0; m < msgs; m++) {
+                int i = (int)(next_rand() % 8);
+                if (next_rand() % 4 == 0) {
+                    evs[count++] = EV_TICK;
+                } else if (open[i]) {
+                    evs[count++] = ev_note(false, i & 1, 36 + i);
+                    open[i] = false;
+                } else {
+                    evs[count++] = ev_note(true, i & 1, 36 + i);
+                    open[i] = true;
+                }
+            }
+            out_batch(&o, evs, count);
+            if (next_rand() % 5 == 0) out_retry(&o);
+        }
+        mo_event offs[8];
+        int n_offs = 0;
+        for (int i = 0; i < 8; i++)
+            if (open[i]) offs[n_offs++] = ev_note(false, i & 1, 36 + i);
+        port.mode = MOB_MIDI_OK;
+        out_retry(&o);
+        if (n_offs) out_batch(&o, offs, n_offs);
+        out_retry(&o);
+        port_deliver();
+        stuck_runs += port_sounding() > 0;
+    }
+    CHECK(stuck_runs == 0, "200 runs of random stalls, discards and deliveries: no note left sounding (%d runs with one)",
+          stuck_runs);
+}
+
 int main(void) {
     test_parser();
     test_notes_in();
@@ -789,6 +985,7 @@ int main(void) {
     test_clock_in();
     test_out_pairing();
     test_hits();
+    test_outputs();
     printf(failures ? "FAILED: %d\n" : "passed: 0 failures\n", failures);
     return failures ? 1 : 0;
 }

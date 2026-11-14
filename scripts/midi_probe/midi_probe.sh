@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Build MidiProbe.java, push it to the phone and run it there as the adb
-# shell user (app_process): another process that opens the Magpie port,
+# shell user (app_process): another process that opens Magpie's MIDI device,
 # sends it notes or a clock and prints what Magpie sends back, all stamped
 # with CLOCK_MONOTONIC. See MidiProbe.java for the modes and the output.
 #
-#   plugins/magpie_midi/tools/midi_probe.sh <serial> <device name> devices
-#   plugins/magpie_midi/tools/midi_probe.sh <serial> Magpie listen 10
-#   plugins/magpie_midi/tools/midi_probe.sh <serial> Magpie notes 10 20 200 1 36,38
-#   plugins/magpie_midi/tools/midi_probe.sh <serial> Magpie clock 8 120 8
+#   scripts/midi_probe/midi_probe.sh <serial> <device name> devices
+#   scripts/midi_probe/midi_probe.sh <serial> Magpie listen 10
+#   scripts/midi_probe/midi_probe.sh <serial> Magpie stall 20
+#   scripts/midi_probe/midi_probe.sh <serial> Magpie notes 10 20 200 1 36,38
+#   scripts/midi_probe/midi_probe.sh <serial> Magpie clock 8 120 8
 #
 # PROBE_PUSH_ONLY=1 builds and pushes /data/local/tmp/magpie_midi_probe.dex
 # without running it (scripts/midi_check.exs does that, then runs it

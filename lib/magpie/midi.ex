@@ -1,18 +1,21 @@
 defmodule Magpie.Midi do
   @moduledoc """
   MIDI devices: which ones are open, one process started from
-  `Magpie.App.on_start/0` after the Engine. Notes and clock never pass
-  through here (the engine and the plugin's Kotlin move them, see
-  `decisions/2026-11-13-midi.md`); this process only decides what is
-  connected.
+  `Magpie.App.on_start/0` after the Engine. Devices and ports are mob_midi's
+  (`MobMidi`; `impl/0` is `Magpie.Midi.Fake` in host tests). Notes and clock
+  never pass through here: inputs open with `deliver: :native`, so their
+  bytes go from mob_midi's receive threads straight to the engine's C, and
+  the engine sends to the output handles this process gives it
+  (`c:Magpie.Audio.midi_outputs/1`); see `decisions/2026-11-13-midi.md`.
 
-  - **The Magpie port** (a virtual device "Magpie", one input and one
-    output) is always there for other apps; `snapshot/0`'s `port` counts the
-    apps connected to it (`inputs`: sending to Magpie, `outputs`:
-    listening).
-  - **USB and Bluetooth devices open when they appear** (hot-plug), both
-    ways. Other apps' virtual ports (Humdinger's "Humdinger") open only when
-    the user turns them on: opening one starts that app's service.
+  - **The Magpie device** (Magpie's own virtual device "Magpie", one input
+    and one output, declared by `mix mob_midi.gen.virtual_device`) is always
+    there for other apps; `snapshot/0`'s `port` counts the apps connected
+    to it (`inputs`: sending to Magpie, `outputs`: listening).
+  - **USB and Bluetooth devices open when they appear** (hot-plug): every
+    port Magpie can read (`port: :all`) and output port 0. Other apps'
+    virtual devices (Humdinger's "Humdinger") open only when the user turns
+    them on: opening one starts that app's service.
   - `set_open/2` turns a device on or off and remembers it by type and
     name (`Mob.State`, when it runs), so a device the user turned off stays
     off when plugged in again, and a port turned on reopens next time.
@@ -22,13 +25,15 @@ defmodule Magpie.Midi do
     at start.
 
   Subscribers (`subscribe/1`, monitored) get `{:magpie_midi, %{devices,
-  port, scan}}` on every change. Each device: `t:Magpie.Audio.midi_device/0`
-  plus `status` (`:open | :opening | :closed | {:failed, reason}`) and
-  `wanted` (what the policy above says). `scan`: `%{state: :idle |
-  :scanning, found: [%{address, name, rssi}], error: atom | nil}`.
+  port, scan}}` on every change. Each device: `%{id, name, type, address,
+  input_ports, output_ports}` (`MobMidi.parse_devices/1`; `input_ports`
+  are what Magpie reads, `output_ports` what it sends to) plus `status`
+  (`:open | :opening | :closed | {:failed, reason}`) and `wanted` (what the
+  policy above says). `scan`: `%{state: :idle | :scanning, found:
+  [%{address, name, rssi}], error: atom | nil}`.
 
-  Without MIDI (the host's Fake without devices, a phone without the
-  service) the list is empty and nothing fails.
+  Without MIDI (the host, a phone without the MIDI service) the list is
+  empty and nothing fails.
   """
 
   use GenServer
@@ -37,11 +42,15 @@ defmodule Magpie.Midi do
 
   alias Magpie.Audio
 
+  @name "Magpie"
   @scan_ms 10_000
   @prefs_key :magpie_midi_devices
   @ble_key :magpie_midi_ble
 
   defstruct devices: %{},
+            own: nil,
+            handles: %{},
+            pushed: nil,
             prefs: %{},
             ble: nil,
             persist: true,
@@ -64,48 +73,37 @@ defmodule Magpie.Midi do
   def set_open(id, on) when is_integer(id) and is_boolean(on),
     do: GenServer.call(__MODULE__, {:set_open, id, on})
 
-  @doc "Scan for Bluetooth-MIDI devices (10 s). Errors as `c:Magpie.Audio.midi_ble_scan/1`."
+  @doc """
+  Scan for Bluetooth-MIDI devices (10 s): `:ok`, then the snapshot's
+  `scan` (what it finds, or why it couldn't: `:permission_denied`,
+  `:bluetooth_off`, `:location_off`, ...). `{:error, :unsupported}` without
+  Bluetooth MIDI.
+  """
+  @spec ble_scan() :: :ok | {:error, term()}
   def ble_scan, do: GenServer.call(__MODULE__, :ble_scan)
 
-  @doc "Connect a Bluetooth-MIDI device found by a scan."
+  @doc "Connect a Bluetooth-MIDI device found by a scan (a failure shows as the scan's `error`)."
+  @spec ble_connect(String.t()) :: :ok | {:error, term()}
   def ble_connect(address) when is_binary(address),
     do: GenServer.call(__MODULE__, {:ble_connect, address})
 
-  @doc false
-  # A device as the engine's JSON has it (string keys) → `t:Magpie.Audio.midi_device/0`.
-  def device(%{"id" => id} = d) do
-    %{
-      id: id,
-      name: Map.get(d, "name", "MIDI device"),
-      type: type(Map.get(d, "type")),
-      inputs: Map.get(d, "inputs", 0),
-      outputs: Map.get(d, "outputs", 0),
-      own: Map.get(d, "own", false),
-      address: Map.get(d, "address", "")
-    }
-  end
-
-  defp type("usb"), do: :usb
-  defp type("bluetooth"), do: :bluetooth
-  defp type(_), do: :virtual
+  @doc "`MobMidi` on the phone, `Magpie.Midi.Fake` in host tests (`config :magpie, :midi`)."
+  def impl, do: Application.get_env(:magpie, :midi, MobMidi)
 
   # ── Server ──────────────────────────────────────────────────────────────────
+
+  # MobMidi's calls take a Mob socket and hand it back; this process has none.
+  @socket nil
 
   @impl true
   def init(opts) do
     s = %__MODULE__{persist: Keyword.get(opts, :persist, true)}
     s = %{s | prefs: recall(s, @prefs_key, %{}), ble: recall(s, @ble_key, nil)}
-
-    with :ok <- Audio.impl().midi_listen(self()),
-         {:ok, devices} <- Audio.impl().midi_devices() do
-      s = Enum.reduce(devices, s, &add(&2, &1))
-      if s.ble, do: _ = Audio.impl().midi_ble_connect(s.ble)
-      {:ok, s}
-    else
-      {:error, reason} ->
-        Logger.info("Magpie.Midi: no MIDI (#{inspect(reason)})")
-        {:ok, s}
-    end
+    # Answers arrive as {:midi, ...} messages.
+    _ = impl().list_devices(@socket)
+    _ = impl().open_virtual(@socket, @name, deliver: :native)
+    if s.ble, do: _ = impl().connect_bluetooth(@socket, s.ble)
+    {:ok, s}
   end
 
   @impl true
@@ -134,26 +132,24 @@ defmodule Magpie.Midi do
   end
 
   def handle_call(:ble_scan, _from, s) do
-    case Audio.impl().midi_ble_scan(@scan_ms) do
-      :ok -> {:reply, :ok, publish(%{s | scan: %{state: :scanning, found: [], error: nil}})}
-      {:error, _} = error -> {:reply, error, s}
+    case impl().scan_bluetooth(@socket, duration_ms: @scan_ms) do
+      {:error, _} = error ->
+        {:reply, error, s}
+
+      _socket ->
+        {:reply, :ok, publish(%{s | scan: %{state: :scanning, found: [], error: nil}})}
     end
   end
 
-  def handle_call({:ble_connect, address}, _from, s),
-    do: {:reply, Audio.impl().midi_ble_connect(address), s}
+  def handle_call({:ble_connect, address}, _from, s) do
+    case impl().connect_bluetooth(@socket, address) do
+      {:error, _} = error -> {:reply, error, s}
+      _socket -> {:reply, :ok, s}
+    end
+  end
 
   @impl true
-  def handle_info({:magpie_midi, tag, json}, s) when is_binary(json) do
-    case JSON.decode(json) do
-      {:ok, data} when is_map(data) ->
-        {:noreply, s |> event(tag, data) |> publish()}
-
-      _ ->
-        Logger.warning("Magpie.Midi: unreadable #{tag} event #{inspect(json)}")
-        {:noreply, s}
-    end
-  end
+  def handle_info({:midi, tag, data}, s), do: {:noreply, s |> midi(tag, data) |> publish()}
 
   def handle_info({:DOWN, ref, :process, pid, _}, s) do
     case s.subscribers do
@@ -164,89 +160,167 @@ defmodule Magpie.Midi do
 
   def handle_info(_message, s), do: {:noreply, s}
 
-  # ── Events ──────────────────────────────────────────────────────────────────
+  # ── mob_midi's messages ─────────────────────────────────────────────────────
 
-  defp event(s, :added, data), do: add(s, device(data))
-  defp event(s, :removed, %{"id" => id}), do: %{s | devices: Map.delete(s.devices, id)}
-  # Turned off while it was opening: it closes again.
-  defp event(s, :opened, %{"id" => id}) do
-    s = status(s, id, :open)
-    if Map.has_key?(s.devices, id), do: apply_policy(s, id), else: s
+  defp midi(s, :devices, payload), do: payload |> MobMidi.parse_devices() |> listed(s)
+
+  # Hot-plug: list again (mob_midi has closed a removed device's ports).
+  defp midi(s, event, _) when event in [:device_added, :device_removed] do
+    _ = impl().list_devices(@socket)
+    s
   end
 
-  defp event(s, :closed, %{"id" => id}), do: status(s, id, :closed)
+  defp midi(s, :opened, %{direction: :virtual, device: id}) do
+    handle =
+      case impl().output_handle(id) do
+        {:ok, h} -> h
+        {:error, _} -> nil
+      end
 
-  defp event(s, :open_failed, %{"id" => id} = data),
-    do: status(s, id, {:failed, reason(Map.get(data, "reason"))})
+    push_outputs(%{s | own: %{id: id, handle: handle}})
+  end
 
-  defp event(s, :port, data),
-    do: %{s | port: %{inputs: Map.get(data, "inputs", 0), outputs: Map.get(data, "outputs", 0)}}
+  defp midi(s, :opened, %{direction: :input, device: id}), do: part(s, id, :input, :open)
 
-  defp event(s, :ble_found, %{"address" => address} = data) do
-    found = %{address: address, name: Map.get(data, "name", ""), rssi: Map.get(data, "rssi")}
+  defp midi(s, :opened, %{direction: :output, device: id, handle: handle}) do
+    s = part(s, id, :output, :open)
+
+    if match?(%{parts: %{output: :open}}, s.devices[id]),
+      do: push_outputs(put_in(s.handles[id], handle)),
+      else: s
+  end
+
+  # Another app started or stopped sending into Magpie's own device, or
+  # listening to it: what a sender that left held ends.
+  defp midi(s, :virtual_status, %{senders: senders, listeners: listeners}) do
+    sources_changed()
+    %{s | port: %{inputs: senders, outputs: listeners}}
+  end
+
+  # An open close/2 cancelled: that close already set the device straight.
+  defp midi(s, :error, %{reason: :closed}), do: s
+
+  defp midi(s, :error, %{op: op, device: id, reason: reason})
+       when op in [:open_input, :open_output] do
+    part(s, id, if(op == :open_input, do: :input, else: :output), {:failed, reason})
+  end
+
+  defp midi(s, :error, %{op: :scan_bluetooth, reason: reason}),
+    do: %{s | scan: %{s.scan | state: :idle, error: reason}}
+
+  defp midi(s, :error, %{op: :connect_bluetooth, reason: reason}),
+    do: put_in(s.scan.error, reason)
+
+  defp midi(s, :error, %{op: op, reason: reason}) do
+    Logger.info("Magpie.Midi: #{op} failed (#{inspect(reason)})")
+    s
+  end
+
+  defp midi(s, :bluetooth_scan, :started), do: %{s | scan: %{s.scan | state: :scanning}}
+  defp midi(s, :bluetooth_scan, :stopped), do: %{s | scan: %{s.scan | state: :idle}}
+
+  defp midi(s, :bluetooth_device, %{address: address} = found) do
+    found = %{address: address, name: Map.get(found, :name) || "", rssi: Map.get(found, :rssi)}
     others = Enum.reject(s.scan.found, &(&1.address == address))
     put_in(s.scan.found, others ++ [found])
   end
 
-  defp event(s, :ble_scan_done, data),
-    do: %{s | scan: %{s.scan | state: :idle, error: reason(Map.get(data, "error"))}}
-
-  defp event(s, :ble_connected, %{"address" => address}) do
+  defp midi(s, :connected, %{address: address}) do
     remember(s, @ble_key, address)
     %{s | ble: address}
   end
 
-  defp event(s, :ble_failed, data), do: put_in(s.scan.error, reason(Map.get(data, "reason")))
-  defp event(s, _tag, _data), do: s
+  # :raw (inputs go to the engine), :drained (the engine owes and retries
+  # itself), anything newer.
+  defp midi(s, _tag, _data), do: s
 
-  # Why the plugin says something failed (a known word, else :error).
-  @reasons ~w(no_permission bluetooth_off location_off no_bluetooth scan_failed open_failed
-              no_activity no_midi_service bad_address unknown_device unavailable)a
+  # ── Devices ─────────────────────────────────────────────────────────────────
 
-  defp reason(nil), do: nil
-  defp reason(r) when is_binary(r), do: Enum.find(@reasons, :error, &(Atom.to_string(&1) == r))
+  # A fresh list: devices gone are dropped (mob_midi closed their ports),
+  # new ones added, the rest keep their state.
+  defp listed(devices, s) do
+    ids = MapSet.new(devices, & &1.id)
+    {gone, kept} = Map.split_with(s.devices, fn {id, _} -> not MapSet.member?(ids, id) end)
+    s = %{s | devices: kept, handles: Map.drop(s.handles, Map.keys(gone))}
+    if map_size(gone) > 0, do: sources_changed()
 
-  # ── Policy ──────────────────────────────────────────────────────────────────
+    devices
+    |> Enum.reject(&(&1.own or Map.has_key?(s.devices, &1.id)))
+    |> Enum.reduce(s, &add(&2, &1))
+    |> push_outputs()
+  end
 
   defp add(s, device) do
-    device = Map.merge(device, %{status: :closed})
+    device = device |> Map.take(~w(id name type address input_ports output_ports)a)
+    device = Map.put(device, :parts, %{})
     s |> put_in([Access.key(:devices), device.id], device) |> apply_policy(device.id)
   end
 
-  defp status(s, id, status) do
+  # A port opened (or failed) for a device that is still opening it; an
+  # answer for a device closed since is old news.
+  defp part(s, id, which, status) do
     case s.devices[id] do
-      nil -> s
-      _ -> put_in(s.devices[id].status, status)
+      %{parts: %{^which => :opening}} -> put_in(s.devices[id].parts[which], status)
+      _ -> s
     end
   end
+
+  # :open when a direction is, else :opening while one is, {:failed, reason}
+  # when every direction asked for failed, :closed otherwise.
+  defp status(%{parts: parts}) do
+    statuses = Map.values(parts)
+
+    cond do
+      :open in statuses -> :open
+      :opening in statuses -> :opening
+      statuses != [] -> hd(statuses)
+      true -> :closed
+    end
+  end
+
+  # ── Policy ──────────────────────────────────────────────────────────────────
 
   # Open a wanted device that isn't, close an unwanted one that is.
   defp apply_policy(s, id) do
     device = s.devices[id]
-    wanted = wanted?(s, device)
+    status = status(device)
 
     cond do
-      wanted and (device.status == :closed or match?({:failed, _}, device.status)) ->
+      wanted?(s, device) and (status == :closed or match?({:failed, _}, status)) ->
         open(s, device)
 
-      not wanted and device.status in [:open, :opening] ->
-        _ = Audio.impl().midi_close(id)
-        status(s, id, :closed)
+      not wanted?(s, device) and status in [:open, :opening] ->
+        _ = impl().close(@socket, id)
+        sources_changed()
+        s = put_in(s.devices[id].parts, %{})
+        push_outputs(%{s | handles: Map.delete(s.handles, id)})
 
       true ->
         s
     end
   end
 
+  # Every port Magpie can read, into the engine; output port 0 for what it
+  # sends. Each answers :opened or an error.
   defp open(s, device) do
-    case Audio.impl().midi_open(device.id) do
-      :ok -> status(s, device.id, :opening)
-      {:error, reason} -> status(s, device.id, {:failed, reason})
-    end
+    parts =
+      [
+        {:input, device.input_ports > 0,
+         fn -> impl().open_input(@socket, device.id, port: :all, deliver: :native) end},
+        {:output, device.output_ports > 0, fn -> impl().open_output(@socket, device.id) end}
+      ]
+      |> Enum.filter(fn {_, has, _} -> has end)
+      |> Map.new(fn {which, _, open} ->
+        case open.() do
+          {:error, reason} -> {which, {:failed, reason}}
+          _socket -> {which, :opening}
+        end
+      end)
+
+    put_in(s.devices[device.id].parts, parts)
   end
 
-  defp wanted?(_s, %{own: true}), do: false
-  defp wanted?(_s, %{inputs: 0, outputs: 0}), do: false
+  defp wanted?(_s, %{input_ports: 0, output_ports: 0}), do: false
 
   defp wanted?(s, device) do
     case Map.fetch(s.prefs, key(device)) do
@@ -257,12 +331,33 @@ defmodule Magpie.Midi do
 
   defp key(device), do: {device.type, device.name}
 
+  # ── The engine ──────────────────────────────────────────────────────────────
+
+  # The outputs the engine sends to: Magpie's own device and every opened
+  # device's port 0, given when they change.
+  defp push_outputs(s) do
+    own = if s.own && s.own.handle, do: [s.own.handle], else: []
+    handles = own ++ (s.handles |> Enum.sort() |> Enum.map(&elem(&1, 1)))
+
+    if handles == s.pushed do
+      s
+    else
+      :ok = Audio.impl().midi_outputs(handles)
+      %{s | pushed: handles}
+    end
+  end
+
+  defp sources_changed, do: :ok = Audio.impl().midi_sources_changed()
+
+  # ── The view ────────────────────────────────────────────────────────────────
+
   defp view(s) do
     devices =
       s.devices
       |> Map.values()
-      |> Enum.reject(& &1.own)
-      |> Enum.map(&Map.put(&1, :wanted, wanted?(s, &1)))
+      |> Enum.map(fn d ->
+        d |> Map.delete(:parts) |> Map.merge(%{status: status(d), wanted: wanted?(s, d)})
+      end)
       |> Enum.sort_by(&{&1.type, &1.name, &1.id})
 
     %{devices: devices, port: s.port, scan: s.scan}

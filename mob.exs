@@ -55,14 +55,16 @@ config :mob_dev,
 # magpie_capture: the "Other apps" recording source (plugins/magpie_capture,
 # Kotlin only: the MediaProjection consent, its foreground service and the
 # AudioRecord read thread feeding the magpie_audio NIF), part of this repo.
-# magpie_midi: the virtual "Magpie" MIDI port, the MIDI device watcher, USB /
-# Bluetooth device open and Bluetooth-MIDI connect (plugins/magpie_midi,
-# Kotlin only, feeding and fed by the magpie_audio NIF), part of this repo.
-config :mob, :plugins, [:magpie_capture, :magpie_midi]
+# mob_midi: MIDI devices (USB, Bluetooth, other apps' ports), the app's own
+# "Magpie" device (its declaration is generated from `config :mob_midi,
+# :virtual_device` by `mix mob_midi.gen.virtual_device`) and the C ABI the
+# magpie_audio NIF receives and sends MIDI through
+# (deps/mob_midi/priv/include/mob_midi.h). A signed Hex release (trusted below).
+config :mob, :plugins, [:magpie_capture, :mob_midi]
 
-# magpie_capture and magpie_midi are this app's own code, reviewed with it, so
-# they build unsigned instead of carrying a signing key (mob_dev prints a banner).
-config :mob, :acknowledge_unsafe_plugins, [:magpie_capture, :magpie_midi]
+# magpie_capture is this app's own code, reviewed with it, so it builds
+# unsigned instead of carrying a signing key (mob_dev prints a banner).
+config :mob, :acknowledge_unsafe_plugins, [:magpie_capture]
 
 # Trust gate for the first-party plugins. Each is signed in CI with the shared
 # mob release key; this is that key's public fingerprint. The build refuses an
@@ -80,6 +82,7 @@ config :mob, :trusted_plugins, %{
   mob_scanner: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
   mob_bluetooth: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
   mob_screencast: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
+  mob_midi: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
   mob_photos: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
   mob_notify: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
   mob_mishka: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",

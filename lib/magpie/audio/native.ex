@@ -122,26 +122,8 @@ defmodule Magpie.Audio.Native do
   end
 
   @impl true
-  def midi_listen(pid) when is_pid(pid), do: Nif.midi_listen(pid)
+  def midi_outputs(handles) when is_list(handles), do: Nif.midi_outputs(handles)
 
   @impl true
-  def midi_devices do
-    with {:ok, json} <- Nif.midi_devices(),
-         do: {:ok, json |> JSON.decode!() |> Enum.map(&Magpie.Midi.device/1)}
-  end
-
-  @impl true
-  def midi_open(id) when is_integer(id), do: Nif.midi_open(id)
-
-  @impl true
-  def midi_close(id) when is_integer(id), do: Nif.midi_close(id)
-
-  @impl true
-  def midi_ble_scan(ms) when is_integer(ms) and ms > 0, do: Nif.midi_ble_scan(ms)
-
-  @impl true
-  def midi_ble_connect(address) when is_binary(address), do: Nif.midi_ble_connect(address)
-
-  @impl true
-  def midi_ble_disconnect(address) when is_binary(address), do: Nif.midi_ble_disconnect(address)
+  def midi_sources_changed, do: Nif.midi_sources_changed()
 end

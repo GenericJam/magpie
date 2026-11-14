@@ -2,7 +2,8 @@
  * c_src/magpie_audio.c — Magpie's audio engine on Android: the sampler core
  * (sampler.c) behind an AAudio output stream, the recorder (recorder.c) on
  * an input (the mic, or other apps through plugins/magpie_capture), NDK
- * MediaCodec decoding, and the NIF (Magpie.Audio.Nif).
+ * MediaCodec decoding, MIDI in and out through mob_midi's C ABI, and the
+ * NIF (Magpie.Audio.Nif).
  *
  *   output callback  AAudio, low-latency performance mode, shared, stereo
  *                    float at the device's own rate. Runs sp_render: drains
@@ -26,6 +27,10 @@
  *                    AMediaCodec decode a file to 16-bit (wav, mp3, aac,
  *                    flac, ogg, …), resample to the engine's rate, peaks,
  *                    then hand the sample to the renderer.
+ *   MIDI receive     mob_midi's, one per open input port: midi_sink parses
+ *                    the bytes into the command queue.
+ *   MIDI sending     Sends what the renderer stamped (notes, clock) to the
+ *                    MIDI outputs with mob_midi_send, when it is heard.
  *
  * Messages to the owner (open/1's caller):
  *
@@ -84,7 +89,11 @@
 
 #include <android/log.h>
 
+/* mob_midi's C ABI (a dependency: its own path, see its README). */
+#include "../deps/mob_midi/priv/include/mob_midi.h"
+
 #include "sampler.c"
+#include "midi_out.c"
 #include "recorder.c"
 
 #define LOG_TAG "magpie_audio"
@@ -1571,37 +1580,43 @@ static void deliver_input(ErlNifEnv *env, int64_t now) {
 
 /* ── MIDI ────────────────────────────────────────────────────────────────── */
 
-/* Kotlin (plugins/magpie_midi) holds the ports and devices; no MIDI byte
- * passes through the BEAM. In: each receiver hands its bytes and their
- * timestamp to native_in, which parses them (one parser per source, under
- * the source's lock) and queues one SP_CMD_MIDI per message. Out:
- * the renderer stamps messages with engine frames into SP.midi.out; the
- * sending thread turns each frame into CLOCK_MONOTONIC through the output
- * timestamp, sleeps until then and calls MagpieMidi.send with that time.
- * Device events (tag, JSON) go to the listener as {magpie_midi, Tag, Json}. */
+/* mob_midi (deps/mob_midi) holds the devices, the app's own "Magpie" device
+ * and their ports; Magpie.Midi opens them with deliver: :native and hands
+ * this NIF the output handles (midi_outputs/1). No MIDI byte passes through
+ * the BEAM. In: mob_midi calls midi_sink on a port's receive thread with
+ * the bytes, their timestamp and the port's source and generation; it
+ * parses them (one parser per source) and queues one SP_CMD_MIDI per
+ * message. Out: the renderer stamps messages with engine frames into
+ * SP.midi.out; the sending thread turns each frame into CLOCK_MONOTONIC
+ * through the output timestamp, sleeps until then and queues the bytes on
+ * every output with mob_midi_send, stamped with that time. */
 
-#define MIDI_CLASS "com.genericjam.magpie.midi.MagpieMidi"
-#define MIDI_SOURCES 16
+#define MIDI_SOURCES MOB_MIDI_MAX_SOURCES
+#define MIDI_OUTPUTS 32               /* outputs the sending thread sends to */
 #define MIDI_LATE_CLOCK_NS 20000000LL /* a tick this late is dropped, not sent in a burst */
 #define MIDI_BATCH_NS 100000LL        /* messages this close together go in one send */
+#define MIDI_RETRY_NS 10000000LL      /* a refusing output owed note-offs is tried this often */
 #define MIDI_SEND_MAX 256
 #define MIDI_STATS 512
 
-/* A source's parser, fed only by the port with the highest generation seen
- * on it so far (see native_in). */
+_Static_assert(MIDI_SOURCES == SP_MIDI_SOURCES, "a gone bit per mob_midi source");
+
+/* A source's parser, fed only by the source's current generation (see
+ * midi_sink). */
 typedef struct {
     pthread_mutex_t lock;
-    int64_t generation;
+    uint32_t generation; /* the port being parsed; 0: none (never opened, or gone) */
     mi_parser parser;
 } midi_source;
 
 static struct {
-    pthread_mutex_t lock; /* the class and its methods once bound, the listener */
-    jclass cls;
-    jmethodID attach, send, devices, open, close, ble_scan, ble_connect, ble_disconnect;
-    ErlNifPid listener;
-    bool has_listener;
     midi_source sources[MIDI_SOURCES];
+    bool sink; /* midi_sink is mob_midi's sink */
+    /* The outputs (midi_outputs/1), under out_lock: the NIF replaces them,
+     * the sending thread sends to them. `next` is the NIF's scratch. */
+    pthread_mutex_t out_lock;
+    midi_out outs[MIDI_OUTPUTS], next[MIDI_OUTPUTS];
+    int n_outs;
     /* The sending thread: started and joined under E.lock. */
     pthread_t out;
     bool out_started;
@@ -1610,6 +1625,8 @@ static struct {
      * fills it, the new thread sends it). */
     mo_event stale[MO_RING];
     int n_stale;
+    /* received: parsed messages; sent: messages handed to the outputs (what
+     * they refused: OUT_STATS, midi_out.c). */
     _Atomic uint64_t received, sent, late_dropped;
     /* Under E.stats_lock: send time − stamp (µs); MIDI timestamp → heard (ms). */
     float late_us[MIDI_STATS], in_ms[MIDI_STATS];
@@ -1635,7 +1652,7 @@ static void midi_drain_offline(void) {
  * renderer applies after the commands queued by then (never lost). */
 static void source_gone(int source) {
     sp_cmd c = {.type = SP_CMD_MIDI_GONE, .u.midi = {.src = (uint8_t)source}};
-    if (!push_cmd(&c)) atomic_fetch_or(&SP.midi.gone, 1u << source);
+    if (!push_cmd(&c)) atomic_fetch_or(&SP.midi.gone, 1ull << source);
     midi_drain_offline();
 }
 
@@ -1658,151 +1675,65 @@ static void midi_emit(void *ctx, mi_msg m) {
     if (release) midi_drain_offline();
 }
 
-/* Under the source's lock: `generation` becomes current, from a fresh
- * parser. True if it is newer: the port that had the source is done. */
-static bool source_renew_locked(midi_source *s, int64_t generation) {
-    if (generation <= s->generation) return false;
-    s->generation = generation;
-    s->parser = (mi_parser){0};
-    return true;
-}
-
-/* MagpieMidi.nativeIn(source, generation, data, offset, count, timestamp): a
- * receiver's thread. Kotlin gives a source a new, higher generation when a
- * port takes it, when it is given back and when the Magpie port's service
- * is created, and tells C (nativeActivate) before the port can deliver.
- * Under the source's lock, a newer generation starts a fresh parser (no
- * running status or SysEx left by the port that had the source before) and
- * an older one's bytes are dropped (a closed port's thread delivering a
- * last message). So two threads never parse on one source at once, and one
- * port's bytes never land in another's stream. A timestamp of 0 (senders
- * that don't stamp) or more than a second off isn't System.nanoTime: the
- * message counts as arriving now. */
-static void JNICALL native_in(JNIEnv *j, jclass cls, jint source, jlong generation, jbyteArray data, jint offset,
-                              jint count, jlong timestamp) {
-    (void)cls;
-    if (source < 0 || source >= MIDI_SOURCES || count <= 0 || !data) return;
-    int64_t now = now_ns();
-    midi_ctx ctx = {.t_ns = timestamp > now - 1000000000LL && timestamp < now + 1000000000LL ? timestamp : now,
-                    .src = (uint8_t)source};
-    uint8_t buf[256];
+/* mob_midi's sink: a port's receive thread, under mob_midi's lock of the
+ * source, so calls for one source never overlap. mob_midi delivers only the
+ * source's current generation; a new one is another port on the source (or
+ * another app sending into Magpie's own device): a fresh parser (no running
+ * status or SysEx left by the port before), and what the old one held ends.
+ * A timestamp of 0 (senders that don't stamp) or more than a second off
+ * isn't CLOCK_MONOTONIC: the message counts as arriving now. */
+static void midi_sink(void *ctx, uint32_t source, uint32_t generation, const uint8_t *bytes, size_t len,
+                      int64_t timestamp_ns) {
+    (void)ctx;
+    if (source == 0 || source >= MIDI_SOURCES || generation == 0 || len == 0) return;
+    midi_ctx x = {.t_ns = mob_midi_timestamp_or(timestamp_ns, now_ns()), .src = (uint8_t)source};
     midi_source *s = &MI.sources[source];
     pthread_mutex_lock(&s->lock);
-    if (source_renew_locked(s, generation)) source_gone(source);
-    for (jint done = 0; generation == s->generation && done < count;) {
-        jint n = count - done > (jint)sizeof(buf) ? (jint)sizeof(buf) : count - done;
-        (*j)->GetByteArrayRegion(j, data, offset + done, n, (jbyte *)buf);
-        if (jni_failed(j)) break;
-        mi_parse(&s->parser, buf, n, midi_emit, &ctx);
-        done += n;
+    if (generation != s->generation) {
+        if (s->generation) source_gone((int)source);
+        s->generation = generation;
+        s->parser = (mi_parser){0};
     }
+    mi_parse(&s->parser, bytes, len, midi_emit, &x);
     pthread_mutex_unlock(&s->lock);
 }
 
-/* MagpieMidi.nativeActivate(source, generation): from now on only that
- * generation's bytes are parsed on the source, from a fresh parser; what
- * the port that had it held ends. */
-static void JNICALL native_activate(JNIEnv *j, jclass cls, jint source, jlong generation) {
-    (void)j;
-    (void)cls;
-    if (source < 0 || source >= MIDI_SOURCES) return;
-    midi_source *s = &MI.sources[source];
-    pthread_mutex_lock(&s->lock);
-    if (source_renew_locked(s, generation)) source_gone(source);
-    pthread_mutex_unlock(&s->lock);
-}
-
-/* MagpieMidi.nativeEvent(tag, json): a device event for the listener. */
-static void JNICALL native_event(JNIEnv *j, jclass cls, jstring tag, jbyteArray json) {
-    (void)cls;
-    const char *t = tag ? (*j)->GetStringUTFChars(j, tag, NULL) : NULL;
-    if (!t) return;
-    ErlNifEnv *m = enif_alloc_env();
-    jsize len = json ? (*j)->GetArrayLength(j, json) : 0;
-    ERL_NIF_TERM bin;
-    unsigned char *p = enif_make_new_binary(m, (size_t)len, &bin);
-    if (len > 0) (*j)->GetByteArrayRegion(j, json, 0, len, (jbyte *)p);
-    ERL_NIF_TERM msg = enif_make_tuple3(m, atom(m, "magpie_midi"), atom(m, t), bin);
-    (*j)->ReleaseStringUTFChars(j, tag, t);
-    if (!jni_failed(j)) {
-        pthread_mutex_lock(&MI.lock);
-        if (MI.has_listener) enif_send(NULL, &MI.listener, m, msg);
-        pthread_mutex_unlock(&MI.lock);
-    }
-    enif_free_env(m);
-}
-
-static jmethodID static_method(JNIEnv *j, jclass cls, const char *name, const char *sig) {
-    jmethodID id = (*j)->GetStaticMethodID(j, cls, name, sig);
-    return jni_failed(j) ? NULL : id;
-}
-
-/* Find MagpieMidi through the activity's class loader, register its natives
- * and tell it (attach) that they are there. Takes MI.lock; attach is
- * called after it is released (it sends an event, which takes it). */
-static bool midi_bind(JNIEnv *j) {
-    pthread_mutex_lock(&MI.lock);
-    if (MI.cls) {
-        pthread_mutex_unlock(&MI.lock);
-        return true;
-    }
-    bool ok = false;
-    if (g_activity && (*j)->PushLocalFrame(j, 16) == JNI_OK) {
-        jmethodID get_loader =
-            method(j, (*j)->GetObjectClass(j, g_activity), "getClassLoader", "()Ljava/lang/ClassLoader;");
-        jobject loader = get_loader ? (*j)->CallObjectMethod(j, g_activity, get_loader) : NULL;
-        if (jni_failed(j)) loader = NULL;
-        jmethodID load_class = loader ? method(j, (*j)->GetObjectClass(j, loader), "loadClass",
-                                               "(Ljava/lang/String;)Ljava/lang/Class;")
-                                      : NULL;
-        jclass cls =
-            load_class ? (jclass)(*j)->CallObjectMethod(j, loader, load_class, (*j)->NewStringUTF(j, MIDI_CLASS)) : NULL;
-        if (jni_failed(j)) cls = NULL;
-        if (cls) {
-            JNINativeMethod natives[] = {
-                {"nativeIn", "(IJ[BIIJ)V", (void *)native_in},
-                {"nativeActivate", "(IJ)V", (void *)native_activate},
-                {"nativeEvent", "(Ljava/lang/String;[B)V", (void *)native_event},
-            };
-            MI.attach = static_method(j, cls, "attach", "()V");
-            MI.send = static_method(j, cls, "send", "([BIJ)V");
-            MI.devices = static_method(j, cls, "devices", "()[B");
-            MI.open = static_method(j, cls, "open", "(I)Ljava/lang/String;");
-            MI.close = static_method(j, cls, "close", "(I)V");
-            MI.ble_scan = static_method(j, cls, "bleScan", "(I)Ljava/lang/String;");
-            MI.ble_connect = static_method(j, cls, "bleConnect", "(Ljava/lang/String;)Ljava/lang/String;");
-            MI.ble_disconnect = static_method(j, cls, "bleDisconnect", "(Ljava/lang/String;)V");
-            if (MI.attach && MI.send && MI.devices && MI.open && MI.close && MI.ble_scan && MI.ble_connect &&
-                MI.ble_disconnect && (*j)->RegisterNatives(j, cls, natives, 3) == 0 && !jni_failed(j)) {
-                MI.cls = (jclass)(*j)->NewGlobalRef(j, cls);
-                ok = MI.cls != NULL;
-            }
+/* Every source parsed here whose port has closed since (unplugged, closed
+ * by Magpie.Midi, another app stopped sending into Magpie's own device):
+ * what it held ends, and its late bytes can't reach the next port on it.
+ * mob_midi_source_info is lock-free; a generation the sink moved on
+ * meanwhile has ended its voices itself. */
+static void midi_sources_check(void) {
+    for (uint32_t i = 1; i < MIDI_SOURCES; i++) {
+        midi_source *s = &MI.sources[i];
+        pthread_mutex_lock(&s->lock);
+        uint32_t seen = s->generation;
+        pthread_mutex_unlock(&s->lock);
+        uint32_t current = 0;
+        if (!seen || (mob_midi_source_info(i, &current, NULL, NULL) == MOB_MIDI_OK && current == seen)) continue;
+        pthread_mutex_lock(&s->lock);
+        if (s->generation == seen) {
+            s->generation = 0;
+            s->parser = (mi_parser){0};
+            source_gone((int)i);
         }
-        (*j)->PopLocalFrame(j, NULL);
+        pthread_mutex_unlock(&s->lock);
     }
-    jclass bound = MI.cls;
-    jmethodID attach = MI.attach;
-    pthread_mutex_unlock(&MI.lock);
-    if (ok) {
-        (*j)->CallStaticVoidMethod(j, bound, attach);
-        jni_failed(j);
-        LOGI("midi: bound");
-    } else {
-        LOGE("midi: %s not usable", MIDI_CLASS);
-    }
-    return ok;
 }
 
-/* MIDI bound (binding it if it isn't), with a JNI env for this thread;
- * NULL without. Pair with jni_done. */
-static JNIEnv *midi_env(bool *attached) {
-    JNIEnv *j = jni_env(attached);
-    if (!j) return NULL;
-    if (!midi_bind(j)) {
-        jni_done(*attached);
-        return NULL;
-    }
-    return j;
+/* The sending thread: a batch to every output (midi_out.c). */
+static void outs_send(const uint8_t *buf, int n, const mo_event *evs, int count, int64_t at) {
+    pthread_mutex_lock(&MI.out_lock);
+    for (int i = 0; i < MI.n_outs; i++) out_send(&MI.outs[i], buf, n, evs, count, at);
+    pthread_mutex_unlock(&MI.out_lock);
+    atomic_fetch_add_explicit(&MI.sent, (uint64_t)count, memory_order_relaxed);
+}
+
+/* The sending thread with nothing to send (see out_retry). */
+static void outs_retry(void) {
+    pthread_mutex_lock(&MI.out_lock);
+    for (int i = 0; i < MI.n_outs; i++) out_retry(&MI.outs[i]);
+    pthread_mutex_unlock(&MI.out_lock);
 }
 
 /* The sending thread's copy of the clock map: a read that loses to the
@@ -1842,31 +1773,28 @@ static void stat_push(float *ring, int64_t *n, float v) {
 static void *midi_out_main(void *arg) {
     (void)arg;
     if (setpriority(PRIO_PROCESS, (id_t)gettid(), -19) != 0) LOGE("midi: could not raise the sending thread's priority");
-    JNIEnv *j = NULL;
-    if (!g_jvm || (*g_jvm)->AttachCurrentThreadAsDaemon(g_jvm, &j, NULL) != JNI_OK) {
-        LOGE("midi: the sending thread has no JVM");
-        return NULL;
-    }
-    jbyteArray local = (*j)->NewByteArray(j, MIDI_SEND_MAX);
-    jbyteArray arr = local ? (jbyteArray)(*j)->NewGlobalRef(j, local) : NULL;
-    if (local) (*j)->DeleteLocalRef(j, local);
     uint8_t buf[MIDI_SEND_MAX];
+    mo_event evs[MIDI_SEND_MAX];
     midi_clock clk = {0, 0, 0};
-    for (int i = 0; arr && i < MI.n_stale;) {
+    for (int i = 0; i < MI.n_stale;) {
         int n = 0, count = 0;
-        for (; i < MI.n_stale && n + MI.stale[i].len <= MIDI_SEND_MAX; i++, count++) {
+        for (; i < MI.n_stale && n + MI.stale[i].len <= MIDI_SEND_MAX; i++) {
             memcpy(buf + n, MI.stale[i].b, MI.stale[i].len);
             n += MI.stale[i].len;
+            evs[count++] = MI.stale[i];
         }
-        (*j)->SetByteArrayRegion(j, arr, 0, n, (const jbyte *)buf);
-        (*j)->CallStaticVoidMethod(j, MI.cls, MI.send, arr, (jint)n, (jlong)now_ns());
-        jni_failed(j);
-        atomic_fetch_add_explicit(&MI.sent, (uint64_t)count, memory_order_relaxed);
+        outs_send(buf, n, evs, count, 0);
     }
     MI.n_stale = 0;
-    while (arr && atomic_load(&MI.out_run)) {
+    int64_t retry_at = 0;
+    while (atomic_load(&MI.out_run)) {
         mo_event ev;
         if (!mo_peek(&SP.midi.out, &ev)) {
+            int64_t now = now_ns();
+            if (now >= retry_at) {
+                outs_retry();
+                retry_at = now + MIDI_RETRY_NS;
+            }
             usleep(1000);
             continue;
         }
@@ -1889,31 +1817,22 @@ static void *midi_out_main(void *arg) {
             }
             memcpy(buf + n, ev.b, ev.len);
             n += ev.len;
-            count++;
+            evs[count++] = ev;
         }
         if (n == 0) continue;
-        (*j)->SetByteArrayRegion(j, arr, 0, n, (const jbyte *)buf);
         int64_t sent_at = now_ns();
-        (*j)->CallStaticVoidMethod(j, MI.cls, MI.send, arr, (jint)n, (jlong)t);
-        jni_failed(j);
-        atomic_fetch_add_explicit(&MI.sent, (uint64_t)count, memory_order_relaxed);
+        outs_send(buf, n, evs, count, t);
         stat_push(MI.late_us, &MI.late_n, (float)((sent_at - t) / 1000.0));
     }
-    if (arr) (*j)->DeleteGlobalRef(j, arr);
-    (*g_jvm)->DetachCurrentThread(g_jvm);
     return NULL;
 }
 
-/* Bind MIDI and start the sending thread. What is left in the out queue
- * from an earlier stream is stale: the notes whose other half went out go
- * first, at once (mo_take_stale: a note-on that went out keeps its note-off,
- * a voice still holding its note gets its note-on), the rest is dropped.
- * Caller holds E.lock; the queue has no consumer until the thread starts. */
+/* Start the sending thread. What is left in the out queue from an earlier
+ * stream is stale: the notes whose other half went out go first, at once
+ * (mo_take_stale: a note-on that went out keeps its note-off, a voice still
+ * holding its note gets its note-on), the rest is dropped. Caller holds
+ * E.lock; the queue has no consumer until the thread starts. */
 static void midi_start_locked(void) {
-    bool attached;
-    JNIEnv *j = midi_env(&attached);
-    if (!j) return;
-    jni_done(attached);
     if (MI.out_started) return;
     MI.n_stale = mo_take_stale(&SP.midi.out, MI.stale);
     atomic_store(&MI.out_run, true);
@@ -1944,18 +1863,29 @@ static void midi_in_latency(const sp_event *ev) {
 static ERL_NIF_TERM ring_term(ErlNifEnv *env, const float *ring, const int64_t *count_at, int size);
 
 static ERL_NIF_TERM midi_info(ErlNifEnv *env) {
-    ERL_NIF_TERM keys[8] = {atom(env, "bound"),        atom(env, "received"),         atom(env, "applied"),
-                            atom(env, "sent"),         atom(env, "out_dropped"),      atom(env, "late_ticks_dropped"),
-                            atom(env, "in_latency_ms"), atom(env, "out_late_us")};
-    ERL_NIF_TERM vals[8] = {atom(env, MI.cls ? "true" : "false"),
-                            enif_make_uint64(env, atomic_load(&MI.received)),
-                            enif_make_uint64(env, atomic_load(&SP.midi.in_messages)),
-                            enif_make_uint64(env, atomic_load(&MI.sent)),
-                            enif_make_uint64(env, atomic_load(&SP.midi.out.dropped)),
-                            enif_make_uint64(env, atomic_load(&MI.late_dropped)),
-                            ring_term(env, MI.in_ms, &MI.in_n, MIDI_STATS),
-                            ring_term(env, MI.late_us, &MI.late_n, MIDI_STATS)};
-    return make_map(env, keys, vals, 8);
+    pthread_mutex_lock(&MI.out_lock);
+    int outputs = MI.n_outs, refusing = 0;
+    for (int i = 0; i < MI.n_outs; i++) refusing += MI.outs[i].refusing;
+    pthread_mutex_unlock(&MI.out_lock);
+    ERL_NIF_TERM keys[13] = {atom(env, "bound"),         atom(env, "received"),    atom(env, "applied"),
+                             atom(env, "sent"),          atom(env, "out_dropped"), atom(env, "late_ticks_dropped"),
+                             atom(env, "refused"),       atom(env, "discards"),    atom(env, "offs_owed"),
+                             atom(env, "outputs"),       atom(env, "refusing"),    atom(env, "in_latency_ms"),
+                             atom(env, "out_late_us")};
+    ERL_NIF_TERM vals[13] = {atom(env, MI.sink ? "true" : "false"),
+                             enif_make_uint64(env, atomic_load(&MI.received)),
+                             enif_make_uint64(env, atomic_load(&SP.midi.in_messages)),
+                             enif_make_uint64(env, atomic_load(&MI.sent)),
+                             enif_make_uint64(env, atomic_load(&SP.midi.out.dropped)),
+                             enif_make_uint64(env, atomic_load(&MI.late_dropped)),
+                             enif_make_uint64(env, atomic_load(&OUT_STATS.refused)),
+                             enif_make_uint64(env, atomic_load(&OUT_STATS.discards)),
+                             enif_make_uint64(env, atomic_load(&OUT_STATS.offs_owed)),
+                             enif_make_int(env, outputs),
+                             enif_make_int(env, refusing),
+                             ring_term(env, MI.in_ms, &MI.in_n, MIDI_STATS),
+                             ring_term(env, MI.late_us, &MI.late_n, MIDI_STATS)};
+    return make_map(env, keys, vals, 13);
 }
 
 /* ── NIFs ────────────────────────────────────────────────────────────────── */
@@ -2536,6 +2466,9 @@ static ERL_NIF_TERM nif_reset_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     atomic_store(&MI.received, 0);
     atomic_store(&MI.sent, 0);
     atomic_store(&MI.late_dropped, 0);
+    atomic_store(&OUT_STATS.refused, 0);
+    atomic_store(&OUT_STATS.discards, 0);
+    atomic_store(&OUT_STATS.offs_owed, 0);
     pthread_mutex_unlock(&E.stats_lock);
     return ok_atom(env);
 }
@@ -2858,136 +2791,40 @@ static ERL_NIF_TERM nif_set_midi(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     return ok_atom(env);
 }
 
-/* midi_listen(Pid) -> ok | {error, unavailable}: device events to Pid,
- * starting with the port's connection counts now (attach sends them; the
- * one sent when MIDI was bound may have gone before there was a listener).
- * Dirty IO (binds MIDI on first use). */
-static ERL_NIF_TERM nif_midi_listen(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+/* midi_outputs([Handle]) -> ok: the outputs MIDI out goes to, as mob_midi
+ * output handles (Magpie's own device's output, each opened device's
+ * input). An output kept from the last list keeps what it is owed. Anyone;
+ * dirty IO (waits for the sending thread's current send). */
+static ERL_NIF_TERM nif_midi_outputs(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
-    ErlNifPid pid;
-    if (!enif_get_local_pid(env, argv[0], &pid)) return enif_make_badarg(env);
-    pthread_mutex_lock(&MI.lock);
-    MI.listener = pid;
-    MI.has_listener = true;
-    pthread_mutex_unlock(&MI.lock);
-    bool attached;
-    JNIEnv *j = midi_env(&attached);
-    if (!j) return error_tuple(env, "unavailable");
-    (*j)->CallStaticVoidMethod(j, MI.cls, MI.attach);
-    jni_failed(j);
-    jni_done(attached);
+    unsigned len;
+    if (!enif_get_list_length(env, argv[0], &len) || len > MIDI_OUTPUTS) return enif_make_badarg(env);
+    mob_midi_port handles[MIDI_OUTPUTS];
+    ERL_NIF_TERM head, tail = argv[0];
+    for (unsigned i = 0; enif_get_list_cell(env, tail, &head, &tail); i++) {
+        ErlNifSInt64 h;
+        if (!enif_get_int64(env, head, &h) || h <= 0) return enif_make_badarg(env);
+        handles[i] = (mob_midi_port)h;
+    }
+    pthread_mutex_lock(&MI.out_lock);
+    for (unsigned i = 0; i < len; i++) {
+        MI.next[i] = (midi_out){.handle = handles[i]};
+        for (int k = 0; k < MI.n_outs; k++)
+            if (MI.outs[k].handle == handles[i]) MI.next[i] = MI.outs[k];
+    }
+    memcpy(MI.outs, MI.next, len * sizeof(midi_out));
+    MI.n_outs = (int)len;
+    pthread_mutex_unlock(&MI.out_lock);
     return ok_atom(env);
 }
 
-/* A Kotlin answer: "" → ok, else {error, Reason} (null: error). */
-static ERL_NIF_TERM reason_term(ErlNifEnv *env, JNIEnv *j, jstring r) {
-    if (jni_failed(j) || !r) return error_tuple(env, "error");
-    const char *s = (*j)->GetStringUTFChars(j, r, NULL);
-    ERL_NIF_TERM out = s && s[0] ? error_tuple(env, s) : ok_atom(env);
-    if (s) (*j)->ReleaseStringUTFChars(j, r, s);
-    (*j)->DeleteLocalRef(j, r);
-    return out;
-}
-
-/* midi_devices() -> {ok, Json} | {error, unavailable}. Dirty IO. */
-static ERL_NIF_TERM nif_midi_devices(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+/* midi_sources_changed() -> ok: an input closed or changed hands (see
+ * midi_sources_check). Anyone; dirty IO (may apply commands offline). */
+static ERL_NIF_TERM nif_midi_sources_changed(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     (void)argv;
-    bool attached;
-    JNIEnv *j = midi_env(&attached);
-    if (!j) return error_tuple(env, "unavailable");
-    jbyteArray json = (jbyteArray)(*j)->CallStaticObjectMethod(j, MI.cls, MI.devices);
-    ERL_NIF_TERM out = error_tuple(env, "error");
-    if (!jni_failed(j) && json) {
-        jsize len = (*j)->GetArrayLength(j, json);
-        ERL_NIF_TERM bin;
-        unsigned char *p = enif_make_new_binary(env, (size_t)len, &bin);
-        (*j)->GetByteArrayRegion(j, json, 0, len, (jbyte *)p);
-        if (!jni_failed(j)) out = enif_make_tuple2(env, ok_atom(env), bin);
-        (*j)->DeleteLocalRef(j, json);
-    }
-    jni_done(attached);
-    return out;
-}
-
-/* midi_open(Id) / midi_close(Id): open a device both ways (outcome as an
- * event) or close it. Dirty IO. */
-static ERL_NIF_TERM nif_midi_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
-    int id;
-    if (!enif_get_int(env, argv[0], &id)) return enif_make_badarg(env);
-    bool attached;
-    JNIEnv *j = midi_env(&attached);
-    if (!j) return error_tuple(env, "unavailable");
-    ERL_NIF_TERM out = reason_term(env, j, (jstring)(*j)->CallStaticObjectMethod(j, MI.cls, MI.open, (jint)id));
-    jni_done(attached);
-    return out;
-}
-
-static ERL_NIF_TERM nif_midi_close(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
-    int id;
-    if (!enif_get_int(env, argv[0], &id)) return enif_make_badarg(env);
-    bool attached;
-    JNIEnv *j = midi_env(&attached);
-    if (!j) return error_tuple(env, "unavailable");
-    (*j)->CallStaticVoidMethod(j, MI.cls, MI.close, (jint)id);
-    ERL_NIF_TERM out = jni_failed(j) ? error_tuple(env, "error") : ok_atom(env);
-    jni_done(attached);
-    return out;
-}
-
-/* midi_ble_scan(Ms) -> ok | {error, Reason}. Dirty IO. */
-static ERL_NIF_TERM nif_midi_ble_scan(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
-    int ms;
-    if (!get_range(env, argv[0], 1, 600000, &ms)) return enif_make_badarg(env);
-    bool attached;
-    JNIEnv *j = midi_env(&attached);
-    if (!j) return error_tuple(env, "unavailable");
-    ERL_NIF_TERM out = reason_term(env, j, (jstring)(*j)->CallStaticObjectMethod(j, MI.cls, MI.ble_scan, (jint)ms));
-    jni_done(attached);
-    return out;
-}
-
-/* An address binary as a Java string (NULL: not one). */
-static jstring address_string(ErlNifEnv *env, JNIEnv *j, ERL_NIF_TERM term) {
-    ErlNifBinary b;
-    char s[32];
-    if (!enif_inspect_binary(env, term, &b) || b.size == 0 || b.size >= sizeof(s)) return NULL;
-    memcpy(s, b.data, b.size);
-    s[b.size] = 0;
-    return (*j)->NewStringUTF(j, s);
-}
-
-/* midi_ble_connect(Address) -> ok | {error, Reason}; midi_ble_disconnect. Dirty IO. */
-static ERL_NIF_TERM nif_midi_ble_connect(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
-    bool attached;
-    JNIEnv *j = midi_env(&attached);
-    if (!j) return error_tuple(env, "unavailable");
-    jstring a = address_string(env, j, argv[0]);
-    ERL_NIF_TERM out = a ? reason_term(env, j, (jstring)(*j)->CallStaticObjectMethod(j, MI.cls, MI.ble_connect, a))
-                         : enif_make_badarg(env);
-    if (a) (*j)->DeleteLocalRef(j, a);
-    jni_done(attached);
-    return out;
-}
-
-static ERL_NIF_TERM nif_midi_ble_disconnect(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
-    bool attached;
-    JNIEnv *j = midi_env(&attached);
-    if (!j) return error_tuple(env, "unavailable");
-    jstring a = address_string(env, j, argv[0]);
-    ERL_NIF_TERM out = enif_make_badarg(env);
-    if (a) {
-        (*j)->CallStaticVoidMethod(j, MI.cls, MI.ble_disconnect, a);
-        out = jni_failed(j) ? error_tuple(env, "error") : ok_atom(env);
-        (*j)->DeleteLocalRef(j, a);
-    }
-    jni_done(attached);
-    return out;
+    midi_sources_check();
+    return ok_atom(env);
 }
 
 static int on_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
@@ -2995,7 +2832,7 @@ static int on_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     (void)info;
     pthread_mutex_init(&E.lock, NULL);
     pthread_mutex_init(&IN.lock, NULL);
-    pthread_mutex_init(&MI.lock, NULL);
+    pthread_mutex_init(&MI.out_lock, NULL);
     for (int i = 0; i < MIDI_SOURCES; i++) pthread_mutex_init(&MI.sources[i].lock, NULL);
     pcm_type = enif_open_resource_type(env, NULL, "magpie_pcm", pcm_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!pcm_type) return 1;
@@ -3008,6 +2845,11 @@ static int on_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     E.drains = true;
     libs_ok = bind_libraries();
     if (!libs_ok) LOGE("could not bind %s", libs_error);
+    /* MIDI in from mob_midi's threads: the sources' locks are ready. */
+    int rc = mob_midi_abi_version() == MOB_MIDI_ABI_VERSION ? mob_midi_set_sink(midi_sink, NULL) : MOB_MIDI_ERR_INVALID;
+    MI.sink = rc == MOB_MIDI_OK;
+    if (!MI.sink) LOGE("midi: no sink (%d; mob_midi ABI %d, built against %d)", rc, mob_midi_abi_version(),
+                       MOB_MIDI_ABI_VERSION);
     return 0;
 }
 
@@ -3038,13 +2880,8 @@ static ErlNifFunc nif_funcs[] = {
     {"record_stop", 0, nif_record_stop, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"record_cancel", 0, nif_record_cancel, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_midi", 1, nif_set_midi, 0},
-    {"midi_listen", 1, nif_midi_listen, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"midi_devices", 0, nif_midi_devices, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"midi_open", 1, nif_midi_open, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"midi_close", 1, nif_midi_close, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"midi_ble_scan", 1, nif_midi_ble_scan, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"midi_ble_connect", 1, nif_midi_ble_connect, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"midi_ble_disconnect", 1, nif_midi_ble_disconnect, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"midi_outputs", 1, nif_midi_outputs, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"midi_sources_changed", 0, nif_midi_sources_changed, ERL_NIF_DIRTY_JOB_IO_BOUND},
 };
 
 ERL_NIF_INIT(Elixir.Magpie.Audio.Nif, nif_funcs, on_load, NULL, NULL, NULL)

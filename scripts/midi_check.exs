@@ -1,31 +1,34 @@
-# Checks Magpie's MIDI on a connected Android phone through the "Magpie"
-# port, from another process: plugins/magpie_midi/tools/MidiProbe.java runs
-# on the phone as the shell user (app_process), sends notes and a 24 PPQN
-# clock into the port and records what Magpie sends out, every message
-# stamped with CLOCK_MONOTONIC; the app is driven over Erlang distribution.
+# Checks Magpie's MIDI on a connected Android phone through its own MIDI
+# device "Magpie" (mob_midi's MobMidiDeviceService), from another process:
+# scripts/midi_probe/MidiProbe.java runs on the phone as the shell user
+# (app_process), sends notes and a 24 PPQN clock into the device and records
+# what Magpie sends out, every message stamped with CLOCK_MONOTONIC; the app
+# is driven over Erlang distribution.
 #
 #   mix mob.deploy --native --android --device <serial>
 #   mix mob.connect --no-iex --android-only --device <serial>
 #   SERIAL=<serial> mix run --no-start scripts/midi_check.exs
 #
-# Measures: the port's ports; notes in → the mapped pads (voice starts per
-# pad), the channel filter, in → heard latency (`info().midi.in_latency_ms`:
-# the probe's timestamp → the frame the voice is heard); notes out for
-# touches (`Engine.trigger`) and sequencer steps, stamped with the frame
-# heard; clock send (tick spacing of the stamps and of the arrivals, arrival
-# − stamp, `out_late_us`, song position / Start / Stop, notes on the tick
-# grid); an incoming clock with Start / Stop / song position / Continue
-# ignored (Magpie doesn't follow a clock yet).
+# Measures: the device's ports and service; notes in → the mapped pads
+# (voice starts per pad), the channel filter, in → heard latency
+# (`info().midi.in_latency_ms`: the probe's timestamp → the frame the voice
+# is heard); notes out for touches (`Engine.trigger`) and sequencer steps,
+# stamped with the frame heard; clock send (tick spacing of the stamps and
+# of the arrivals, arrival − stamp, `out_late_us`, song position / Start /
+# Stop, notes on the tick grid); an incoming clock with Start / Stop / song
+# position / Continue ignored (Magpie doesn't follow a clock yet); a
+# listener that stops reading (mob_midi refuses sends until its queue has
+# drained: every note-on still gets its note-off).
 #
 # It puts short test tones on bank A pads 0..4 (notes 36, 38, 42, 46 and a
 # keys pad rooted at 60) and its own pattern in the engine, then puts the
-# pads, the kit's MIDI settings and the pattern back and deletes only the
-# sounds it added. Turn the volume down. Needs JDK 17+ and the Android SDK
-# for the probe (see midi_probe.sh).
+# pads, the kit's MIDI settings, the tempo and the pattern back and deletes
+# only the sounds it added. Turn the volume down. Needs JDK 17+ and the
+# Android SDK for the probe (see midi_probe.sh).
 
 serial = System.fetch_env!("SERIAL")
 app_dir = Path.expand("..", __DIR__)
-probe_sh = Path.join(app_dir, "plugins/magpie_midi/tools/midi_probe.sh")
+probe_sh = Path.join(app_dir, "scripts/midi_probe/midi_probe.sh")
 
 node =
   String.to_atom(System.get_env("NODE", "magpie_android_#{String.downcase(serial)}@127.0.0.1"))
@@ -166,7 +169,7 @@ defmodule MagpieMidiCheck do
     state = Engine.state()
     # Straight 16ths: sequenced notes land on clock ticks.
     :ok = Engine.set_swing(0.5)
-    %{originals: originals, new: Enum.reject(new, &is_nil/1), midi: before.midi, pattern: state.pattern, swing: state.swing}
+    %{originals: originals, new: Enum.reject(new, &is_nil/1), midi: before.midi, pattern: state.pattern, swing: state.swing, tempo: state.tempo}
   end
 
   def ready? do
@@ -174,15 +177,17 @@ defmodule MagpieMidiCheck do
     Enum.all?(@pads, fn {i, _, _} -> match?(%{status: :ready}, pads[i]) end)
   end
 
-  def cleanup(%{originals: originals, new: new, midi: midi, pattern: pattern, swing: swing}) do
+  def cleanup(%{originals: originals, new: new, midi: midi, pattern: pattern, swing: swing, tempo: tempo}) do
     Engine.stop()
     Engine.set_swing(swing)
+    Engine.set_tempo(tempo)
     # A kit's `follow` can't be set back (Magpie refuses it for now): it
     # keeps the clock this run left.
     :ok = KitSession.set_midi(if midi.clock == :follow, do: Map.delete(midi, :clock), else: midi)
     for {i, pad} <- originals, do: :ok = KitSession.update_pad(i, fn _ -> pad end)
     :ok = KitSession.flush()
-    Engine.set_pattern(pattern, at: :now)
+    # No pattern before (the engine can't be given none): an empty one.
+    Engine.set_pattern(pattern || pattern([]), at: :now)
     Enum.map(new, &Library.delete/1)
   end
 
@@ -260,21 +265,19 @@ _ = rpc.(Code, :compile_string, [helper])
 reset = fn -> rpc.(Magpie.Audio.Native, :reset_stats, []) end
 info = fn -> rpc.(Magpie.Engine, :info, []).midi end
 
-IO.puts("== Port")
+IO.puts("== Magpie's MIDI device")
 
-devices =
-  System.cmd("adb", ["-s", serial, "shell", "dumpsys midi"], stderr_to_stdout: true)
-  |> elem(0)
-  |> String.split("\n")
-  |> Enum.filter(&String.contains?(&1, "name=Magpie"))
+dumpsys = System.cmd("adb", ["-s", serial, "shell", "dumpsys midi"], stderr_to_stdout: true) |> elem(0)
 
-for d <- devices do
-  [_, i, o] = Regex.run(~r/mInputPortCount=(\d+),mOutputPortCount=(\d+)/, d)
-  IO.puts("  dumpsys midi: \"Magpie\", #{i} input, #{o} output")
+for d <- String.split(dumpsys, "\n"), String.contains?(d, "name=Magpie") do
+  [_, i, o] = Regex.run(~r/mInputPortCount=(\d+),\s*mOutputPortCount=(\d+)/, d)
+  service = Regex.run(~r/io\.mob\.midi\.\w+|com\.genericjam\.\S+Service/, d)
+  IO.puts("  dumpsys midi: \"Magpie\", #{i} input, #{o} output, service #{inspect(service && hd(service))}")
 end
 
 i0 = rpc.(Magpie.Engine, :info, [])
-IO.puts("  bound #{i0.midi.bound}; stream #{i0.rate} Hz, burst #{i0.burst}, buffer #{i0.buffer_frames}, output latency #{fmt.(i0.output_latency_ms)} ms")
+IO.puts("  sink registered #{i0.midi.bound}; stream #{i0.rate} Hz, burst #{i0.burst}, buffer #{i0.buffer_frames}, output latency #{fmt.(i0.output_latency_ms)} ms")
+IO.puts("  outputs the engine sends to: #{i0.midi.outputs}")
 
 saved = rpc.(MagpieMidiCheck, :setup, [])
 
@@ -427,7 +430,46 @@ try do
       "#{outs} messages out"
   )
 
-  IO.puts("\n== Totals: #{inspect(Map.take(info.(), [:received, :applied, :sent, :out_dropped, :late_ticks_dropped]))}")
+  # ── A listener that stops reading ──────────────────────────────────────────
+
+  IO.puts("\n== A listener that stops reading (probe stall 18 s, reads again at 15 s; 240 bpm clock send, pads 0 and 1 on every step)")
+  :ok = rpc.(Magpie.KitSession, :set_midi, [%{clock: :send}])
+  :ok = rpc.(Magpie.Engine, :set_tempo, [240])
+  :ok = rpc.(Magpie.Engine, :set_pattern, [rpc.(MagpieMidiCheck, :pattern, [[{0, Enum.to_list(0..15)}, {1, Enum.to_list(0..15)}]]), [at: :now]])
+  Process.sleep(300)
+  reset.()
+  task = probe.(["stall", "18"])
+  await_port.(:outputs)
+  :ok = rpc.(Magpie.Engine, :play, [])
+  Process.sleep(16_500)
+  :ok = rpc.(Magpie.Engine, :stop, [])
+  events = Task.await(task, :infinity)
+  stalled = info.()
+  times = fn tag -> for {:line, l} <- events, [^tag, t] <- [String.split(l, " ")], do: String.to_integer(t) end
+  resume = List.first(times.("RESUME"))
+  recv = for {:recv, a, _s, msg} <- events, do: {a, msg}
+
+  sounding =
+    Enum.reduce(recv, MapSet.new(), fn
+      {_, [st, n, v]}, acc when Bitwise.band(st, 0xF0) == 0x90 and v > 0 -> MapSet.put(acc, {Bitwise.band(st, 15), n})
+      {_, [st, n, _]}, acc when Bitwise.band(st, 0xF0) in [0x80, 0x90] -> MapSet.delete(acc, {Bitwise.band(st, 15), n})
+      _, acc -> acc
+    end)
+
+  after_resume = for {a, msg} <- recv, resume && a >= resume, do: msg
+  ons = Enum.count(recv, fn {_, m} -> match?([st, _, v] when Bitwise.band(st, 0xF0) == 0x90 and v > 0, m) end)
+  offs = Enum.count(recv, fn {_, m} -> match?([st, _, _] when Bitwise.band(st, 0xF0) == 0x80, m) end)
+
+  IO.puts(
+    "  refused #{stalled.refused} messages, #{stalled.discards} queue discard(s), #{stalled.offs_owed} owed note-offs sent after; " <>
+      "still refusing at the end: #{stalled.refusing}"
+  )
+
+  IO.puts("  at the probe: #{length(recv)} messages (#{length(after_resume)} after it read again), #{ons} note-ons, #{offs} note-offs; left sounding: #{inspect(MapSet.to_list(sounding))}")
+
+  IO.puts(
+    "\n== Totals: #{inspect(Map.take(info.(), [:received, :applied, :sent, :out_dropped, :late_ticks_dropped, :refused, :discards, :offs_owed]))}"
+  )
 after
   send(c, :exit)
   rpc.(MagpieMidiCheck, :cleanup, [saved])

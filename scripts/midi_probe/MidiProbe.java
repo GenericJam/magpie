@@ -1,5 +1,5 @@
 // A MIDI client that runs outside the app, as the adb shell user, to drive
-// and measure the Magpie port from another process: it opens the device
+// and measure Magpie's MIDI device from another process: it opens the device
 // whose name is the first argument, listens on its output port 0 and,
 // depending on the mode, sends notes or a 24 PPQN clock into its input
 // port 0. Every send is stamped with System.nanoTime (CLOCK_MONOTONIC, the
@@ -8,6 +8,9 @@
 //
 //   MidiProbe <name> devices
 //   MidiProbe <name> listen <seconds>
+//   MidiProbe <name> stall <seconds>
+//       listens, but blocks in its first onSend until 3 s before the end (a
+//       client that stops reading), then reads again: STALL / RESUME lines.
 //   MidiProbe <name> notes <seconds> <count> <gap ms> <channel 1-16> <note>[,<note>...]
 //       count note-ons (velocity 100) gap ms apart, cycling through the
 //       notes, each note-off half a gap later; starts after 500 ms.
@@ -25,7 +28,7 @@
 //   RECV <arrival> <stamp> <hex bytes>
 //   DONE
 //
-// Build, push and run with tools/midi_probe.sh. It runs under app_process,
+// Build, push and run with midi_probe.sh. It runs under app_process,
 // so it has no Context: it reaches the platform MidiManager through its
 // (hidden) IMidiManager constructor, as Humdinger's probe does.
 import android.media.midi.MidiDevice;
@@ -48,7 +51,7 @@ public final class MidiProbe {
     @SuppressWarnings("deprecation") // MidiManager.getDevices: getDevicesForTransport is API 33+
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.out.println("usage: MidiProbe <name> devices | listen <s> | notes <s> <count> <gap ms> <ch> <notes> | clock <s> <bpm> <beats>");
+            System.out.println("usage: MidiProbe <name> devices | listen <s> | stall <s> | notes <s> <count> <gap ms> <ch> <notes> | clock <s> <bpm> <beats>");
             System.exit(1);
         }
         String wanted = args[0];
@@ -88,13 +91,26 @@ public final class MidiProbe {
         }
 
         MidiOutputPort listen = info.getOutputPortCount() > 0 ? device[0].openOutputPort(0) : null;
-        boolean sends = !mode.equals("listen");
+        boolean sends = !mode.equals("listen") && !mode.equals("stall");
         MidiInputPort send = sends && info.getInputPortCount() > 0 ? device[0].openInputPort(0) : null;
         say("OPEN id=" + info.getId() + " sending=" + (send != null) + " listening=" + (listen != null));
+        long seconds = Long.parseLong(args[2]);
+        long end = System.nanoTime() + seconds * 1_000_000_000L;
+        // stall: the first onSend blocks until 3 s before the end (a client
+        // that stops reading), then it reads again.
+        long[] stallUntil = {mode.equals("stall") ? end - 3_000_000_000L : 0};
         if (listen != null) {
             listen.connect(new MidiReceiver() {
                 @Override
                 public void onSend(byte[] msg, int offset, int count, long timestamp) {
+                    if (stallUntil[0] > 0) {
+                        say("STALL " + System.nanoTime());
+                        for (long left = stallUntil[0] - System.nanoTime(); left > 0; left = stallUntil[0] - System.nanoTime()) {
+                            LockSupport.parkNanos(left);
+                        }
+                        stallUntil[0] = 0;
+                        say("RESUME " + System.nanoTime());
+                    }
                     long arrival = System.nanoTime();
                     StringBuilder line = new StringBuilder("RECV ").append(arrival).append(' ').append(timestamp);
                     for (int i = offset; i < offset + count; i++) line.append(String.format(" %02x", msg[i] & 0xff));
@@ -108,11 +124,10 @@ public final class MidiProbe {
             System.exit(5);
         }
 
-        long seconds = Long.parseLong(args[2]);
-        long end = System.nanoTime() + seconds * 1_000_000_000L;
         Thread.sleep(500);
         switch (mode) {
             case "listen":
+            case "stall":
                 break;
             case "notes":
                 notes(send, Integer.parseInt(args[3]), Long.parseLong(args[4]), Integer.parseInt(args[5]), args[6]);

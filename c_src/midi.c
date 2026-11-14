@@ -49,8 +49,9 @@ static int mi_data_len(uint8_t status) {
  * dropped). Channel messages keep running status; system common messages
  * cancel it. SysEx is skipped up to its end (or the next status byte).
  * Data bytes with no status are dropped. */
-MI_UNUSED static void mi_parse(mi_parser *p, const uint8_t *in, int n, void (*emit)(void *ctx, mi_msg m), void *ctx) {
-    for (int i = 0; i < n; i++) {
+MI_UNUSED static void mi_parse(mi_parser *p, const uint8_t *in, size_t n, void (*emit)(void *ctx, mi_msg m),
+                               void *ctx) {
+    for (size_t i = 0; i < n; i++) {
         uint8_t b = in[i];
         if (b >= 0xF8) {
             if (b != 0xF9 && b != 0xFD && b != 0xFE) emit(ctx, (mi_msg){b, 0, 0, 1});

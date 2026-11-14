@@ -107,20 +107,9 @@ defmodule Magpie.Audio.Nif do
   """
   def set_midi(_table), do: :erlang.nif_error(:nif_not_loaded)
 
-  @doc "Send `{:magpie_midi, tag, json}` device messages to `pid` (anyone, dirty IO)."
-  def midi_listen(_pid), do: :erlang.nif_error(:nif_not_loaded)
+  @doc "The MIDI outputs: mob_midi output handles (anyone, dirty IO)."
+  def midi_outputs(_handles), do: :erlang.nif_error(:nif_not_loaded)
 
-  @doc "`{:ok, json}`: the MIDI devices as a JSON array (dirty IO)."
-  def midi_devices, do: :erlang.nif_error(:nif_not_loaded)
-
-  @doc "Open device `id` both ways; `:opened` / `:open_failed` follows (dirty IO)."
-  def midi_open(_id), do: :erlang.nif_error(:nif_not_loaded)
-
-  def midi_close(_id), do: :erlang.nif_error(:nif_not_loaded)
-
-  @doc "Scan for Bluetooth-MIDI devices for `ms` (dirty IO)."
-  def midi_ble_scan(_ms), do: :erlang.nif_error(:nif_not_loaded)
-
-  def midi_ble_connect(_address), do: :erlang.nif_error(:nif_not_loaded)
-  def midi_ble_disconnect(_address), do: :erlang.nif_error(:nif_not_loaded)
+  @doc "An input closed or changed hands: what closed inputs held ends (anyone, dirty IO)."
+  def midi_sources_changed, do: :erlang.nif_error(:nif_not_loaded)
 end

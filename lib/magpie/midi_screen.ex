@@ -49,8 +49,15 @@ defmodule Magpie.MidiScreen do
   def handle_info({:magpie_kit, snapshot}, socket),
     do: {:noreply, Mob.Socket.assign(socket, :kit, snapshot.kit)}
 
-  def handle_info({:magpie_midi, midi}, socket),
-    do: {:noreply, Mob.Socket.assign(socket, :midi, midi)}
+  # A scan that fails (no permission, Bluetooth off, ...) says why.
+  def handle_info({:magpie_midi, midi}, socket) do
+    socket =
+      if midi.scan.error && midi.scan.error != socket.assigns.midi.scan.error,
+        do: Mob.Socket.assign(socket, :notice, scan_error(midi.scan.error)),
+        else: socket
+
+    {:noreply, Mob.Socket.assign(socket, :midi, midi)}
+  end
 
   def handle_info({:tap, :back}, socket), do: {:noreply, Mob.Socket.pop_screen(socket)}
 
@@ -70,7 +77,13 @@ defmodule Magpie.MidiScreen do
     {:noreply, socket}
   end
 
-  def handle_info({:tap, :scan}, socket), do: {:noreply, scan(socket)}
+  # Scanning needs the :midi_bluetooth permission: ask (the answer comes at
+  # once when it was given before), scan once granted.
+  def handle_info({:tap, :scan}, socket) do
+    if device_calls?(),
+      do: {:noreply, Mob.Permissions.request(socket, :midi_bluetooth)},
+      else: {:noreply, scan(socket)}
+  end
 
   def handle_info({:tap, {:ble, address}}, socket) do
     notice =
@@ -93,23 +106,16 @@ defmodule Magpie.MidiScreen do
 
   defp scan(socket) do
     case Midi.ble_scan() do
-      :ok ->
-        Mob.Socket.assign(socket, :notice, nil)
-
-      {:error, :no_permission} ->
-        if device_calls?(),
-          do: Mob.Permissions.request(socket, :midi_bluetooth),
-          else: Mob.Socket.assign(socket, :notice, "Bluetooth MIDI needs a permission.")
-
-      {:error, reason} ->
-        Mob.Socket.assign(socket, :notice, scan_error(reason))
+      :ok -> Mob.Socket.assign(socket, :notice, nil)
+      {:error, reason} -> Mob.Socket.assign(socket, :notice, scan_error(reason))
     end
   end
 
+  defp scan_error(:permission_denied), do: "Bluetooth MIDI needs the Nearby devices permission."
   defp scan_error(:bluetooth_off), do: "Bluetooth is off."
   defp scan_error(:location_off), do: "Turn location on to scan for Bluetooth MIDI."
-  defp scan_error(:no_bluetooth), do: "This phone has no Bluetooth."
-  defp scan_error(reason), do: "Can't scan (#{reason})."
+  defp scan_error(:unsupported), do: "This phone can't scan for Bluetooth MIDI."
+  defp scan_error(reason), do: "Bluetooth MIDI failed (#{reason})."
 
   @doc false
   def next_channel(:all), do: 1
@@ -335,6 +341,7 @@ defmodule Magpie.MidiScreen do
         :usb -> "USB"
         :bluetooth -> "Bluetooth"
         :virtual -> "app"
+        :other -> "MIDI"
       end
 
     "#{type} · #{status_label(device.status)}"
