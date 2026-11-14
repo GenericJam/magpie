@@ -24,14 +24,18 @@ defmodule Magpie.MixProject do
 
   defp deps do
     [
-      # 0.9.29: per-node multi-pointer on_touch (MOB-518), which the pads use.
-      {:mob, "~> 0.9.29"},
+      # 0.9.29: per-node multi-pointer on_touch (MOB-518), which the pads use;
+      # 0.9.30: the 32-bit Android fixes (MOB-523), for the moto e (armv7).
+      {:mob, "~> 0.9.30"},
       {:mob_dev, "~> 0.7.31", only: :dev, runtime: false},
       # mix mob.icon renders the launcher icons with it.
       {:image, "~> 0.54", only: :dev, runtime: false},
       {:ecto_sqlite3, "~> 0.18"},
       # The "Other apps" recording source (Kotlin; see mob.exs).
       {:magpie_capture, path: "plugins/magpie_capture"},
+      # MIDI: devices, the "Magpie" virtual device, Bluetooth MIDI and the C
+      # ABI magpie_audio.c sends and receives through (see mob.exs).
+      {:mob_midi, "~> 0.3.0"},
       # Tests check kit files against design/kit.schema.json itself.
       {:jsv, "~> 0.27.0", only: :test},
       # Code quality — Credo + ex_slop (catches AI-generated patterns

@@ -482,6 +482,154 @@ starts the take on the frame captured when its downbeat is heard.
     silence for ~10 s. A tap or `KEYCODE_MEDIA_PLAY` starts it;
   - Magpie's own sequencer: digital silence (its UID is excluded).
 
+## MIDI
+
+Why it is built this way: `decisions/2026-11-13-midi.md` (and the move to
+mob_midi: `decisions/2026-11-13-midi-on-mob-midi.md`). No MIDI byte passes
+through the BEAM.
+
+- **Devices and ports: mob_midi** (`~> 0.3.0` from Hex, signed with the
+  shared key and trusted in `mob.exs`). Magpie's own
+  device "Magpie" (one input, one output) is declared by `mix
+  mob_midi.gen.virtual_device` from `config :mob_midi, :virtual_device`
+  (`res/xml/mob_midi_device.xml` + a fenced `<service>` for
+  `io.mob.midi.MobMidiDeviceService` in the manifest, both committed; see
+  "Working on it" for why `--check` isn't in the gate). Bluetooth-MIDI scan/connect and the
+  `:midi_bluetooth` capability are mob_midi's too.
+- **Native:** `c_src/magpie_audio.c` includes
+  `deps/mob_midi/priv/include/mob_midi.h`. In: `midi_sink`, registered
+  with `mob_midi_set_sink` at NIF load, gets every input opened with
+  `deliver: :native` as (source 1..63, generation, bytes, timestamp) on
+  mob_midi's receive thread; one parser per source, a new generation is a
+  fresh parser and ends what the old port held; `midi_sources_changed/0`
+  (from `Magpie.Midi` when a device closes or goes, or another app starts
+  or stops sending into Magpie's device) ends what closed sources held
+  (`mob_midi_source_info`). Out: the sending thread (started in `open/1`)
+  sleeps until a message's frame is heard and calls `mob_midi_send(handle,
+  bytes, len, t)` per output (`midi_outputs/1`: Magpie's own output and
+  each opened device's input port 0). `c_src/midi_out.c`: what each output
+  took, refused and is owed (below). `c_src/midi.c` (plain C): parser, the
+  out ring. `c_src/sampler.c` "MIDI in/out": the renderer maps notes
+  through the kit's table, sends notes/clock stamped with engine frames.
+- **Rule:** a note plays every non-keys pad whose `midi_note` it is (any
+  bank); unclaimed notes go to every keys pad (chromatic from its root);
+  note-off releases gate/loop/keys; a MIDI voice goes by the input,
+  channel and note that started it, past table changes and with no stream
+  running: its note-off, CC 123 (CC 120: fast) on its channel, or its
+  input closing (unplugged, port gone).
+  Played voices (touch, sequencer) send note-on/off (one note open per
+  channel and note; note-offs never dropped: they wait out a stream
+  restart, which drops an unsent note-on with its note-off and sends a
+  held voice's late; a note-on the full out ring refuses sends no
+  note-off); MIDI voices don't echo. Out channel = `in_channel` or 1.
+  Clock `send`: tick every 4 seq ticks, SPP 0 + Start on play, Stop,
+  free-running while stopped. **No clock follow yet** (deferred, see the
+  decision record; the heuristic version is on branch
+  `midi-follow-heuristic`): incoming clock, Start, Stop, Continue and song
+  position do nothing in any mode. The kit format keeps `follow`: a kit
+  saying it loads, round-trips and plays on the internal clock
+  (`Midi.Map.config/1` compiles it to `:internal`); `KitSession.set_midi/1`
+  refuses `:follow` and `Magpie.MidiScreen` offers internal ↔ send.
+  A port whose listener stops reading fills mob_midi's queue (256 chunks):
+  the send is refused (`MOB_MIDI_ERR_QUEUE_FULL`) and so is every send
+  until it has drained. At the first refusal the output's queue is
+  discarded (late notes and clock, like the late ticks dropped below);
+  note-offs it refused or that the discard may have dropped are owed and go
+  first once it takes sends again (retried every 10 ms with nothing else
+  to send), except for notes held again since (their own note-off ends
+  them); a refused note-on owes nothing. Nobody listening to Magpie's own
+  output (`MOB_MIDI_ERR_NO_LISTENER`): nothing owed.
+- **Elixir:** `Magpie.Midi.Map.config/1` / `route/2` (the table and the
+  rule), `Engine.set_midi/1` (KitSession pushes it on every kit change),
+  `KitSession.set_midi(%{in_channel, clock})`, `Magpie.Midi` (devices
+  through `MobMidi`, `Magpie.Midi.Fake` in tests: USB/BLE auto-open
+  (`open_input(port: :all, deliver: :native)` + `open_output` port 0),
+  other apps' ports on request, choices in `Mob.State`; `open_virtual("Magpie",
+  deliver: :native)`; `subscribe/1`, `set_open/2`, `ble_scan/0`,
+  `ble_connect/1`; it hands the engine the output handles), `Engine.state/0`
+  `midi`, `info/0` `midi` stats (`refused`, `discards`, `offs_owed`,
+  `outputs`, `refusing` besides the counts and latencies).
+  `Magpie.MidiScreen` (plain, not designed) behind the magpie button.
+- **Checking it:** `cc -O2 -Wall -Wextra -Wno-unused-function -o
+  /tmp/midi_host c_src/test/midi_host.c -lm && /tmp/midi_host` (also with
+  `-fsanitize=address,undefined`; it needs `deps/mob_midi` for the header
+  and runs `midi_out.c` against a fake port that stalls); `mix test
+  test/magpie/midi_*_test.exs test/magpie/kit_session_midi_test.exs`. On a
+  phone: `SERIAL=<serial> mix run --no-start scripts/midi_check.exs` (after
+  `mix mob.deploy --native` and `mix mob.connect`): it drives
+  `scripts/midi_probe/MidiProbe.java`, a client of Magpie's device run as
+  the shell user (`app_process`; `midi_probe.sh` builds and runs it by
+  hand), against test tones on bank A pads 0..4, and puts the kit back;
+  `MidiProbe ... clock <s> <bpm> <beats>` sends a clock with Start / Stop /
+  song position + Continue (Magpie must ignore it), `stall <s>` stops
+  reading for all but the last 3 s. (mob_midi's `tools/MidiProbe.java` has
+  no channel / note list / clock modes, so Magpie keeps its own.)
+
+### Measured (moto e 2020, Android 10, `scripts/midi_check.exs`)
+
+Through mob_midi (three runs: two on mob_midi#6's head 4e7437d, one on
+Hex 0.3.0 with mob 0.9.30, the same mob_midi code). Stream 48 kHz,
+240-frame bursts, output latency 35.9–36.8 ms. All through Magpie's device
+(`dumpsys midi`: "Magpie", 1 input, 1 output, service
+`io.mob.midi.MobMidiDeviceService`) from another process. "Before": the
+Kotlin plugin (two runs).
+
+- **Notes in:** 72 sent, 72 received, 72 applied, voice starts exactly as
+  mapped (6 per drum pad, 12 on the keys pad); channel 2 with `in_channel`
+  1: nothing. In → heard p50 34.5–37.2 ms, p95 36.6–39.4 ms, against a
+  touch's NIF call → heard p50 34.0–34.7 ms in the same runs: +0.4 to
+  +2.8 ms (before: 33.8–34.7 vs 33.7–34.4, +0.1 to +0.3; mob_midi's own
+  sender → sink p50 is 1.1–1.3 ms on this phone).
+- **Notes out:** 20 touches → 20 note-ons + 20 note-offs; touch call →
+  stamp p50 34.1–34.9 ms (the trigger latency). Stamp → arrival p50
+  1.16–1.25 ms, p95 2.5–2.8 ms (before 0.6, 1.2–1.8): mob_midi's
+  per-port dispatch thread is one more hop. The sending thread calls
+  `mob_midi_send` 0.26–0.29 ms (p50) after the stamp (before 0.23–0.29).
+- **Clock send** (120 bpm, 12 s): 672–673 ticks, none dropped. Stamp
+  spacing − period p95 0.16–0.18 ms. Arrival spacing rms 0.56–0.82 ms
+  (before 0.28–0.37), worst ±1.6–2.0 ms, one run ±7 ms around a 10 ms
+  sending-thread wake-up (`out_late_us` max); arrival − stamp p50
+  1.69–1.79 ms, p95 2.26–2.40 ms (before 0.7–0.9, 1.8–2.0). SPP 0 + Start
+  + the first tick on one stamp, Stop; the clock runs on while stopped.
+  Sequenced notes: 33 on, 33 off, every note-on exactly on a tick (0 µs).
+- **Clock in** (192 ticks with Start / Stop / SPP + Continue): applied,
+  ignored (not playing, no steps, nothing out).
+- **A listener that stops reading** (240 bpm clock send, two pads on every
+  step, the probe blocked 15 s): 1369–1370 messages refused, one queue
+  discard, 2 owed note-offs sent once it read again; 1000–1001 messages
+  arrived after, 172 note-ons and 174 note-offs, no note left sounding;
+  the output stopped refusing. (Before, the Kotlin `send` blocked the
+  sending thread instead.)
+- **A sender that leaves mid-note** (the probe killed 1 s after a note-on
+  to a loop pad): the voice ended at once (`midi_sources_changed`); with
+  the note-off sent, it ended on the note-off.
+- **Clock follow:** numbers from the removed heuristic implementation
+  (branch `midi-follow-heuristic`), not what ships: locked from step 4,
+  120 bpm rms 0.11–0.13 ms.
+- **Not measured:** USB and Bluetooth devices (no hardware here; mob_midi
+  hasn't verified them either), `open_input(port: :all)` on a device other
+  than Magpie's own (covered by the Fake on the Elixir side).
+
+### Measured (MobDevFix_arm emulator, Android 15, `scripts/midi_check.exs`)
+
+With the Kotlin plugin (before mob_midi), at b72ab65 (two runs), 069853c
+and 7f30330 (one each), no phone being free: stream 48 kHz, 960-frame
+bursts, output latency 109–121 ms, so absolute latencies are the
+emulator's; one run had host stalls (its outliers are left out below and
+noted). Same port (`dumpsys midi`: 1 input, 1 output).
+
+- **Notes in:** 72 sent, 72 applied, voice starts exactly as mapped;
+  channel 2 with `in_channel` 1: nothing. In → heard p50 112–118 ms (the
+  output latency, as a touch).
+- **Notes out:** 20 touches → 20 note-ons + 20 note-offs; stamp → arrival
+  p50 0.7–1.1 ms, p95 1.8–2.5 ms.
+- **Clock send:** 670–673 ticks, 0–3 late ticks dropped, arrival spacing
+  rms 1.2–1.4 ms (2.4 in the stalled run); sequenced notes exactly on a
+  tick (0 µs).
+- **Clock follow** (the removed heuristic implementation, branch
+  `midi-follow-heuristic`): 120 bpm rms 0.51–0.52 ms; lost ticks and
+  dropouts up to ~53 ms off before relocking.
+
 ## The pads (`Magpie.PadsScreen`)
 
 The root screen (`stack(:main, root: Magpie.PadsScreen)`), landscape,
@@ -599,7 +747,14 @@ these), 16 loaded pads (every one asking for moves), 40 rounds:
   toolchain (zig 0.17.0; the nightly in `~/.local/bin` fails the native
   build).
 - Gate before every commit: `mix format`, `mix compile --warnings-as-errors`,
-  `mix credo --strict`, `mix test`.
+  `mix credo --strict`, `mix test`, and the host C tests (`midi_host`,
+  `sampler_host`, also under ASan/UBSan). Not `mix
+  mob_midi.gen.virtual_device --check`: the task puts its `<service>` block
+  last in `<application>` and mob_dev's native build moves its own
+  `mob:plugin-components` block back after it, so the check fails after
+  every native build (a mob_midi gap). The committed manifest has mob_dev's
+  order; after changing `config :mob_midi, :virtual_device`, run the task,
+  then a native build, and commit what that leaves.
 - Devices are shared with other agents: lease first (`agent-lease acquire
   <name> --serial <serial>`), release when done (see `~/AGENTS.md`).
 - Android: `mix mob.deploy --native --android --device <serial>` after

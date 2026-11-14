@@ -50,6 +50,16 @@ defmodule Magpie.Audio.Fake do
   later at the fake's tempo and records only after `downbeat/0` (no
   pre-roll). At `max_seconds` it sends `:full` and takes no more.
   `record_stop/0` without a recorded frame is `{:error, :not_started}`.
+
+  ## MIDI
+
+  `set_midi/1` keeps the table (`state/0`'s `midi`); `midi_in/1` plays a
+  message through it as the phone's renderer would (`Magpie.Midi.Map.route/2`,
+  live calls, recorded in `calls/0` as `{:midi, message}`; clock and
+  transport do nothing, as there). `midi_outputs/1` keeps the handles
+  (`state/0`'s `midi_outputs`), `midi_sources_changed/0` counts its calls
+  (`midi_sources_changed`); both outlive `reset/0`. The devices are
+  `Magpie.Midi.Fake`'s.
   """
 
   @behaviour Magpie.Audio
@@ -152,6 +162,15 @@ defmodule Magpie.Audio.Fake do
   @impl Magpie.Audio
   def record_cancel, do: call(:record_cancel)
 
+  @impl Magpie.Audio
+  def set_midi(config), do: call({:set_midi, config})
+
+  @impl Magpie.Audio
+  def midi_outputs(handles) when is_list(handles), do: call({:midi_outputs, handles})
+
+  @impl Magpie.Audio
+  def midi_sources_changed, do: call(:midi_sources_changed)
+
   # ── Driving it from a test ────────────────────────────────────────────────
 
   @doc "Run the sequencer `steps` 16th notes on."
@@ -201,9 +220,14 @@ defmodule Magpie.Audio.Fake do
   @doc "The count-in's downbeat: a counting recorder starts recording."
   def downbeat, do: call(:downbeat)
 
-  @doc "Make the next `n` `call` (`:set_pad` or `:unload_sample`) fail with `:busy`, as with a full command queue."
-  def busy(call, n) when call in [:set_pad, :unload_sample] and is_integer(n) and n >= 0,
-    do: call({:busy, call, n})
+  @doc "Make the next `n` `call` (`:set_pad`, `:unload_sample` or `:set_midi`) fail with `:busy`, as with a full command queue."
+  def busy(call, n)
+      when call in [:set_pad, :unload_sample, :set_midi] and is_integer(n) and n >= 0,
+      do: call({:busy, call, n})
+
+  @doc "A MIDI message `{status, data1, data2}` arrives (needs the stream and a table)."
+  def midi_in({status, d1, d2} = message) when status in 0..255 and d1 in 0..127 and d2 in 0..127,
+    do: call({:midi_in, message})
 
   # ── Server ────────────────────────────────────────────────────────────────
 
@@ -243,7 +267,10 @@ defmodule Magpie.Audio.Fake do
       play_frame: 0,
       sounding: %{},
       gated: [],
-      calls: []
+      calls: [],
+      midi: nil,
+      midi_outputs: [],
+      midi_sources_changed: 0
     }
   end
 
@@ -309,14 +336,51 @@ defmodule Magpie.Audio.Fake do
 
   def handle_call(:downbeat, _from, s), do: {:reply, {:error, :not_counting}, s}
 
+  # MIDI outputs and inputs: open to every process (Magpie.Midi calls them).
+  def handle_call({:midi_outputs, handles}, _from, s),
+    do: {:reply, :ok, %{s | midi_outputs: handles}}
+
+  def handle_call(:midi_sources_changed, _from, s),
+    do: {:reply, :ok, %{s | midi_sources_changed: s.midi_sources_changed + 1}}
+
+  def handle_call({:midi_in, _message}, _from, %{open: false} = s),
+    do: {:reply, {:error, :not_running}, s}
+
+  def handle_call({:midi_in, message}, _from, s) do
+    actions = if s.midi, do: Magpie.Midi.Map.route(s.midi, message), else: []
+
+    s =
+      Enum.reduce(actions, %{s | calls: [{:midi, message} | s.calls]}, fn
+        {:trigger, pad, vel}, acc -> live(acc, {:trigger, pad, vel, 0})
+        action, acc -> live(acc, action)
+      end)
+
+    {:reply, :ok, s}
+  end
+
   def handle_call(_request, {pid, _}, %{owner: owner} = s) when pid != owner,
     do: {:reply, {:error, :not_owner}, s}
 
   def handle_call(:close, _from, s), do: {:reply, :ok, %{s | open: false}}
 
+  def handle_call({:set_midi, _config}, _from, %{busy: %{set_midi: n}} = s) when n > 0,
+    do: busy_reply(s, :set_midi)
+
+  def handle_call({:set_midi, config}, _from, s), do: {:reply, :ok, %{s | midi: config}}
+
   # The test's knobs and the ids outlive a reset, as the phone's counters do.
   def handle_call(:reset, _from, s) do
-    keep = Map.take(s, [:fail_input, :refuse_input, :stuck, :last_input, :last_take])
+    keep =
+      Map.take(s, [
+        :fail_input,
+        :refuse_input,
+        :stuck,
+        :last_input,
+        :last_take,
+        :midi_outputs,
+        :midi_sources_changed
+      ])
+
     {:reply, :ok, Map.merge(fresh(s.owner, s.open, s.fail_open), keep)}
   end
 

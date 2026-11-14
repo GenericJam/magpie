@@ -29,6 +29,9 @@ defmodule Magpie.Audio do
       {:magpie_audio, :record, take, :full, frames}
       {:magpie_audio, :count_in, take, first_frame, until_frame}
 
+  MIDI devices are `Magpie.Midi`'s (through mob_midi); the engine only
+  takes their bytes (`c:midi_outputs/1`, `c:midi_sources_changed/0`).
+
   `input` is the id `c:input_open/1` returned, `take` the one
   `c:record_start/1` returned (positive integers, never reused): a
   message about an input or a take that is over can still be on its way
@@ -158,7 +161,6 @@ defmodule Magpie.Audio do
 
   @typedoc "Engine frame `frame` is heard at `time` (`System.monotonic_time(:nanosecond)`)."
   @type clock :: %{frame: integer(), time: integer(), rate: pos_integer()}
-
   @doc """
   Open the output stream (if it isn't) and become the owner:
   `{:ok, %{rate, burst, buffer_frames, low_latency}}`.
@@ -267,6 +269,23 @@ defmodule Magpie.Audio do
   @callback record_stop() :: {:ok, recording()} | {:error, :not_recording | :not_started}
   @doc "Disarm the recorder and drop what it has."
   @callback record_cancel() :: :ok | {:error, term()}
+  @doc """
+  The kit's MIDI (`Magpie.Midi.Map.config/1`): the renderer maps every
+  incoming message through it, sends notes and clock by it. nil: MIDI off.
+  """
+  @callback set_midi(Magpie.Midi.Map.t() | nil) :: :ok | {:error, term()}
+  @doc """
+  The MIDI outputs notes and clock go to: mob_midi output handles
+  (`MobMidi.output_handle/2`; Magpie's own device's output, each opened
+  device's input). Replaces the last list; open to every process.
+  """
+  @callback midi_outputs([pos_integer()]) :: :ok
+  @doc """
+  An input closed or changed hands (a device closed or gone, another app
+  started or stopped sending into Magpie's own device): the voices a closed
+  input held end. Open to every process.
+  """
+  @callback midi_sources_changed() :: :ok
 
   @doc "The engine in use."
   def impl, do: Application.get_env(:magpie, :audio, Magpie.Audio.Native)

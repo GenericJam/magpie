@@ -99,4 +99,17 @@ defmodule Magpie.Audio.Nif do
 
   @doc "Drop the recording (owner only, dirty IO)."
   def record_cancel, do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  The kit's MIDI table (owner only): `{in_channel (0 all), out_channel,
+  clock, [128 note masks, a bit per pad], [64 out notes, -1 none]}`, or nil
+  for MIDI off.
+  """
+  def set_midi(_table), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "The MIDI outputs: mob_midi output handles (anyone, dirty IO)."
+  def midi_outputs(_handles), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "An input closed or changed hands: what closed inputs held ends (anyone, dirty IO)."
+  def midi_sources_changed, do: :erlang.nif_error(:nif_not_loaded)
 end

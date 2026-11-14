@@ -2,7 +2,8 @@
  * c_src/magpie_audio.c — Magpie's audio engine on Android: the sampler core
  * (sampler.c) behind an AAudio output stream, the recorder (recorder.c) on
  * an input (the mic, or other apps through plugins/magpie_capture), NDK
- * MediaCodec decoding, and the NIF (Magpie.Audio.Nif).
+ * MediaCodec decoding, MIDI in and out through mob_midi's C ABI, and the
+ * NIF (Magpie.Audio.Nif).
  *
  *   output callback  AAudio, low-latency performance mode, shared, stereo
  *                    float at the device's own rate. Runs sp_render: drains
@@ -26,6 +27,10 @@
  *                    AMediaCodec decode a file to 16-bit (wav, mp3, aac,
  *                    flac, ogg, …), resample to the engine's rate, peaks,
  *                    then hand the sample to the renderer.
+ *   MIDI receive     mob_midi's, one per open input port: midi_sink parses
+ *                    the bytes into the command queue.
+ *   MIDI sending     Sends what the renderer stamped (notes, clock) to the
+ *                    MIDI outputs with mob_midi_send, when it is heard.
  *
  * Messages to the owner (open/1's caller):
  *
@@ -65,6 +70,7 @@
  * minSdk is 28, so both libraries are always present at run time.
  */
 
+#include <errno.h>
 #include <dlfcn.h>
 #include <erl_nif.h>
 #include <fcntl.h>
@@ -83,7 +89,11 @@
 
 #include <android/log.h>
 
+/* mob_midi's C ABI (a dependency: its own path, see its README). */
+#include "../deps/mob_midi/priv/include/mob_midi.h"
+
 #include "sampler.c"
+#include "midi_out.c"
 #include "recorder.c"
 
 #define LOG_TAG "magpie_audio"
@@ -371,6 +381,7 @@ static void refresh_input_clock(void);
 static void deliver_input(ErlNifEnv *env, int64_t now);
 static void count_in_heard(ErlNifEnv *env, const ErlNifPid *owner, bool has_owner, const sp_event *ev);
 static ERL_NIF_TERM input_info(ErlNifEnv *env);
+static void midi_in_latency(const sp_event *ev);
 
 static ERL_NIF_TERM atom(ErlNifEnv *env, const char *name) { return enif_make_atom(env, name); }
 
@@ -612,7 +623,8 @@ static void deliver_events(ErlNifEnv *env) {
                                             enif_make_int64(env, ev.frame)));
             break;
         case SP_EV_TRIGGERED:
-            record_latency(&ev);
+            if (ev.b) midi_in_latency(&ev);
+            else record_latency(&ev);
             break;
         case SP_EV_COUNT_IN:
             count_in_heard(env, &owner, has_owner, &ev);
@@ -1566,6 +1578,316 @@ static void deliver_input(ErlNifEnv *env, int64_t now) {
     pthread_mutex_unlock(&IN.lock);
 }
 
+/* ── MIDI ────────────────────────────────────────────────────────────────── */
+
+/* mob_midi (deps/mob_midi) holds the devices, the app's own "Magpie" device
+ * and their ports; Magpie.Midi opens them with deliver: :native and hands
+ * this NIF the output handles (midi_outputs/1). No MIDI byte passes through
+ * the BEAM. In: mob_midi calls midi_sink on a port's receive thread with
+ * the bytes, their timestamp and the port's source and generation; it
+ * parses them (one parser per source) and queues one SP_CMD_MIDI per
+ * message. Out: the renderer stamps messages with engine frames into
+ * SP.midi.out; the sending thread turns each frame into CLOCK_MONOTONIC
+ * through the output timestamp, sleeps until then and queues the bytes on
+ * every output with mob_midi_send, stamped with that time. */
+
+#define MIDI_SOURCES MOB_MIDI_MAX_SOURCES
+#define MIDI_OUTPUTS 32               /* outputs the sending thread sends to */
+#define MIDI_LATE_CLOCK_NS 20000000LL /* a tick this late is dropped, not sent in a burst */
+#define MIDI_BATCH_NS 100000LL        /* messages this close together go in one send */
+#define MIDI_RETRY_NS 10000000LL      /* a refusing output owed note-offs is tried this often */
+#define MIDI_SEND_MAX 256
+#define MIDI_STATS 512
+
+_Static_assert(MIDI_SOURCES == SP_MIDI_SOURCES, "a gone bit per mob_midi source");
+
+/* A source's parser, fed only by the source's current generation (see
+ * midi_sink). */
+typedef struct {
+    pthread_mutex_t lock;
+    uint32_t generation; /* the port being parsed; 0: none (never opened, or gone) */
+    mi_parser parser;
+} midi_source;
+
+static struct {
+    midi_source sources[MIDI_SOURCES];
+    bool sink; /* midi_sink is mob_midi's sink */
+    /* The outputs (midi_outputs/1), under out_lock: the NIF replaces them,
+     * the sending thread sends to them. `next` is the NIF's scratch. */
+    pthread_mutex_t out_lock;
+    midi_out outs[MIDI_OUTPUTS], next[MIDI_OUTPUTS];
+    int n_outs;
+    /* The sending thread: started and joined under E.lock. */
+    pthread_t out;
+    bool out_started;
+    _Atomic bool out_run;
+    /* Notes left in the out queue by an earlier stream (midi_start_locked
+     * fills it, the new thread sends it). */
+    mo_event stale[MO_RING];
+    int n_stale;
+    /* received: parsed messages; sent: messages handed to the outputs (what
+     * they refused: OUT_STATS, midi_out.c). */
+    _Atomic uint64_t received, sent, late_dropped;
+    /* Under E.stats_lock: send time − stamp (µs); MIDI timestamp → heard (ms). */
+    float late_us[MIDI_STATS], in_ms[MIDI_STATS];
+    int64_t late_n, in_n;
+} MI;
+
+typedef struct {
+    int64_t t_ns;
+    uint8_t src;
+} midi_ctx;
+
+/* With no stream rendering, the control path renders: now, if it does
+ * (else the stream being reopened does first). */
+static void midi_drain_offline(void) {
+    if (atomic_load(&E.running)) return;
+    pthread_mutex_lock(&E.ctl);
+    if (E.drains) sp_drain(&SP, false);
+    pthread_mutex_unlock(&E.ctl);
+}
+
+/* What input `source` held ends: SP_CMD_MIDI_GONE in the command queue, so
+ * after what the input sent before; if the full queue refuses it, a bit the
+ * renderer applies after the commands queued by then (never lost). */
+static void source_gone(int source) {
+    sp_cmd c = {.type = SP_CMD_MIDI_GONE, .u.midi = {.src = (uint8_t)source}};
+    if (!push_cmd(&c)) atomic_fetch_or(&SP.midi.gone, 1ull << source);
+    midi_drain_offline();
+}
+
+/* With no stream only what releases voices goes (a note-off, CC 120/123),
+ * applied offline: a note held across a route change still ends. A release
+ * the full command queue refuses ends everything its input holds instead
+ * (source_gone): an early end, never a stuck note. */
+static void midi_emit(void *ctx, mi_msg m) {
+    atomic_fetch_add_explicit(&MI.received, 1, memory_order_relaxed);
+    const midi_ctx *x = ctx;
+    sp_cmd c = {.type = SP_CMD_MIDI, .u.midi = {m.status, m.d1, m.d2, x->src}, .t_ns = x->t_ns};
+    uint8_t kind = m.status & 0xF0;
+    bool release = m.status < 0xF0 && (kind == 0x80 || (kind == 0x90 && m.d2 == 0) ||
+                                       (kind == 0xB0 && (m.d1 == 120 || m.d1 == 123)));
+    if (!atomic_load(&E.running) && !release) return;
+    if (!push_cmd(&c)) {
+        if (release) source_gone(x->src);
+        return;
+    }
+    if (release) midi_drain_offline();
+}
+
+/* mob_midi's sink: a port's receive thread, under mob_midi's lock of the
+ * source, so calls for one source never overlap. mob_midi delivers only the
+ * source's current generation; a new one is another port on the source (or
+ * another app sending into Magpie's own device): a fresh parser (no running
+ * status or SysEx left by the port before), and what the old one held ends.
+ * A timestamp of 0 (senders that don't stamp) or more than a second off
+ * isn't CLOCK_MONOTONIC: the message counts as arriving now. */
+static void midi_sink(void *ctx, uint32_t source, uint32_t generation, const uint8_t *bytes, size_t len,
+                      int64_t timestamp_ns) {
+    (void)ctx;
+    if (source == 0 || source >= MIDI_SOURCES || generation == 0 || len == 0) return;
+    midi_ctx x = {.t_ns = mob_midi_timestamp_or(timestamp_ns, now_ns()), .src = (uint8_t)source};
+    midi_source *s = &MI.sources[source];
+    pthread_mutex_lock(&s->lock);
+    if (generation != s->generation) {
+        if (s->generation) source_gone((int)source);
+        s->generation = generation;
+        s->parser = (mi_parser){0};
+    }
+    mi_parse(&s->parser, bytes, len, midi_emit, &x);
+    pthread_mutex_unlock(&s->lock);
+}
+
+/* Every source parsed here whose port has closed since (unplugged, closed
+ * by Magpie.Midi, another app stopped sending into Magpie's own device):
+ * what it held ends, and its late bytes can't reach the next port on it.
+ * mob_midi_source_info is lock-free; a generation the sink moved on
+ * meanwhile has ended its voices itself. */
+static void midi_sources_check(void) {
+    for (uint32_t i = 1; i < MIDI_SOURCES; i++) {
+        midi_source *s = &MI.sources[i];
+        pthread_mutex_lock(&s->lock);
+        uint32_t seen = s->generation;
+        pthread_mutex_unlock(&s->lock);
+        uint32_t current = 0;
+        if (!seen || (mob_midi_source_info(i, &current, NULL, NULL) == MOB_MIDI_OK && current == seen)) continue;
+        pthread_mutex_lock(&s->lock);
+        if (s->generation == seen) {
+            s->generation = 0;
+            s->parser = (mi_parser){0};
+            source_gone((int)i);
+        }
+        pthread_mutex_unlock(&s->lock);
+    }
+}
+
+/* The sending thread: a batch to every output (midi_out.c). */
+static void outs_send(const uint8_t *buf, int n, const mo_event *evs, int count, int64_t at) {
+    pthread_mutex_lock(&MI.out_lock);
+    for (int i = 0; i < MI.n_outs; i++) out_send(&MI.outs[i], buf, n, evs, count, at);
+    pthread_mutex_unlock(&MI.out_lock);
+    atomic_fetch_add_explicit(&MI.sent, (uint64_t)count, memory_order_relaxed);
+}
+
+/* The sending thread with nothing to send (see out_retry). */
+static void outs_retry(void) {
+    pthread_mutex_lock(&MI.out_lock);
+    for (int i = 0; i < MI.n_outs; i++) out_retry(&MI.outs[i]);
+    pthread_mutex_unlock(&MI.out_lock);
+}
+
+/* The sending thread's copy of the clock map: a read that loses to the
+ * event thread's update (sp_get_clock gives up rather than spin) uses the
+ * last one instead of sending early. */
+typedef struct {
+    int64_t frame, ns;
+    int rate;
+} midi_clock;
+
+/* When engine frame `frame` is heard (CLOCK_MONOTONIC), or now before
+ * there has been a timestamp. */
+static int64_t frame_ns(midi_clock *c, int64_t frame) {
+    int64_t cf, cns;
+    int rate = atomic_load(&E.rate);
+    if (sp_get_clock(&SP, &cf, &cns) && rate > 0) *c = (midi_clock){cf, cns, rate};
+    if (c->rate <= 0) return now_ns();
+    return c->ns + (int64_t)((double)(frame - c->frame) * 1e9 / c->rate);
+}
+
+static void sleep_until(int64_t t) {
+    struct timespec ts = {.tv_sec = (time_t)(t / 1000000000LL), .tv_nsec = (long)(t % 1000000000LL)};
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
+    }
+}
+
+static void stat_push(float *ring, int64_t *n, float v) {
+    pthread_mutex_lock(&E.stats_lock);
+    ring[(*n)++ % MIDI_STATS] = v;
+    pthread_mutex_unlock(&E.stats_lock);
+}
+
+/* The sending thread: each message at the time it is heard, stamped with
+ * it. Messages within MIDI_BATCH_NS of the first go in the same send. A
+ * tick more than MIDI_LATE_CLOCK_NS late is dropped (a stalled client
+ * would otherwise get a burst of clock); notes go however late. */
+static void *midi_out_main(void *arg) {
+    (void)arg;
+    if (setpriority(PRIO_PROCESS, (id_t)gettid(), -19) != 0) LOGE("midi: could not raise the sending thread's priority");
+    uint8_t buf[MIDI_SEND_MAX];
+    mo_event evs[MIDI_SEND_MAX];
+    midi_clock clk = {0, 0, 0};
+    for (int i = 0; i < MI.n_stale;) {
+        int n = 0, count = 0;
+        for (; i < MI.n_stale && n + MI.stale[i].len <= MIDI_SEND_MAX; i++) {
+            memcpy(buf + n, MI.stale[i].b, MI.stale[i].len);
+            n += MI.stale[i].len;
+            evs[count++] = MI.stale[i];
+        }
+        outs_send(buf, n, evs, count, 0);
+    }
+    MI.n_stale = 0;
+    int64_t retry_at = 0;
+    while (atomic_load(&MI.out_run)) {
+        mo_event ev;
+        if (!mo_peek(&SP.midi.out, &ev)) {
+            int64_t now = now_ns();
+            if (now >= retry_at) {
+                outs_retry();
+                retry_at = now + MIDI_RETRY_NS;
+            }
+            usleep(1000);
+            continue;
+        }
+        int64_t t = frame_ns(&clk, ev.frame), now = now_ns();
+        if (t - now > 5000000LL) {
+            /* Far ahead (the stream renders ~20–40 ms ahead): look again
+             * shortly, so a stop doesn't wait and the clock map stays fresh. */
+            usleep(2000);
+            continue;
+        }
+        if (t > now) sleep_until(t);
+        int n = 0, count = 0;
+        while (mo_peek(&SP.midi.out, &ev) && n + ev.len <= MIDI_SEND_MAX) {
+            int64_t te = frame_ns(&clk, ev.frame);
+            if (te > t + MIDI_BATCH_NS) break;
+            mo_drop(&SP.midi.out);
+            if (ev.kind == MO_CLOCK && now_ns() - te > MIDI_LATE_CLOCK_NS) {
+                atomic_fetch_add_explicit(&MI.late_dropped, 1, memory_order_relaxed);
+                continue;
+            }
+            memcpy(buf + n, ev.b, ev.len);
+            n += ev.len;
+            evs[count++] = ev;
+        }
+        if (n == 0) continue;
+        int64_t sent_at = now_ns();
+        outs_send(buf, n, evs, count, t);
+        stat_push(MI.late_us, &MI.late_n, (float)((sent_at - t) / 1000.0));
+    }
+    return NULL;
+}
+
+/* Start the sending thread. What is left in the out queue from an earlier
+ * stream is stale: the notes whose other half went out go first, at once
+ * (mo_take_stale: a note-on that went out keeps its note-off, a voice still
+ * holding its note gets its note-on), the rest is dropped. Caller holds
+ * E.lock; the queue has no consumer until the thread starts. */
+static void midi_start_locked(void) {
+    if (MI.out_started) return;
+    MI.n_stale = mo_take_stale(&SP.midi.out, MI.stale);
+    atomic_store(&MI.out_run, true);
+    MI.out_started = pthread_create(&MI.out, NULL, midi_out_main, NULL) == 0;
+    if (!MI.out_started) {
+        atomic_store(&MI.out_run, false);
+        LOGE("midi: no sending thread");
+    }
+}
+
+/* Caller holds E.lock. */
+static void midi_stop_locked(void) {
+    if (!MI.out_started) return;
+    atomic_store(&MI.out_run, false);
+    pthread_join(MI.out, NULL);
+    MI.out_started = false;
+}
+
+/* The event thread: a MIDI note's timestamp → when its voice is heard. */
+static void midi_in_latency(const sp_event *ev) {
+    int64_t cf, cns;
+    int rate = atomic_load(&E.rate);
+    if (!sp_get_clock(&SP, &cf, &cns) || rate <= 0) return;
+    double heard_ns = (double)cns + (double)(ev->frame - cf) * 1e9 / rate;
+    stat_push(MI.in_ms, &MI.in_n, (float)((heard_ns - (double)ev->t_ns) / 1e6));
+}
+
+static ERL_NIF_TERM ring_term(ErlNifEnv *env, const float *ring, const int64_t *count_at, int size);
+
+static ERL_NIF_TERM midi_info(ErlNifEnv *env) {
+    pthread_mutex_lock(&MI.out_lock);
+    int outputs = MI.n_outs, refusing = 0;
+    for (int i = 0; i < MI.n_outs; i++) refusing += MI.outs[i].refusing;
+    pthread_mutex_unlock(&MI.out_lock);
+    ERL_NIF_TERM keys[13] = {atom(env, "bound"),         atom(env, "received"),    atom(env, "applied"),
+                             atom(env, "sent"),          atom(env, "out_dropped"), atom(env, "late_ticks_dropped"),
+                             atom(env, "refused"),       atom(env, "discards"),    atom(env, "offs_owed"),
+                             atom(env, "outputs"),       atom(env, "refusing"),    atom(env, "in_latency_ms"),
+                             atom(env, "out_late_us")};
+    ERL_NIF_TERM vals[13] = {atom(env, MI.sink ? "true" : "false"),
+                             enif_make_uint64(env, atomic_load(&MI.received)),
+                             enif_make_uint64(env, atomic_load(&SP.midi.in_messages)),
+                             enif_make_uint64(env, atomic_load(&MI.sent)),
+                             enif_make_uint64(env, atomic_load(&SP.midi.out.dropped)),
+                             enif_make_uint64(env, atomic_load(&MI.late_dropped)),
+                             enif_make_uint64(env, atomic_load(&OUT_STATS.refused)),
+                             enif_make_uint64(env, atomic_load(&OUT_STATS.discards)),
+                             enif_make_uint64(env, atomic_load(&OUT_STATS.offs_owed)),
+                             enif_make_int(env, outputs),
+                             enif_make_int(env, refusing),
+                             ring_term(env, MI.in_ms, &MI.in_n, MIDI_STATS),
+                             ring_term(env, MI.late_us, &MI.late_n, MIDI_STATS)};
+    return make_map(env, keys, vals, 13);
+}
+
 /* ── NIFs ────────────────────────────────────────────────────────────────── */
 
 /* open(Owner) -> {ok, #{rate, burst, buffer_frames, low_latency}} | {error, Reason}.
@@ -1609,6 +1931,7 @@ static ERL_NIF_TERM nif_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
             return error_tuple(env, "thread");
         }
     }
+    midi_start_locked();
     ERL_NIF_TERM info = stream_info(env);
     pthread_mutex_unlock(&E.lock);
     return enif_make_tuple2(env, ok_atom(env), info);
@@ -1634,6 +1957,7 @@ static ERL_NIF_TERM nif_close(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
     sp_garbage g;
     while (sp_pop_garbage(&SP, &g)) free_garbage(&g);
     pthread_mutex_unlock(&E.ctl);
+    midi_stop_locked();
     bool closed = close_output_locked();
     pthread_mutex_unlock(&E.lock);
     return closed ? ok_atom(env) : error_tuple(env, "output_stuck");
@@ -2027,12 +2351,14 @@ static int cmp_float(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 
-static ERL_NIF_TERM latency_term(ErlNifEnv *env) {
-    float v[LATENCIES];
+/* The newest `size` values of a stats ring (under stats_lock) as count,
+ * mean, p50, p95, min and max; nil when empty. */
+static ERL_NIF_TERM ring_term(ErlNifEnv *env, const float *ring, const int64_t *count_at, int size) {
+    float v[MIDI_STATS > LATENCIES ? MIDI_STATS : LATENCIES];
     pthread_mutex_lock(&E.stats_lock);
-    int n = E.latency_n < LATENCIES ? (int)E.latency_n : LATENCIES;
-    memcpy(v, E.latency_ms, sizeof(float) * (size_t)n);
-    int64_t count = E.latency_n;
+    int64_t count = *count_at;
+    int n = count < size ? (int)count : size;
+    memcpy(v, ring, sizeof(float) * (size_t)n);
     pthread_mutex_unlock(&E.stats_lock);
     if (n == 0) return atom(env, "nil");
     qsort(v, (size_t)n, sizeof(float), cmp_float);
@@ -2046,12 +2372,14 @@ static ERL_NIF_TERM latency_term(ErlNifEnv *env) {
     return make_map(env, keys, vals, 6);
 }
 
+static ERL_NIF_TERM latency_term(ErlNifEnv *env) { return ring_term(env, E.latency_ms, &E.latency_n, LATENCIES); }
+
 /* info() -> map of engine diagnostics. Dirty IO (takes `lock` to ask the
  * stream). */
 static ERL_NIF_TERM nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     (void)argv;
-    enum { N = 28 };
+    enum { N = 29 };
     pthread_mutex_lock(&E.lock);
     AAudioStream *s = E.out;
     int rate = atomic_load(&E.rate);
@@ -2076,7 +2404,7 @@ static ERL_NIF_TERM nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         atom(env, "voices_peak"),     atom(env, "steals"),           atom(env, "hard_cuts"),
         atom(env, "trigger_latency_ms"), atom(env, "samples"),       atom(env, "sample_bytes"),
         atom(env, "dropped"),         atom(env, "playing"),          atom(env, "frame"),
-        atom(env, "input"),
+        atom(env, "input"),           atom(env, "midi"),
     };
     ERL_NIF_TERM dropped[3] = {enif_make_uint64(env, atomic_load(&SP.cmds_dropped)),
                                enif_make_uint64(env, atomic_load(&SP.events_dropped)),
@@ -2111,6 +2439,7 @@ static ERL_NIF_TERM nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         atom(env, atomic_load(&SP.playing_now) ? "true" : "false"),
         enif_make_int64(env, atomic_load(&E.engine_frame)),
         input_info(env),
+        midi_info(env),
     };
     pthread_mutex_unlock(&E.lock);
     return make_map(env, keys, vals, N);
@@ -2132,6 +2461,14 @@ static ERL_NIF_TERM nif_reset_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     atomic_store(&SP.hard_cuts, 0);
     pthread_mutex_lock(&E.stats_lock);
     E.latency_n = 0;
+    MI.late_n = 0;
+    MI.in_n = 0;
+    atomic_store(&MI.received, 0);
+    atomic_store(&MI.sent, 0);
+    atomic_store(&MI.late_dropped, 0);
+    atomic_store(&OUT_STATS.refused, 0);
+    atomic_store(&OUT_STATS.discards, 0);
+    atomic_store(&OUT_STATS.offs_owed, 0);
     pthread_mutex_unlock(&E.stats_lock);
     return ok_atom(env);
 }
@@ -2396,11 +2733,107 @@ static ERL_NIF_TERM input_info(ErlNifEnv *env) {
     return result;
 }
 
+/* set_midi(nil | {InChannel, OutChannel, Clock, NoteMasks, OutNotes}) -> ok
+ * | {error, not_owner | busy | alloc}: the kit's MIDI table (owner only).
+ * InChannel 0 (all) | 1..16, OutChannel 1..16, Clock internal | send,
+ * NoteMasks 128 integers (a bit per pad), OutNotes 64 integers (-1: the
+ * pad sends nothing). */
+static ERL_NIF_TERM nif_set_midi(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    sp_midi_map *m = NULL;
+    if (!enif_is_identical(argv[0], atom(env, "nil"))) {
+        const ERL_NIF_TERM *t;
+        int arity, in_ch, out_ch;
+        unsigned len;
+        if (!enif_get_tuple(env, argv[0], &arity, &t) || arity != 5 || !get_range(env, t[0], 0, 16, &in_ch) ||
+            !get_range(env, t[1], 1, 16, &out_ch) || !enif_get_list_length(env, t[3], &len) || len != 128 ||
+            !enif_get_list_length(env, t[4], &len) || len != SP_PADS)
+            return enif_make_badarg(env);
+        uint8_t clock;
+        if (enif_is_identical(t[2], atom(env, "internal"))) clock = SP_CLOCK_INTERNAL;
+        else if (enif_is_identical(t[2], atom(env, "send"))) clock = SP_CLOCK_SEND;
+        else return enif_make_badarg(env);
+        m = calloc(1, sizeof(*m));
+        if (!m) return error_tuple(env, "alloc");
+        *m = (sp_midi_map){.in_channel = (uint8_t)in_ch, .out_channel = (uint8_t)out_ch, .clock = clock};
+        ERL_NIF_TERM head, tail = t[3];
+        for (int i = 0; enif_get_list_cell(env, tail, &head, &tail); i++) {
+            ErlNifUInt64 mask;
+            if (!enif_get_uint64(env, head, &mask)) {
+                free(m);
+                return enif_make_badarg(env);
+            }
+            m->notes[i] = mask;
+        }
+        tail = t[4];
+        for (int i = 0; enif_get_list_cell(env, tail, &head, &tail); i++) {
+            int note;
+            if (!get_range(env, head, -1, 127, &note)) {
+                free(m);
+                return enif_make_badarg(env);
+            }
+            m->out_note[i] = (int16_t)note;
+        }
+    }
+    pthread_mutex_lock(&E.ctl);
+    if (!is_owner(env)) {
+        pthread_mutex_unlock(&E.ctl);
+        free(m);
+        return error_tuple(env, "not_owner");
+    }
+    sp_cmd c = {.type = SP_CMD_MIDI_MAP, .u.map = m};
+    bool queued = ctl_push(&c);
+    pthread_mutex_unlock(&E.ctl);
+    if (!queued) {
+        free(m);
+        return error_tuple(env, "busy");
+    }
+    return ok_atom(env);
+}
+
+/* midi_outputs([Handle]) -> ok: the outputs MIDI out goes to, as mob_midi
+ * output handles (Magpie's own device's output, each opened device's
+ * input). An output kept from the last list keeps what it is owed. Anyone;
+ * dirty IO (waits for the sending thread's current send). */
+static ERL_NIF_TERM nif_midi_outputs(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    unsigned len;
+    if (!enif_get_list_length(env, argv[0], &len) || len > MIDI_OUTPUTS) return enif_make_badarg(env);
+    mob_midi_port handles[MIDI_OUTPUTS];
+    ERL_NIF_TERM head, tail = argv[0];
+    for (unsigned i = 0; enif_get_list_cell(env, tail, &head, &tail); i++) {
+        ErlNifSInt64 h;
+        if (!enif_get_int64(env, head, &h) || h <= 0) return enif_make_badarg(env);
+        handles[i] = (mob_midi_port)h;
+    }
+    pthread_mutex_lock(&MI.out_lock);
+    for (unsigned i = 0; i < len; i++) {
+        MI.next[i] = (midi_out){.handle = handles[i]};
+        for (int k = 0; k < MI.n_outs; k++)
+            if (MI.outs[k].handle == handles[i]) MI.next[i] = MI.outs[k];
+    }
+    memcpy(MI.outs, MI.next, len * sizeof(midi_out));
+    MI.n_outs = (int)len;
+    pthread_mutex_unlock(&MI.out_lock);
+    return ok_atom(env);
+}
+
+/* midi_sources_changed() -> ok: an input closed or changed hands (see
+ * midi_sources_check). Anyone; dirty IO (may apply commands offline). */
+static ERL_NIF_TERM nif_midi_sources_changed(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    (void)argv;
+    midi_sources_check();
+    return ok_atom(env);
+}
+
 static int on_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     (void)priv;
     (void)info;
     pthread_mutex_init(&E.lock, NULL);
     pthread_mutex_init(&IN.lock, NULL);
+    pthread_mutex_init(&MI.out_lock, NULL);
+    for (int i = 0; i < MIDI_SOURCES; i++) pthread_mutex_init(&MI.sources[i].lock, NULL);
     pcm_type = enif_open_resource_type(env, NULL, "magpie_pcm", pcm_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!pcm_type) return 1;
     pthread_mutex_init(&E.ctl, NULL);
@@ -2412,6 +2845,11 @@ static int on_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     E.drains = true;
     libs_ok = bind_libraries();
     if (!libs_ok) LOGE("could not bind %s", libs_error);
+    /* MIDI in from mob_midi's threads: the sources' locks are ready. */
+    int rc = mob_midi_abi_version() == MOB_MIDI_ABI_VERSION ? mob_midi_set_sink(midi_sink, NULL) : MOB_MIDI_ERR_INVALID;
+    MI.sink = rc == MOB_MIDI_OK;
+    if (!MI.sink) LOGE("midi: no sink (%d; mob_midi ABI %d, built against %d)", rc, mob_midi_abi_version(),
+                       MOB_MIDI_ABI_VERSION);
     return 0;
 }
 
@@ -2441,6 +2879,9 @@ static ErlNifFunc nif_funcs[] = {
     {"record_start", 4, nif_record_start, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"record_stop", 0, nif_record_stop, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"record_cancel", 0, nif_record_cancel, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"set_midi", 1, nif_set_midi, 0},
+    {"midi_outputs", 1, nif_midi_outputs, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"midi_sources_changed", 0, nif_midi_sources_changed, ERL_NIF_DIRTY_JOB_IO_BOUND},
 };
 
 ERL_NIF_INIT(Elixir.Magpie.Audio.Nif, nif_funcs, on_load, NULL, NULL, NULL)

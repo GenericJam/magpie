@@ -42,9 +42,9 @@ defmodule Magpie.KitSession do
 
   @wave_bars Style.pad().wave_bars
   @autosave_ms 1_000
-  # A sample the engine couldn't unload yet (its command queue full) is
-  # tried again after this.
-  @unload_retry_ms 200
+  # A sample the engine couldn't unload yet, or a MIDI table it refused
+  # (its command queue full), is tried again after this.
+  @retry_ms 200
 
   defmodule Snapshot do
     @moduledoc """
@@ -73,7 +73,9 @@ defmodule Magpie.KitSession do
     samples: %{},
     refused: %{},
     queue: [],
-    subscribers: %{}
+    subscribers: %{},
+    # The MIDI table last given to the engine (`Magpie.Midi.Map.config/1`).
+    midi: nil
   ]
 
   # ── API ─────────────────────────────────────────────────────────────────────
@@ -131,6 +133,27 @@ defmodule Magpie.KitSession do
   @doc "Snap on or off (the kit's `snap`)."
   def set_snap(on) when is_boolean(on), do: GenServer.call(__MODULE__, {:snap, on})
 
+  @doc """
+  The kit's MIDI settings: `in_channel` (`:all` or 1..16; notes out go on
+  it, or 1 with `:all`) and `clock` (`:internal` or `:send` a MIDI clock).
+  Either key may be left out. `:follow` is refused: Magpie doesn't follow
+  an incoming clock yet (a kit file saying `follow` still loads, keeps it
+  and plays on the internal clock; see `Magpie.Midi.Map.config/1`).
+  """
+  @spec set_midi(map()) :: :ok | {:error, {:invalid, atom()}}
+  def set_midi(changes) when is_map(changes) do
+    cond do
+      not (Map.get(changes, :in_channel, :all) == :all or Map.get(changes, :in_channel) in 1..16) ->
+        {:error, {:invalid, :in_channel}}
+
+      Map.get(changes, :clock, :internal) not in [:internal, :send] ->
+        {:error, {:invalid, :clock}}
+
+      true ->
+        GenServer.call(__MODULE__, {:midi, Map.take(changes, [:in_channel, :clock])})
+    end
+  end
+
   @doc "Save now if a change is waiting for the autosave."
   def flush, do: GenServer.call(__MODULE__, :flush)
 
@@ -186,7 +209,7 @@ defmodule Magpie.KitSession do
   def handle_continue(:load, s) do
     _ = Engine.set_tempo(s.kit.tempo)
     _ = Engine.set_swing(s.kit.swing)
-    {:noreply, s |> enqueue(sample_ids(s.kit)) |> next_load() |> publish()}
+    {:noreply, s |> sync_midi() |> enqueue(sample_ids(s.kit)) |> next_load() |> publish()}
   end
 
   @impl true
@@ -221,6 +244,9 @@ defmodule Magpie.KitSession do
   def handle_call({:snap, on}, _from, s),
     do: {:reply, :ok, s |> put_kit(%{s.kit | snap: on}) |> publish()}
 
+  def handle_call({:midi, changes}, _from, s),
+    do: {:reply, :ok, s |> put_kit(%{s.kit | midi: Map.merge(s.kit.midi, changes)}) |> publish()}
+
   def handle_call(:flush, _from, s) do
     {result, s} = save(s)
     {:reply, result, s}
@@ -254,6 +280,8 @@ defmodule Magpie.KitSession do
   def handle_info({:autosave, _stale}, s), do: {:noreply, s}
 
   def handle_info({:unload, id}, s), do: {:noreply, drop_unused(s, id)}
+
+  def handle_info(:sync_midi, s), do: {:noreply, sync_midi(s)}
 
   # Magpie.RecordScreen's reply: a sample saved for a pad.
   def handle_info({:recorded, index, %Library.Sample{id: id}}, s) when index in 0..63 do
@@ -339,7 +367,7 @@ defmodule Magpie.KitSession do
         s
 
       match?({:ok, _}, s.samples[id]) and Engine.unload_sample(id) == {:error, :busy} ->
-        Process.send_after(self(), {:unload, id}, @unload_retry_ms)
+        Process.send_after(self(), {:unload, id}, @retry_ms)
         s
 
       true ->
@@ -489,7 +517,27 @@ defmodule Magpie.KitSession do
   defp put_kit(s, kit) do
     token = make_ref()
     Process.send_after(self(), {:autosave, token}, s.autosave_ms)
-    %{s | kit: kit, save_token: token}
+    sync_midi(%{s | kit: kit, save_token: token})
+  end
+
+  # The engine plays MIDI by the kit's pads and settings: a change to either
+  # gives it the table again. One it refused is tried again after a delay,
+  # with the kit's table as it is then. It stops once the engine takes it.
+  defp sync_midi(s) do
+    config = Magpie.Midi.Map.config(s.kit)
+
+    cond do
+      config == s.midi ->
+        s
+
+      Engine.set_midi(config) == :ok ->
+        %{s | midi: config}
+
+      true ->
+        Logger.warning("Magpie.KitSession: the engine refused the MIDI table")
+        Process.send_after(self(), :sync_midi, @retry_ms)
+        %{s | midi: nil}
+    end
   end
 
   defp save(%{save_token: nil} = s), do: {:ok, s}

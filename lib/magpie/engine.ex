@@ -115,7 +115,8 @@ defmodule Magpie.Engine do
             take: nil,
             close_retry_ms: @close_retry_ms,
             close_backoff: @close_retry_ms,
-            retry: nil
+            retry: nil,
+            midi: nil
 
   # ── Public API ──────────────────────────────────────────────────────────────
 
@@ -300,6 +301,18 @@ defmodule Magpie.Engine do
   @spec cancel_recording() :: :ok | {:error, term()}
   def cancel_recording, do: GenServer.call(__MODULE__, :cancel_recording)
 
+  @doc """
+  The kit's MIDI (`Magpie.Midi.Map.config/1`; nil: off): which pads
+  incoming notes play, what pads send, and the clock (`:internal` or
+  `:send`; an incoming clock is not followed). The engine applies it
+  without the BEAM: notes in play pads in the audio callback, notes and
+  clock out are stamped there. `Magpie.KitSession` keeps it current with
+  the kit.
+  """
+  @spec set_midi(Magpie.Midi.Map.t() | nil) :: :ok | {:error, term()}
+  def set_midi(config) when is_nil(config) or is_map(config),
+    do: GenServer.call(__MODULE__, {:set_midi, config})
+
   # ── Server ──────────────────────────────────────────────────────────────────
 
   @impl true
@@ -434,9 +447,13 @@ defmodule Magpie.Engine do
        pattern: s.pattern,
        pending: with({_, pattern} <- s.pending, do: pattern),
        stream: s.stream,
-       input: s.input
+       input: s.input,
+       midi: s.midi && Map.take(s.midi, [:in_channel, :out_channel, :clock])
      }, s}
   end
+
+  def handle_call({:set_midi, config}, _from, s),
+    do: control(Audio.impl().set_midi(config), %{s | midi: config}, s)
 
   def handle_call({:open_input, source, pid}, _from, s) do
     case Audio.impl().input_open(source) do

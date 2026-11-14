@@ -105,4 +105,25 @@ defmodule Magpie.Audio.Native do
 
   @impl true
   def record_cancel, do: Nif.record_cancel()
+
+  # The table as the NIF takes it: in channel (0 all), out channel, clock,
+  # per note a bit per pad (128 masks), per pad the note it sends (-1 none).
+  @impl true
+  def set_midi(nil), do: Nif.set_midi(nil)
+
+  def set_midi(%{} = c) do
+    masks =
+      for note <- 0..127,
+          do: c.notes |> Map.get(note, []) |> Enum.reduce(0, &Bitwise.bor(&2, Bitwise.bsl(1, &1)))
+
+    out = for pad <- 0..63, do: Map.get(c.out_notes, pad, -1)
+    in_channel = if c.in_channel == :all, do: 0, else: c.in_channel
+    Nif.set_midi({in_channel, c.out_channel, c.clock, masks, out})
+  end
+
+  @impl true
+  def midi_outputs(handles) when is_list(handles), do: Nif.midi_outputs(handles)
+
+  @impl true
+  def midi_sources_changed, do: Nif.midi_sources_changed()
 end

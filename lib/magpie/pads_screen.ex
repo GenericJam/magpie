@@ -46,13 +46,18 @@ defmodule Magpie.PadsScreen do
   while the sheet is up. Every change in the sheet goes through
   `Magpie.KitSession`.
 
+  ## MIDI
+
+  The magpie button opens `Magpie.MidiScreen` (plain, not designed). Pads
+  MIDI plays light like touched ones (the engine's voice messages).
+
   ## Not designed / not built yet (inert, shown as the board has them)
 
-  The menu (the magpie button), the kit name (kit save / load sheet), the
-  tempo, Record pattern and Seq in the top bar, and the sheet's "Edit
-  sample" (no editor yet). Play plays the selected bank's pattern
-  (`Magpie.KitSession.pattern/2`); while it plays the button shows a stop
-  square (the board has only the play state).
+  The kit name (kit save / load sheet), the tempo, Record pattern and Seq
+  in the top bar, and the sheet's "Edit sample" (no editor yet). Play
+  plays the selected bank's pattern (`Magpie.KitSession.pattern/2`); while
+  it plays the button shows a stop square (the board has only the play
+  state).
 
   Every tap target also declares `on_press_out={held()}` (MOB-509): this
   screen re-renders on every touch, voice and frame tick.
@@ -62,7 +67,7 @@ defmodule Magpie.PadsScreen do
 
   import Mob.Canvas, only: [path: 2, rect: 5]
 
-  alias Magpie.{Bird, Engine, Kit, KitSession, RecordScreen, Style}
+  alias Magpie.{Bird, Engine, Kit, KitSession, MidiScreen, RecordScreen, Style}
   alias Magpie.Kit.{Pad, Region}
 
   @banks Style.pad().banks
@@ -244,6 +249,9 @@ defmodule Magpie.PadsScreen do
 
     {:noreply, Mob.Socket.assign(socket, :bank, bank)}
   end
+
+  def handle_info({:tap, :menu}, socket),
+    do: {:noreply, Mob.Socket.push_screen(socket, MidiScreen, %{})}
 
   def handle_info({:tap, :play}, %{assigns: %{playing: true}} = socket) do
     _ = Engine.stop()
@@ -462,13 +470,23 @@ defmodule Magpie.PadsScreen do
     kit = kit(assigns)
     snap_tap = {self(), :snap}
     play_tap = {self(), :play}
+    menu_tap = {self(), :menu}
     snap_bg = Style.color(if kit.snap, do: :selected, else: :surface)
     snap_fg = Style.color(if kit.snap, do: :fm, else: :muted)
     tabs = for bank <- @banks, do: bank_tab(bank, bank == assigns.bank)
 
     ~MOB"""
     <Row height={44} fill_width={true} gap={8}>
-      <Box width={44} height={44} corner_radius={22} background={Style.color(:raised)} align="center">
+      <Box
+        id="menu"
+        width={44}
+        height={44}
+        corner_radius={22}
+        background={Style.color(:raised)}
+        align="center"
+        on_tap={menu_tap}
+        on_press_out={held()}
+      >
         <Canvas
           id="menu_bird"
           width={32}
