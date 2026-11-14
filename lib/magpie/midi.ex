@@ -28,7 +28,8 @@ defmodule Magpie.Midi do
   port, scan}}` on every change. Each device: `%{id, name, type, address,
   input_ports, output_ports}` (`MobMidi.parse_devices/1`; `input_ports`
   are what Magpie reads, `output_ports` what it sends to) plus `status`
-  (`:open | :opening | :closed | {:failed, reason}`) and `wanted` (what the
+  (`:open | :opening | :closed | {:failed, reason}`), `error` (why a port
+  failed while others opened; nil otherwise) and `wanted` (what the
   policy above says). `scan`: `%{state: :idle | :scanning, found:
   [%{address, name, rssi}], error: atom | nil}`.
 
