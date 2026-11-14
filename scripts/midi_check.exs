@@ -147,6 +147,11 @@ defmodule MagpieMidiCheck do
   # Short decaying tones on bank A pads 0..4 with their notes and modes.
   def setup do
     before = KitSession.snapshot().kit
+    # A kit's `follow` couldn't be set back afterwards (Magpie refuses it
+    # for now): leave such a kit alone.
+    if before.midi.clock == :follow,
+      do: raise("the open kit says clock follow, which this check couldn't put back: open another kit")
+
     originals = for {i, _, _} <- @pads, do: {i, get_in(before.banks, ["A", i])}
 
     new =
@@ -181,9 +186,7 @@ defmodule MagpieMidiCheck do
     Engine.stop()
     Engine.set_swing(swing)
     Engine.set_tempo(tempo)
-    # A kit's `follow` can't be set back (Magpie refuses it for now): it
-    # keeps the clock this run left.
-    :ok = KitSession.set_midi(if midi.clock == :follow, do: Map.delete(midi, :clock), else: midi)
+    :ok = KitSession.set_midi(midi)
     for {i, pad} <- originals, do: :ok = KitSession.update_pad(i, fn _ -> pad end)
     :ok = KitSession.flush()
     # No pattern before (the engine can't be given none): an empty one.

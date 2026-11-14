@@ -31,7 +31,7 @@
          permission needed — CameraManager.setTorchMode works without one. -->
     <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
 
-    <!-- MIDI (plugins/magpie_midi: the Magpie port, USB and Bluetooth MIDI).
+    <!-- MIDI (mob_midi: Magpie's own MIDI device, USB and Bluetooth MIDI).
          required=false: a phone without the MIDI service runs Magpie without
          MIDI. -->
     <uses-feature android:name="android.software.midi" android:required="false" />

@@ -130,6 +130,23 @@ defmodule Magpie.MidiTest do
     assert device(Midi.snapshot(), 11).status == :open
   end
 
+  test "ports answer one by one: one that fails while others open says why; all failing is a failure" do
+    :ok = Fake.fail_input_port(0, :no_free_source)
+    start!([@ble, @own])
+    view = await(&(device(&1, 12) && device(&1, 12).status == :open))
+    assert %{status: :open, error: :no_free_source} = device(view, 12)
+
+    # An input-only device whose one port fails.
+    Fake.plug(@humdinger)
+    await(&device(&1, 13))
+    :ok = Midi.set_open(13, true)
+
+    assert %{error: nil} =
+             await(&(device(&1, 13).status == {:failed, :no_free_source})) |> device(13)
+  after
+    Fake.fail_input_port(0, nil)
+  end
+
   test "Magpie's device: its connections, and a sender leaving ends what it held" do
     start!()
     changed = Audio.state().midi_sources_changed

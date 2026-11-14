@@ -60,6 +60,9 @@ defmodule Magpie.Midi.Fake do
   @doc "Opens answer `{:midi, :error, ...}` with `reason` (nil: they open again)."
   def fail_open(reason), do: call({:fail_open, reason})
 
+  @doc "Input port `port` of every device answers an error with `reason` (nil: it opens again)."
+  def fail_input_port(port, reason), do: call({:fail_input_port, port, reason})
+
   @doc "Send the hot-plug process `{:midi, tag, data}`."
   def event(tag, data), do: call({:event, tag, data})
 
@@ -90,7 +93,15 @@ defmodule Magpie.Midi.Fake do
   end
 
   defp fresh(listener),
-    do: %{devices: %{}, listener: listener, fail: nil, calls: [], handle: 0, source: 0}
+    do: %{
+      devices: %{},
+      listener: listener,
+      fail: nil,
+      fail_ports: %{},
+      calls: [],
+      handle: 0,
+      source: 0
+    }
 
   @impl true
   def init(nil), do: {:ok, fresh(nil)}
@@ -115,12 +126,7 @@ defmodule Magpie.Midi.Fake do
         ports =
           if port == :all, do: Enum.to_list(0..(s.devices[id].input_ports - 1)//1), else: [port]
 
-        s =
-          Enum.reduce(ports, s, fn p, acc ->
-            source = rem(acc.source, 63) + 1
-            send(pid, {:midi, :opened, %{device: id, port: p, direction: :input, source: source}})
-            %{acc | source: source}
-          end)
+        s = Enum.reduce(ports, s, &open_port(&2, pid, id, &1))
 
         {:reply, :ok, put_in(s.devices[id].input, true)}
     end
@@ -205,6 +211,12 @@ defmodule Magpie.Midi.Fake do
 
   def handle_call({:fail_open, reason}, _from, s), do: {:reply, :ok, %{s | fail: reason}}
 
+  def handle_call({:fail_input_port, port, nil}, _from, s),
+    do: {:reply, :ok, %{s | fail_ports: Map.delete(s.fail_ports, port)}}
+
+  def handle_call({:fail_input_port, port, reason}, _from, s),
+    do: {:reply, :ok, put_in(s.fail_ports[port], reason)}
+
   def handle_call({:event, tag, data}, _from, s) do
     tell(s, tag, data)
     {:reply, :ok, s}
@@ -212,6 +224,20 @@ defmodule Magpie.Midi.Fake do
 
   def handle_call(:reset, _from, s), do: {:reply, :ok, fresh(s.listener)}
   def handle_call(:state, _from, s), do: {:reply, s, s}
+
+  # One input port of `port: :all`: :opened, or the error fail_input_port/2 set.
+  defp open_port(s, pid, id, port) do
+    case s.fail_ports[port] do
+      nil ->
+        source = rem(s.source, 63) + 1
+        send(pid, {:midi, :opened, %{device: id, port: port, direction: :input, source: source}})
+        %{s | source: source}
+
+      reason ->
+        send(pid, {:midi, :error, %{device: id, op: :open_input, reason: reason, dropped: 0}})
+        s
+    end
+  end
 
   defp opening(s, id, op) do
     cond do

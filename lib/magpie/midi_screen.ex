@@ -344,7 +344,8 @@ defmodule Magpie.MidiScreen do
         :other -> "MIDI"
       end
 
-    "#{type} · #{status_label(device.status)}"
+    partial = if device[:error], do: " (a port can't: #{device.error})", else: ""
+    "#{type} · #{status_label(device.status)}#{partial}"
   end
 
   defp status_label(:open), do: "open"

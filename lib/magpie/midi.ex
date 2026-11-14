@@ -183,11 +183,10 @@ defmodule Magpie.Midi do
   defp midi(s, :opened, %{direction: :input, device: id}), do: part(s, id, :input, :open)
 
   defp midi(s, :opened, %{direction: :output, device: id, handle: handle}) do
-    s = part(s, id, :output, :open)
-
-    if match?(%{parts: %{output: :open}}, s.devices[id]),
-      do: push_outputs(put_in(s.handles[id], handle)),
-      else: s
+    case part(s, id, :output, :open) do
+      ^s -> s
+      s -> push_outputs(put_in(s.handles[id], handle))
+    end
   end
 
   # Another app started or stopped sending into Magpie's own device, or
@@ -256,26 +255,45 @@ defmodule Magpie.Midi do
     s |> put_in([Access.key(:devices), device.id], device) |> apply_policy(device.id)
   end
 
-  # A port opened (or failed) for a device that is still opening it; an
-  # answer for a device closed since is old news.
-  defp part(s, id, which, status) do
+  # mob_midi answers each port it opens (`port: :all`: every one) with
+  # :opened or an error; these refuse the whole open at once.
+  @device_errors [:no_midi_service, :no_such_device, :no_such_port]
+
+  # A port's answer for a device still waiting for it; an answer for a
+  # device closed since is old news.
+  defp part(s, id, which, answer) do
     case s.devices[id] do
-      %{parts: %{^which => :opening}} -> put_in(s.devices[id].parts[which], status)
-      _ -> s
+      %{parts: %{^which => %{pending: pending} = part}} when pending > 0 ->
+        put_in(s.devices[id].parts[which], answered(part, answer))
+
+      _ ->
+        s
     end
   end
 
-  # :open when a direction is, else :opening while one is, {:failed, reason}
-  # when every direction asked for failed, :closed otherwise.
+  defp answered(part, :open), do: %{part | pending: part.pending - 1, open: part.open + 1}
+
+  defp answered(part, {:failed, reason}) when reason in @device_errors,
+    do: %{part | pending: 0, error: reason}
+
+  defp answered(part, {:failed, reason}), do: %{part | pending: part.pending - 1, error: reason}
+
+  # :open when a port is, else :opening while one is awaited, {:failed,
+  # reason} when every port asked for failed, :closed when none was.
   defp status(%{parts: parts}) do
-    statuses = Map.values(parts)
+    parts = Map.values(parts)
 
     cond do
-      :open in statuses -> :open
-      :opening in statuses -> :opening
-      statuses != [] -> hd(statuses)
+      Enum.any?(parts, &(&1.open > 0)) -> :open
+      Enum.any?(parts, &(&1.pending > 0)) -> :opening
+      error = Enum.find_value(parts, & &1.error) -> {:failed, error}
       true -> :closed
     end
+  end
+
+  # Why a port failed on a device whose other ports opened (nil: none did).
+  defp port_error(%{parts: parts} = device) do
+    if status(device) == :open, do: parts |> Map.values() |> Enum.find_value(& &1.error)
   end
 
   # ── Policy ──────────────────────────────────────────────────────────────────
@@ -301,19 +319,19 @@ defmodule Magpie.Midi do
   end
 
   # Every port Magpie can read, into the engine; output port 0 for what it
-  # sends. Each answers :opened or an error.
+  # sends. Each port answers :opened or an error.
   defp open(s, device) do
     parts =
       [
-        {:input, device.input_ports > 0,
+        {:input, device.input_ports,
          fn -> impl().open_input(@socket, device.id, port: :all, deliver: :native) end},
-        {:output, device.output_ports > 0, fn -> impl().open_output(@socket, device.id) end}
+        {:output, min(device.output_ports, 1), fn -> impl().open_output(@socket, device.id) end}
       ]
-      |> Enum.filter(fn {_, has, _} -> has end)
-      |> Map.new(fn {which, _, open} ->
+      |> Enum.filter(fn {_, ports, _} -> ports > 0 end)
+      |> Map.new(fn {which, ports, open} ->
         case open.() do
-          {:error, reason} -> {which, {:failed, reason}}
-          _socket -> {which, :opening}
+          {:error, reason} -> {which, %{pending: 0, open: 0, error: reason}}
+          _socket -> {which, %{pending: ports, open: 0, error: nil}}
         end
       end)
 
@@ -356,7 +374,9 @@ defmodule Magpie.Midi do
       s.devices
       |> Map.values()
       |> Enum.map(fn d ->
-        d |> Map.delete(:parts) |> Map.merge(%{status: status(d), wanted: wanted?(s, d)})
+        d
+        |> Map.delete(:parts)
+        |> Map.merge(%{status: status(d), error: port_error(d), wanted: wanted?(s, d)})
       end)
       |> Enum.sort_by(&{&1.type, &1.name, &1.id})
 
