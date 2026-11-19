@@ -62,7 +62,7 @@ defmodule Magpie.RecordScreen do
 
   import Mob.Canvas
 
-  alias Magpie.{Audio, Bird, Engine, Import, Library, Style}
+  alias Magpie.{Audio, Bird, Engine, Import, Library, LibraryScreen, Style}
 
   # Mob canvases have fixed sizes and a screen can't learn its window's
   # width, so the board's 844 × 390 is laid out to fit the narrowest
@@ -90,7 +90,8 @@ defmodule Magpie.RecordScreen do
     mic: %{icon: "MIC", ink: :pad_coral, name: "Microphone", sub: "phone mic or headset"},
     fmutate: %{icon: "FM", ink: :fm, name: "FMutate", sub: "pairing comes later"},
     apps: %{icon: "APPS", ink: :info, name: "Other apps", sub: "what this phone is playing"},
-    file: %{icon: "FILE", ink: nil, name: "Import a file", sub: "wav, aiff, mp3, flac"}
+    file: %{icon: "FILE", ink: nil, name: "Import a file", sub: "wav, aiff, mp3, flac"},
+    stash: %{icon: "LIB", ink: :pad_amber, name: "The stash", sub: "pick a saved sound"}
   ]
 
   @modes [now: "Now", on_sound: "When sound starts", count_in: "Count in 1 bar"]
@@ -139,10 +140,12 @@ defmodule Magpie.RecordScreen do
   @doc false
   # "Record into pad A15" (slots count from 1), else "Record a sample".
   def title(nil), do: "Record a sample"
+  def title({pad, _pid}), do: "Record into pad #{pad_name(pad)}"
 
-  def title({pad, _pid}) do
+  @doc false
+  def pad_name(pad) when pad in 0..63 do
     {bank, slot} = Magpie.Kit.bank_slot(pad)
-    "Record into pad #{bank}#{slot + 1}"
+    "#{bank}#{slot + 1}"
   end
 
   defp held, do: {self(), :held}
@@ -163,7 +166,7 @@ defmodule Magpie.RecordScreen do
       padding_top={8}
       padding_bottom={8}
     >
-      <Row gap={12} fill_width={true}>
+      <Row gap={12} fill_width={true} fill_height={true} align={:top}>
         {left(assigns)}
         <Column weight={1} gap={10}>
           <Canvas id="wave" width={card_w} height={card_h} draw={card_ops(assigns)} />
@@ -178,40 +181,48 @@ defmodule Magpie.RecordScreen do
     left_w = @left_w
 
     ~MOB"""
-    <Column width={left_w} gap={6}>
-      <Row align={:center} gap={8} height={44}>
-        <Canvas
-          id="back"
-          width={44}
-          height={44}
-          draw={back_ops()}
-          on_tap={{self(), :back}}
-          on_press_out={held()}
-        />
+    <Box width={left_w} fill_height={true}>
+      <Column fill_width={true} fill_height={true} gap={4}>
+        <Row align={:center} gap={8} height={44}>
+          <Canvas
+            id="back"
+            width={44}
+            height={44}
+            draw={back_ops()}
+            on_tap={{self(), :back}}
+            on_press_out={held()}
+          />
+          <Text
+            text={title(assigns.target)}
+            font={:bold}
+            text_size={16}
+            text_color={Style.color(:text)}
+            max_lines={1}
+          />
+        </Row>
         <Text
-          text={title(assigns.target)}
-          font={:bold}
-          text_size={16}
-          text_color={Style.color(:text)}
+          text="SOURCE"
+          font={:mono_semibold}
+          text_size={11}
+          line_height={1.0}
+          letter_spacing={0.88}
+          text_color={Style.color(:muted)}
         />
-      </Row>
-      <Text
-        text="SOURCE"
-        font={:mono_semibold}
-        text_size={11}
-        letter_spacing={0.88}
-        text_color={Style.color(:muted)}
-      />
-      {for {key, source} <- sources(), do: source_row(key, source, assigns)}
-      <Text
-        :if={assigns.notice}
-        id="notice"
-        text={assigns.notice}
-        text_size={12}
-        text_color={Style.color(:text_2)}
-        max_lines={3}
-      />
-    </Column>
+        <Scroll weight={1} fill_width={true}>
+          <Column fill_width={true} gap={4}>
+            {for {key, source} <- sources(), do: source_row(key, source, assigns)}
+            <Text
+              :if={assigns.notice}
+              id="notice"
+              text={assigns.notice}
+              text_size={12}
+              text_color={Style.color(:text_2)}
+              max_lines={3}
+            />
+          </Column>
+        </Scroll>
+      </Column>
+    </Box>
     """
   end
 
@@ -231,14 +242,14 @@ defmodule Magpie.RecordScreen do
     <Box
       id={"source_#{key}"}
       fill_width={true}
+      height={48}
       corner_radius={12}
       background={if(selected, do: Style.color(:raised_hi), else: Style.color(:surface))}
       border_color={if(selected, do: Style.color(:fm), else: Style.color(:surface))}
       border_width={if(selected, do: 2, else: 0)}
-      padding_left={12}
-      padding_right={12}
-      padding_top={8}
-      padding_bottom={8}
+      padding_left={10}
+      padding_right={10}
+      align={:center}
       on_tap={tap}
       on_press_out={if(tap, do: held())}
     >
@@ -252,9 +263,23 @@ defmodule Magpie.RecordScreen do
         >
           <Text text={source.icon} font={:mono_bold} text_size={9} text_color={ink} />
         </Box>
-        <Column gap={1}>
-          <Text text={source.name} font={:semibold} text_size={13} text_color={name_color} />
-          <Text text={source.sub} font={:mono} text_size={10} text_color={sub_color} />
+        <Column weight={1}>
+          <Text
+            text={source.name}
+            font={:semibold}
+            text_size={13}
+            line_height={1.15}
+            text_color={name_color}
+            max_lines={1}
+          />
+          <Text
+            text={source.sub}
+            font={:mono}
+            text_size={10}
+            line_height={1.15}
+            text_color={sub_color}
+            max_lines={1}
+          />
         </Column>
       </Row>
     </Box>
@@ -583,6 +608,24 @@ defmodule Magpie.RecordScreen do
   def handle_info({:tap, {:source, :file}}, socket) do
     socket = Mob.Socket.assign(socket, selected: :file, notice: nil)
     {:noreply, if(device_calls?(), do: Mob.Files.pick(socket, types: [:audio]), else: socket)}
+  end
+
+  def handle_info({:tap, {:source, :stash}}, socket) do
+    leave(socket)
+
+    params =
+      case socket.assigns.target do
+        {pad, pid} -> %{pad: pad, reply_to: pid}
+        nil -> %{}
+      end
+
+    socket =
+      socket
+      |> monitoring()
+      |> Mob.Socket.assign(input: nil, input_id: nil, selected: :stash, notice: nil)
+      |> Mob.Socket.push_screen(LibraryScreen, params)
+
+    {:noreply, socket}
   end
 
   def handle_info({:tap, {:source, source}}, socket) when source in [:mic, :apps],

@@ -6,6 +6,7 @@ defmodule Magpie.KitSessionMidiTest do
 
   alias Magpie.Audio.Fake
   alias Magpie.{Engine, Kit, KitSession, Library}
+  alias Magpie.Kit.Step
   alias Magpie.Midi.Map, as: MidiMap
 
   setup do
@@ -103,5 +104,24 @@ defmodule Magpie.KitSessionMidiTest do
     assert_receive {:magpie_audio, :voice, @keys, :start}
     :ok = Fake.midi_in({0x91, 67, 0})
     assert_receive {:magpie_audio, :voice, @keys, :end}
+  end
+
+  test "notes in record into the playing pattern as touches do" do
+    start_session!(drums())
+    :ok = Engine.set_pattern(KitSession.pattern(KitSession.snapshot(), "B"), at: :now)
+    :ok = Engine.play()
+    :ok = KitSession.set_recording(true)
+
+    Fake.advance_ticks(4 * 24 + 2)
+    # The keys pad (bank B, playing) and a drum pad of bank A (not playing).
+    :ok = Fake.midi_in({0x90, 67, 80})
+    :ok = Fake.midi_in({0x90, 36, 100})
+    Engine.state()
+    snapshot = KitSession.snapshot()
+
+    assert %{5 => %{steps: [%Step{step: 4, tick: 2, vel: 80, note: 67}]}} =
+             KitSession.pattern(snapshot, "B").lanes
+
+    assert KitSession.pattern(snapshot, "A").lanes == %{}
   end
 end

@@ -149,33 +149,84 @@ launcher masks keep the whole nest. Regenerate every launcher icon with
   `ops(mood, x:, y:, size:, trinket:)`, moods `:idle | :listen | :grab |
   :play | :proud | :sleep | :nomic` (`moods/0`); size 1 = 64 × 56 pt. No
   rotation or gradients.
-- **`Magpie.Import`**: `import(path, name \\ nil)` → `Engine.decode/1` →
-  `Library.put_pcm(source: :imported)`. AIFF/AIFC (MediaCodec answers
-  `:unsupported` on Android) goes through **`Magpie.Aiff`** (`decode/1`
-  like `Magpie.Wav.decode/1`: big-endian integer, `sowt`, `fl32`, `fl64`),
-  then a float WAV under the library dir so the engine still makes the
-  peaks.
+- **`Magpie.Import`**: `import(path, name \\ nil, opts \\ [])` →
+  `Engine.decode/1` → `Library.put_pcm` (`source:` default `:imported`,
+  `tags:` default `[]`). AIFF/AIFC and WAV formats MediaCodec answers
+  `:unsupported` for on Android go through **`Magpie.Aiff`** (`decode/1`
+  like `Magpie.Wav.decode/1`: big-endian integer, `sowt`, `fl32`, `fl64`)
+  or **`Magpie.Wav`**, then a float WAV under the library dir so the
+  engine still makes the peaks.
 - **`Magpie.RecordScreen`**: the Record board. Params `%{pad: 0..63,
   reply_to: pid}` record into a pad: the title names it and each saved
   sample goes to `reply_to` as `{:recorded, pad, %Magpie.Library.Sample{}}`.
+  "The stash" in the source list closes the input and pushes
+  `Magpie.LibraryScreen` with the same target params.
+- **`Magpie.LibraryScreen`**: the Samples tab of the Library board ("The
+  stash"): search, source filter chips (`All`, `Recorded`, `From FMutate`,
+  `Packs`, `Imported`), `<LazyList>` rows with 16-bar mini waveforms and
+  `Mob.Audio` audition, "+ Import" (`Mob.Files.pick` + `Magpie.Import`),
+  starter-pack progress and credit. With `%{pad: 0..63, reply_to: pid}`,
+  tapping a row's body sends `{:recorded, pad, sample}` to `reply_to` and
+  pops back to `Magpie.PadsScreen` (`Mob.Socket.pop_to/2`).
+- **`Magpie.SeqScreen`**: the Seq board (step sequencer, landscape): pattern
+  tabs (`A1..A4`, `+` while `< 4`), length (`16` / `32` steps), swing
+  (`50%..75%`, vertical drag 6 pt/step), tempo (`40..240 bpm`, vertical drag
+  6 pt/step), `Snap 1/16`, Play/Stop, live record (`record_pattern`, as on
+  the pads), and a vertical `<Scroll>` of 48 pt lanes
+  for the bank's loaded pads (92 pt label with colour chip + name, tap to
+  audition via `Engine.trigger/3`, recorded like a pad while armed; 16 or 32
+  weighted step cells, tap to toggle, vertical drag to change velocity
+  `1..127`, playhead bar from `{:magpie_audio, :playhead, step, frame}` for
+  the pattern `Engine.state/0` says plays; the board's ring on the playing
+  column is left out so a step changes only the bar, as Mob paints the
+  whole tree on every change).
 - **`Magpie.KitSession`**: the kit being played, one GenServer from
   `App.on_start` after the Engine. Loads the kit's samples (library →
   `Engine.load_pcm/4`, one at a time in a loader process) and applies its
   pads; `subscribe/1` (monitored; returns the snapshot, then
-  `{:magpie_kit, %KitSession.Snapshot{kit, pads}}` on every change, `pads`
-  per index: `status` `:loading | :ready | {:error, reason}`, `wave` 12
-  peaks 0..255 over the region, `seconds` at its pitch), `snapshot/0`,
-  `update_pad(index, fn pad -> pad end)` (engine first; its error leaves
-  the kit alone; a new sample or mode, or clearing, stops the pad's voices
-  through `set_pad(…, stop: true)`), `clear_pad/1`,
+  `{:magpie_kit, %KitSession.Snapshot{kit, pads, pattern_ids, recording}}` on every
+  change, `pads` per index: `status` `:loading | :ready | {:error, reason}`,
+  `wave` 12 peaks 0..255 over the region, `seconds` at its pitch),
+  `snapshot/0`, `update_pad(index, fn pad -> pad end)` (engine first; its
+  error leaves the kit alone; a new sample or mode, or clearing, stops the
+  pad's voices through `set_pad(…, stop: true)`), `clear_pad/1`,
   `put_sample(index, sample_id)` (a new pad takes the sample's name and a
-  colour by slot), `set_snap/1`, `flush/0`,
-  `pattern(kit, bank)`, `whereis/0` (RecordScreen's `reply_to`: it handles
-  `{:recorded, pad, sample}`). Autosaves 1 s after a change. Starts with
-  the last saved kit, else the board's Dusty Breaks keeping only pads
-  whose samples the library has (empty on a fresh install). Tests:
-  `Magpie.Test.Kits` (`setup_library/0`, `sample!/2`, `kit/2`, `pad/3`,
-  `start_session!/2`, `await_loaded/0`).
+  colour by slot), `set_snap/1`, `set_tempo/1`, `set_swing/1`,
+  `patterns(kit_or_snapshot, bank)`, `pattern(kit_or_snapshot, bank)` (selected
+  pattern from a `%Snapshot{}`, first pattern for `bank` from a `%Kit{}`),
+  `select_pattern(bank, id)` (the playing one: left playing, a queued one
+  dropped; edits of the playing pattern keep a queued switch),
+  `add_pattern(bank)` (up to 4 per bank),
+  `set_pattern_length(bank, 16 | 32)`, `toggle_step(bank, slot, step, vel \\ 100)`,
+  `set_step_velocity(bank, slot, step, vel)`, `set_recording(boolean)` (live
+  record: `{:error, :not_playing}` when stopped; armed, it subscribes to the
+  Engine and writes each `:hit` (touch or MIDI) into the pad's lane of its
+  bank's selected pattern while the engine plays that pattern, replacing the
+  step at that index, `tick: 0` with Snap on; other banks/patterns, pads
+  not in the kit and hits after a stop are dropped; engine first `at: :now`,
+  autosaved; disarms on the Engine's `:transport, :stopped` and when the
+  Engine exits, monitored while armed), `flush/0`, `whereis/0`
+  (RecordScreen's `reply_to`: it handles `{:recorded, pad, sample}`). Autosaves
+  1 s after a change. Starts with the last saved kit, else the board's Dusty
+  Breaks keeping only pads whose samples the library has (empty on a fresh
+  install). Tests: `Magpie.Test.Kits` (`setup_library/0`, `sample!/2`, `kit/2`,
+  `pad/3`, `start_session!/2`, `await_loaded/0`).
+
+## Bundled starter drum source
+
+`priv/samples/starter-drums/` contains 100 acoustic drum/percussion one-shots from
+Versilian Studios LLC's VCSL, pinned at `c1ea7bcc3c7309650ab0da9d15c9cd1fbc4a4c7e`.
+All are CC0-1.0, independently of Magpie's software licence. Keep `LICENSE.txt`,
+`NOTICE.md` and `manifest.json` with the WAVs; the manifest records original
+source paths, Git blob hashes, SHA-256 checksums, formats and durations.
+The source files are unmodified, about 37.4 MB, covering 20 instrument categories.
+Some files have a short recorded lead-in; don't mistake it for engine latency.
+**`Magpie.StarterPack`** (started from `App.on_start` after `KitSession`)
+imports the manifest into `Magpie.Library` (`source: :pack`, `tags: [category]`,
+one sample per message) and writes `.starter-drums-v1` in `Library.dir/0` once
+every file succeeds (`status/0`, `subscribe/1` → `{status, credit}` in one
+call, `credit/0`, `await/1`). The stash reloads its list every 10 files and
+at the end, the progress line on every file.
 
 ## Architecture (planned)
 
@@ -218,10 +269,14 @@ started in `App.on_start`. Why it is built this way:
 - **Subscribe** (`subscribe/1`, monitored) for
   `{:magpie_audio, :playhead, step, frame}`,
   `{:magpie_audio, :voice, pad, :start | :end}` (a voice of the pad started;
-  its last voice ended), `{:magpie_audio, :hit, pad, %Magpie.Kit.Step{}}`
-  and `{:magpie_audio, :pattern, %Magpie.Kit.Pattern{}, frame}` (it took
-  over). Frames are engine frames; `Magpie.Audio.frame_time(clock(), frame)`
-  is when one is heard, in `System.monotonic_time(:nanosecond)`.
+  its last voice ended), `{:magpie_audio, :hit, pad, %Magpie.Kit.Step{}}`,
+  `{:magpie_audio, :pattern, %Magpie.Kit.Pattern{}, frame}` (it took
+  over) and `{:magpie_audio, :transport, :started | :stopped, nil}` (sent by
+  the Engine itself when `play/0` / `stop/0` change `playing`; nothing for a
+  play while playing or a stop while stopped; subscribe before reading
+  `state/0` so none is missed). Frames are engine frames;
+  `Magpie.Audio.frame_time(clock(), frame)` is when one is heard, in
+  `System.monotonic_time(:nanosecond)`.
 - **Samples:** `load_sample(id, path)` (MediaCodec: wav 16/24/float, mp3,
   m4a, flac, ogg checked), `load_pcm(id, f32le, rate, channels)` (the
   library's PCM, no decoder: use this for kits), both blocking the caller
@@ -651,9 +706,8 @@ locked on mount. Why it is built this way:
   pad lit (or looping, with a progress bar from a tokened 50 ms timer)
   after the lift. Empty pad tap → `Magpie.RecordScreen` with `%{pad,
   reply_to: KitSession.whereis()}`: what it saves lands on that pad (the
-  session handles `{:recorded, pad, sample}`). With the old home screen
-  gone, the pads are the only way into the Record screen for now (the
-  Library screen comes later).
+  session handles `{:recorded, pad, sample}`), and "The stash" in
+  `RecordScreen` opens `Magpie.LibraryScreen` for that pad.
 - **Long press:** 600 ms on the BEAM from the `:down` (`{:long_press,
   pointer_id, token}`), cancelled by the lift or by the finger leaving the
   pad; the first to fire cancels the others, and none opens over the
@@ -662,12 +716,19 @@ locked on mount. Why it is built this way:
   colour, play mode, choke group, velocity mode, pitch and MIDI note (drag
   the field up or down, 6 pt a step), Replace (records into the pad),
   Clear, Done; all through `Magpie.KitSession`.
-- **Inert until designed or built:** the menu (magpie button), the kit
-  name (save/load sheet), the tempo, Record pattern, Seq, and the sheet's
-  Edit sample. Play plays the bank's pattern (stop square while playing:
-  the board shows only play). Plain fallbacks: a pad whose sample isn't in
-  the library says "sample missing", one that failed to load "can't
-  load", one still loading "loading…".
+- **Record pattern** (`record_pattern`): toggles
+  `KitSession.set_recording/1`; pressed while stopped it first plays the
+  bank's selected pattern as Play does. Armed look (not designed; the
+  Record board's recording look): `danger` background, ink dot. Disarms
+  itself when the sequencer stops.
+- **Inert until designed or built:** the kit name (save/load sheet), the
+  tempo, and the sheet's Edit sample. Seq opens
+  `Magpie.SeqScreen` for the current bank; Play plays the bank's selected
+  pattern (stop square while playing: the board shows only play). Both
+  screens' Play/Stop follow the Engine's `:transport` messages, so a stop
+  on one shows on the other. Plain
+  fallbacks: a pad whose sample isn't in the library says "sample missing",
+  one that failed to load "can't load", one still loading "loading…".
 - **The magpie's mood** on the menu button (`Magpie.Bird.ops(mood, size:
   0.5)` on a 32 × 28 canvas): `:play` while the sequencer plays, `:sleep`
   with no audio output, else `:idle`.

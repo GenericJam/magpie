@@ -38,6 +38,11 @@ defmodule Magpie.Wav do
   def decode(<<"RIFF", _size::little-32, "WAVE", chunks::binary>>), do: chunks(chunks, nil)
   def decode(_), do: {:error, :not_wav}
 
+  @doc "True when `head` (a file's first 12 bytes or more) starts a RIFF/WAVE file."
+  @spec wav?(binary()) :: boolean()
+  def wav?(<<"RIFF", _size::little-32, "WAVE", _::binary>>), do: true
+  def wav?(_head), do: false
+
   defp chunks(<<"fmt ", size::little-32, body::binary-size(size), rest::binary>>, _fmt) do
     chunks(skip_pad(rest, size), parse_fmt(body))
   end

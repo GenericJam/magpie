@@ -6,7 +6,7 @@ defmodule Magpie.KitSessionTest do
 
   alias Magpie.Audio.Fake
   alias Magpie.{Engine, Kit, KitSession, Library, Repo, Wav}
-  alias Magpie.Kit.{Pad, Region}
+  alias Magpie.Kit.{Pad, Pattern, Region, Step}
 
   setup do
     setup_library()
@@ -275,4 +275,342 @@ defmodule Magpie.KitSessionTest do
     assert %Kit.Pattern{id: "B1", bank: "B", length: 16, lanes: %{}} =
              KitSession.pattern(kit, "B")
   end
+
+  describe "patterns, tempo and swing" do
+    setup do
+      kick = sample!("Kick", 0.25)
+      snare = sample!("Snare", 0.25)
+      start_session!(kit([{"A", pad(0, kick)}, {"A", pad(1, snare)}]), autosave_ms: 60_000)
+      KitSession.subscribe()
+      :ok
+    end
+
+    test "tempo, swing and pattern edits round-trip through autosave/load" do
+      assert :ok = KitSession.set_tempo(134)
+      assert :ok = KitSession.set_swing(0.62)
+      assert :ok = KitSession.toggle_step("A", 0, 0, 110)
+      assert :ok = KitSession.toggle_step("A", 1, 4, 95)
+      assert :ok = KitSession.set_step_velocity("A", 0, 0, 120)
+
+      assert %{tempo: 134, swing: 0.62} = Fake.state()
+      assert_received {:magpie_kit, %{kit: %Kit{tempo: 134}}}
+      assert_received {:magpie_kit, %{kit: %Kit{swing: 0.62}}}
+
+      assert :ok = KitSession.flush()
+      assert {:ok, saved} = Library.load_kit("test-kit")
+      assert saved.tempo == 134
+      assert saved.swing == 0.62
+
+      assert [%Pattern{id: "A1", bank: "A", length: 16, lanes: lanes}] = saved.patterns
+      assert %{0 => %{mute: false, steps: [%Step{step: 0, vel: 120, tick: 0}]}} = lanes
+      assert %{1 => %{mute: false, steps: [%Step{step: 4, vel: 95, tick: 0}]}} = lanes
+
+      # Toggling an existing step removes it; an empty unmuted lane is dropped.
+      assert :ok = KitSession.toggle_step("A", 0, 0)
+      assert %Pattern{lanes: %{1 => _}} = KitSession.pattern(KitSession.snapshot(), "A")
+      refute Map.has_key?(KitSession.pattern(KitSession.snapshot(), "A").lanes, 0)
+    end
+
+    test "editing the playing pattern updates the engine at once (:now); switching applies at the bar (:bar)" do
+      :ok = KitSession.toggle_step("A", 0, 0, 100)
+      a1 = KitSession.pattern(KitSession.snapshot(), "A")
+      :ok = Engine.set_pattern(a1, at: :now)
+      :ok = Engine.play()
+      Fake.advance(2)
+
+      # Live edit on the playing pattern applies at once (:now) and sounds at step 3.
+      assert :ok = KitSession.toggle_step("A", 1, 3, 88)
+      assert %Pattern{id: "A1", lanes: %{0 => _, 1 => _}} = Engine.state().pattern
+      assert Engine.state().pending == nil
+
+      :ok = Engine.subscribe()
+      Fake.advance(1)
+      assert_receive {:magpie_audio, :playhead, 3, _}
+      assert_receive {:magpie_audio, :voice, 1, :start}
+
+      # Adding A2 while A1 plays queues A2 for the next bar (:bar).
+      assert :ok = KitSession.add_pattern("A")
+      assert KitSession.snapshot().pattern_ids["A"] == "A2"
+      assert %Pattern{id: "A1"} = Engine.state().pattern
+      assert %Pattern{id: "A2"} = Engine.state().pending
+
+      # Editing the pending pattern A2 updates what will take over at the bar.
+      assert :ok = KitSession.toggle_step("A", 0, 0, 77)
+
+      assert %Pattern{id: "A2", lanes: %{0 => %{steps: [%Step{step: 0, vel: 77}]}}} =
+               Engine.state().pending
+
+      # Switching back to A1, which still plays: the queued A2 is dropped.
+      assert :ok = KitSession.select_pattern("A", "A1")
+      assert %{pattern: %Pattern{id: "A1"}, pending: nil} = Engine.state()
+
+      # Re-select A2 and advance to the end of the 16-step bar: A2 takes over at step 0.
+      assert :ok = KitSession.select_pattern("A", "A2")
+      Fake.advance(13)
+      assert %Pattern{id: "A2"} = Engine.state().pattern
+      assert Engine.state().pending == nil
+    end
+
+    test "shrinking from 32 to 16 steps drops steps >= 16 and keeps steps < 16" do
+      assert :ok = KitSession.set_pattern_length("A", 32)
+      assert :ok = KitSession.toggle_step("A", 0, 4, 100)
+      assert :ok = KitSession.toggle_step("A", 0, 16, 90)
+      assert :ok = KitSession.toggle_step("A", 0, 31, 80)
+      assert :ok = KitSession.toggle_step("A", 1, 20, 75)
+
+      assert :ok = KitSession.set_pattern_length("A", 16)
+      pattern = KitSession.pattern(KitSession.snapshot(), "A")
+      assert pattern.length == 16
+      assert %{0 => %{steps: [%Step{step: 4, vel: 100}]}} = pattern.lanes
+      refute Map.has_key?(pattern.lanes, 1)
+    end
+
+    test "caps patterns at 4 per bank (A1..A4)" do
+      assert [%Pattern{id: "A1"}] = KitSession.patterns(KitSession.snapshot(), "A")
+      assert :ok = KitSession.add_pattern("A")
+      assert :ok = KitSession.add_pattern("A")
+      assert :ok = KitSession.add_pattern("A")
+
+      ids = KitSession.snapshot() |> KitSession.patterns("A") |> Enum.map(& &1.id)
+      assert ids == ["A1", "A2", "A3", "A4"]
+      assert KitSession.snapshot().pattern_ids["A"] == "A4"
+      assert %Pattern{id: "A4"} = KitSession.pattern(KitSession.snapshot(), "A")
+      # pattern(%Kit{}, bank) is pure and always returns the kit's first pattern for the bank.
+      assert %Pattern{id: "A1"} = KitSession.pattern(KitSession.snapshot().kit, "A")
+
+      assert {:error, {:invalid, :pattern}} = KitSession.add_pattern("A")
+      assert [_, _, _, _] = KitSession.patterns(KitSession.snapshot(), "A")
+    end
+
+    test "refuses invalid tempo, swing, length, velocity, step, unloaded slot, bank and pattern" do
+      assert {:error, {:invalid, :tempo}} = KitSession.set_tempo(39)
+      assert {:error, {:invalid, :tempo}} = KitSession.set_tempo(241)
+      assert {:error, {:invalid, :swing}} = KitSession.set_swing(0.49)
+      assert {:error, {:invalid, :swing}} = KitSession.set_swing(0.76)
+      assert {:error, {:invalid, :length}} = KitSession.set_pattern_length("A", 24)
+      assert {:error, {:invalid, :bank}} = KitSession.set_pattern_length("Z", 16)
+      assert {:error, {:invalid, :vel}} = KitSession.toggle_step("A", 0, 0, 0)
+      assert {:error, {:invalid, :vel}} = KitSession.set_step_velocity("A", 0, 0, 128)
+      assert {:error, {:invalid, :step}} = KitSession.toggle_step("A", 0, 16, 100)
+      assert {:error, {:invalid, :step}} = KitSession.set_step_velocity("A", 0, -1, 100)
+      # Slot 2 has no loaded pad in bank A.
+      assert {:error, {:invalid, :slot}} = KitSession.toggle_step("A", 2, 0, 100)
+      assert {:error, {:invalid, :slot}} = KitSession.set_step_velocity("A", 2, 0, 100)
+      assert {:error, {:invalid, :slot}} = KitSession.toggle_step("A", 16, 0, 100)
+      assert {:error, {:invalid, :bank}} = KitSession.toggle_step("E", 0, 0, 100)
+      assert {:error, {:invalid, :pattern}} = KitSession.select_pattern("A", "A9")
+      assert {:error, {:invalid, :bank}} = KitSession.select_pattern("E", "E1")
+      assert {:error, {:invalid, :bank}} = KitSession.add_pattern("E")
+    end
+
+    test "an engine error leaves the kit and selection unchanged" do
+      :ok = KitSession.toggle_step("A", 0, 0, 100)
+      a1 = KitSession.pattern(KitSession.snapshot(), "A")
+      :ok = Engine.set_pattern(a1, at: :now)
+      :ok = Engine.play()
+
+      # Drain subscription mailbox before provoking an engine refusal.
+      receive do
+        {:magpie_kit, _} -> :ok
+      after
+        0 -> :ok
+      end
+
+      # Hand ownership of Fake away from Engine so engine control calls return {:error, :not_owner}.
+      other = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(other, :kill) end)
+      {:ok, _} = Fake.open(other)
+
+      assert {:error, :not_owner} = KitSession.set_tempo(140)
+      assert {:error, :not_owner} = KitSession.set_swing(0.60)
+      assert {:error, :not_owner} = KitSession.toggle_step("A", 1, 4, 100)
+      assert {:error, :not_owner} = KitSession.add_pattern("A")
+
+      snapshot = KitSession.snapshot()
+      assert snapshot.kit.tempo == 120
+      assert snapshot.kit.swing == 0.5
+      assert snapshot.pattern_ids["A"] == "A1"
+      assert KitSession.pattern(snapshot, "A") == a1
+      refute_received {:magpie_kit, _}
+    end
+
+    test "selecting the pattern that plays leaves it playing on; selecting it over a queued one cancels that" do
+      :ok = KitSession.set_pattern_length("A", 32)
+      play!("A")
+      Fake.advance(3)
+
+      # Re-tapping its tab: no restart at the bar.
+      assert :ok = KitSession.select_pattern("A", "A1")
+      assert %{pattern: %Pattern{id: "A1"}, pending: nil} = Engine.state()
+      Fake.advance(13)
+      assert %{step: 16, pattern: %Pattern{id: "A1"}} = Engine.state()
+
+      # A2 queued for the bar, then A1 again: A1 plays on from where it is.
+      assert :ok = KitSession.add_pattern("A")
+      assert %Pattern{id: "A2"} = Engine.state().pending
+      assert :ok = KitSession.select_pattern("A", "A1")
+      assert %{pattern: %Pattern{id: "A1"}, pending: nil} = Engine.state()
+      Fake.advance(16)
+      assert %{step: 0, pattern: %Pattern{id: "A1"}} = Engine.state()
+    end
+  end
+
+  describe "live recording" do
+    setup do
+      kick = sample!("Kick", 0.25)
+      snare = sample!("Snare", 0.25)
+
+      start_session!(kit([{"A", pad(0, kick)}, {"A", pad(1, snare)}, {"B", pad(0, kick)}]),
+        autosave_ms: 30
+      )
+
+      KitSession.subscribe()
+      %{kick: kick}
+    end
+
+    test "Snap off keeps a hit's timing, Snap on puts it on the grid; the engine plays it at once" do
+      play!("A")
+      :ok = KitSession.set_recording(true)
+      assert KitSession.snapshot().recording
+
+      Fake.advance_ticks(3 * 24 + 5)
+      :ok = Engine.trigger(0, 90)
+      settle()
+      assert %{steps: [%Step{step: 3, vel: 90, tick: 5, note: nil}]} = lane("A", 0)
+
+      assert %Pattern{id: "A1", lanes: %{0 => %{steps: [%Step{step: 3, tick: 5}]}}} =
+               Engine.state().pattern
+
+      assert Engine.state().pending == nil
+
+      :ok = KitSession.set_snap(true)
+      # To step 6, 4 ticks early.
+      Fake.advance_ticks(3 * 24 - 9)
+      :ok = Engine.trigger(1, 70)
+      settle()
+      assert %{steps: [%Step{step: 6, vel: 70, tick: 0}]} = lane("A", 1)
+    end
+
+    test "a hit replaces the step at its index instead of adding a second one" do
+      :ok = KitSession.toggle_step("A", 0, 2, 50)
+      play!("A")
+      :ok = KitSession.set_recording(true)
+
+      Fake.advance_ticks(2 * 24 - 3)
+      :ok = Engine.trigger(0, 100)
+      settle()
+      assert %{steps: [%Step{step: 2, vel: 100, tick: -3}]} = lane("A", 0)
+
+      :ok = Engine.trigger(0, 60)
+      settle()
+      assert %{steps: [%Step{step: 2, vel: 60, tick: -3}]} = lane("A", 0)
+    end
+
+    test "hits on another bank, on a pad the kit doesn't have, or off the selected pattern are dropped",
+         %{kick: kick} do
+      play!("A")
+      :ok = KitSession.set_recording(true)
+
+      # Bank B isn't playing.
+      :ok = Engine.trigger(Kit.pad_index("B", 0), 100)
+      # A pad the engine has and the kit doesn't.
+      :ok = Engine.set_pad(Kit.pad_index("A", 5), pad(5, kick))
+      :ok = Engine.trigger(Kit.pad_index("A", 5), 100)
+      settle()
+      assert KitSession.snapshot().kit.patterns == []
+
+      # A2 selected, A1 still playing until the bar.
+      :ok = KitSession.add_pattern("A")
+      :ok = Engine.trigger(0, 100)
+      settle()
+      assert Enum.all?(KitSession.patterns(KitSession.snapshot(), "A"), &(&1.lanes == %{}))
+      assert KitSession.snapshot().recording
+    end
+
+    test "arming needs the engine playing; it stops, the session disarms and records no more" do
+      assert {:error, :not_playing} = KitSession.set_recording(true)
+      refute KitSession.snapshot().recording
+
+      play!("A")
+      :ok = KitSession.set_recording(true)
+      assert_receive {:magpie_kit, %{recording: true}}
+      :ok = Engine.stop()
+      settle()
+      refute KitSession.snapshot().recording
+
+      play!("A")
+      :ok = Engine.trigger(0, 100)
+      settle()
+      assert lane("A", 0) == nil
+    end
+
+    test "a hit the session handles after the engine stopped is dropped and disarms" do
+      play!("A")
+      :ok = KitSession.set_recording(true)
+      Fake.advance(1)
+
+      # The hit is forwarded before the stop, the session reads it after.
+      :sys.suspend(KitSession)
+      :ok = Engine.trigger(0, 100)
+      :ok = Engine.stop()
+      :sys.resume(KitSession)
+      settle()
+
+      assert lane("A", 0) == nil
+      refute KitSession.snapshot().recording
+    end
+
+    test "the Engine exiting disarms" do
+      play!("A")
+      :ok = KitSession.set_recording(true)
+      stop_supervised!(Engine)
+      assert_receive {:magpie_kit, %{recording: false}}
+    end
+
+    test "what is recorded is autosaved with the kit" do
+      play!("A")
+      :ok = KitSession.set_recording(true)
+      Fake.advance_ticks(5 * 24 + 1)
+      :ok = Engine.trigger(1, 88)
+      settle()
+      Process.sleep(80)
+
+      assert {:ok, %Kit{patterns: [%Pattern{id: "A1", lanes: lanes}]}} =
+               Library.load_kit("test-kit")
+
+      assert %{1 => %{steps: [%Step{step: 5, vel: 88, tick: 1}]}} = lanes
+    end
+
+    test "a hit recorded while another bank's pattern waits for the bar doesn't cancel it" do
+      play!("A")
+      :ok = KitSession.set_recording(true)
+      # Pads switched to bank B: B1 waits for the bar.
+      :ok = Engine.set_pattern(KitSession.pattern(KitSession.snapshot(), "B"), at: :bar)
+
+      Fake.advance(2)
+      :ok = Engine.trigger(0, 100)
+      settle()
+
+      assert %{steps: [%Step{step: 2}]} = lane("A", 0)
+      assert %Pattern{id: "A1", lanes: %{0 => _}} = Engine.state().pattern
+      assert %Pattern{id: "B1", bank: "B"} = Engine.state().pending
+
+      Fake.advance(14)
+      assert %{pattern: %Pattern{id: "B1", bank: "B"}, pending: nil} = Engine.state()
+    end
+  end
+
+  defp play!(bank) do
+    :ok = Engine.set_pattern(KitSession.pattern(KitSession.snapshot(), bank), at: :now)
+    :ok = Engine.play()
+  end
+
+  # The engine has forwarded what the fake sent it, and the session handled it.
+  defp settle do
+    Engine.state()
+    KitSession.snapshot()
+  end
+
+  defp lane(bank, slot),
+    do: KitSession.snapshot() |> KitSession.pattern(bank) |> Map.fetch!(:lanes) |> Map.get(slot)
 end

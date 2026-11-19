@@ -2,13 +2,13 @@ defmodule Magpie.Import do
   @moduledoc """
   A file into the stash: `Magpie.Engine.decode/1` (MediaCodec on the
   phone: wav, mp3, m4a, flac, ogg…) and `Magpie.Library.put_pcm/2` with
-  the engine's peaks, `source: :imported`.
+  the engine's peaks, `source: :imported` by default.
 
-  AIFF and AIFF-C, which the phone's decoder refuses, go through
-  `Magpie.Aiff`: decoded here, written as a float WAV to a temporary file
-  in the library's directory (the phone has no writable system temp
-  directory) and decoded by the engine from there, so the peaks (and the
-  two-channel limit) come from the one implementation.
+  AIFF, AIFF-C and WAV files the phone's decoder refuses go through
+  `Magpie.Aiff` or `Magpie.Wav`: decoded here, written as a float WAV to
+  a temporary file in the library's directory (the phone has no writable
+  system temp directory) and decoded by the engine from there, so the
+  peaks (and the two-channel limit) come from the one implementation.
   """
 
   alias Magpie.{Aiff, Engine, Library, Wav}
@@ -16,10 +16,12 @@ defmodule Magpie.Import do
 
   @doc """
   Import the audio file at `path` as `name` (default: the file name
-  without its extension). Runs in the caller; a long file takes a while.
+  without its extension). Options: `source:` (`:imported`) and `tags:`
+  (`[]`). Runs in the caller; a long file takes a while.
   """
-  @spec import(Path.t(), String.t() | nil) :: {:ok, Sample.t()} | {:error, term()}
-  def import(path, name \\ nil) do
+  @spec import(Path.t(), String.t() | nil, keyword()) :: {:ok, Sample.t()} | {:error, term()}
+  def import(path, name \\ nil, opts \\ [])
+      when (is_binary(name) or is_nil(name)) and is_list(opts) do
     name = name || path |> Path.basename() |> Path.rootname()
 
     with {:ok, decoded} <- decode(path) do
@@ -27,7 +29,8 @@ defmodule Magpie.Import do
         name: name,
         rate: decoded.rate,
         channels: decoded.channels,
-        source: :imported,
+        source: Keyword.get(opts, :source, :imported),
+        tags: Keyword.get(opts, :tags, []),
         peaks: decoded.peaks
       })
     end
@@ -35,21 +38,34 @@ defmodule Magpie.Import do
 
   defp decode(path) do
     case Engine.decode(path) do
-      {:error, :unsupported} = error -> if aiff?(path), do: decode_aiff(path), else: error
-      result -> result
+      {:error, :unsupported} = error ->
+        case fallback(path) do
+          nil -> error
+          decoder -> decode_with(path, decoder)
+        end
+
+      result ->
+        result
     end
   end
 
-  defp aiff?(path) do
+  defp fallback(path) do
     case File.open(path, [:read, :binary], &IO.binread(&1, 12)) do
-      {:ok, head} when is_binary(head) -> Aiff.aiff?(head)
-      _ -> false
+      {:ok, head} when is_binary(head) ->
+        cond do
+          Aiff.aiff?(head) -> &Aiff.decode/1
+          Wav.wav?(head) -> &Wav.decode/1
+          true -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 
-  defp decode_aiff(path) do
+  defp decode_with(path, decoder) do
     with {:ok, bin} <- File.read(path),
-         {:ok, info, pcm} <- Aiff.decode(bin) do
+         {:ok, info, pcm} <- decoder.(bin) do
       dir = Library.dir()
       tmp = Path.join(dir, ".import-#{System.unique_integer([:positive])}.wav")
 

@@ -26,6 +26,7 @@ defmodule Magpie.Engine do
       {:magpie_audio, :voice, pad, :start | :end}     # a voice of `pad` started; its last voice ended
       {:magpie_audio, :hit, pad, %Magpie.Kit.Step{}}  # a live trigger while playing (see below)
       {:magpie_audio, :pattern, %Magpie.Kit.Pattern{}, frame}  # this pattern took over at `frame`
+      {:magpie_audio, :transport, :started | :stopped, nil}   # the sequencer started (`play/0`) or stopped (`stop/0`)
 
   and the input and recording messages of `Magpie.Audio` (see
   "Recording" below), each tagged with the input or the take it is about:
@@ -39,6 +40,13 @@ defmodule Magpie.Engine do
 
   `frame` is an engine frame; `Magpie.Audio.frame_time(clock(), frame)`
   says when it is heard, for drawing the playhead in time with the sound.
+
+  `:transport` comes from this process, not the audio engine, when
+  `state/0`'s `playing` changes (a `play/0` while playing or a `stop/0`
+  while stopped sends nothing); `play/0` and `stop/0` are the only ways
+  the sequencer starts and stops. A subscriber that also reads `state/0`
+  subscribes first, so no change falls between the two. An Engine that
+  exits sends nothing: monitor it.
 
   ## Live record
 
@@ -213,10 +221,13 @@ defmodule Magpie.Engine do
 
   def set_swing(_swing), do: {:error, {:invalid, :swing}}
 
-  @doc "Start the sequencer from step 0."
+  @doc "Start the sequencer from step 0. Subscribers get `{:magpie_audio, :transport, :started, nil}`."
   def play, do: GenServer.call(__MODULE__, :play)
 
-  @doc "Stop the sequencer; sounding voices ring on."
+  @doc """
+  Stop the sequencer; sounding voices ring on. Subscribers get
+  `{:magpie_audio, :transport, :stopped, nil}` if it was playing.
+  """
   def stop, do: GenServer.call(__MODULE__, :stop)
 
   @doc "`%{playing, step, tempo, swing, pattern, pending, stream, input}`."
@@ -431,11 +442,27 @@ defmodule Magpie.Engine do
 
   def handle_call(:play, _from, %{playing: true} = s), do: {:reply, :ok, s}
 
-  def handle_call(:play, _from, s),
-    do: control(Audio.impl().play(), %{s | playing: true, step: nil}, s)
+  def handle_call(:play, _from, s) do
+    case Audio.impl().play() do
+      :ok ->
+        forward(s, {:magpie_audio, :transport, :started, nil})
+        {:reply, :ok, %{s | playing: true, step: nil}}
 
-  def handle_call(:stop, _from, s),
-    do: control(Audio.impl().stop(), %{s | playing: false, step: nil}, s)
+      {:error, _} = error ->
+        {:reply, error, s}
+    end
+  end
+
+  def handle_call(:stop, _from, s) do
+    case Audio.impl().stop() do
+      :ok ->
+        if s.playing, do: forward(s, {:magpie_audio, :transport, :stopped, nil})
+        {:reply, :ok, %{s | playing: false, step: nil}}
+
+      {:error, _} = error ->
+        {:reply, error, s}
+    end
+  end
 
   def handle_call(:state, _from, s) do
     {:reply,

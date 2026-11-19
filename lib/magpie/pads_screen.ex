@@ -51,13 +51,25 @@ defmodule Magpie.PadsScreen do
   The magpie button opens `Magpie.MidiScreen` (plain, not designed). Pads
   MIDI plays light like touched ones (the engine's voice messages).
 
+  ## Live record
+
+  Record pattern (`id: "record_pattern"`) arms `Magpie.KitSession`'s live
+  recording (`set_recording/1`): touches and MIDI notes on the playing
+  bank's pads write steps into its selected pattern. Pressed while stopped
+  it first starts the bank's selected pattern, as Play does. Armed it shows
+  the snapshot's `recording`: the board has only the idle button, so armed
+  is the Record board's recording look (a `danger` button, ink dot). The
+  session disarms when the sequencer stops; pressing it again disarms too.
+
   ## Not designed / not built yet (inert, shown as the board has them)
 
-  The kit name (kit save / load sheet), the tempo, Record pattern and Seq
-  in the top bar, and the sheet's "Edit sample" (no editor yet). Play
-  plays the selected bank's pattern (`Magpie.KitSession.pattern/2`); while
-  it plays the button shows a stop square (the board has only the play
-  state).
+  The kit name (kit save / load sheet), the tempo in the top bar, and the
+  sheet's "Edit sample" (no editor yet). Seq opens `Magpie.SeqScreen` for
+  the selected bank; Play plays the selected bank's pattern
+  (`Magpie.KitSession.pattern/2`); while it plays the button shows a stop
+  square (the board has only the play state). Play / stop follow the
+  engine's `{:magpie_audio, :transport, :started | :stopped, nil}`, so a
+  stop from `Magpie.SeqScreen` shows here too.
 
   Every tap target also declares `on_press_out={held()}` (MOB-509): this
   screen re-renders on every touch, voice and frame tick.
@@ -67,7 +79,7 @@ defmodule Magpie.PadsScreen do
 
   import Mob.Canvas, only: [path: 2, rect: 5]
 
-  alias Magpie.{Bird, Engine, Kit, KitSession, MidiScreen, RecordScreen, Style}
+  alias Magpie.{Bird, Engine, Kit, KitSession, MidiScreen, RecordScreen, SeqScreen, Style}
   alias Magpie.Kit.{Pad, Region}
 
   @banks Style.pad().banks
@@ -223,6 +235,10 @@ defmodule Magpie.PadsScreen do
   def handle_info({:magpie_audio, :voice, pad, :end}, socket),
     do: {:noreply, Mob.Socket.update(socket, :voices, &Map.delete(&1, pad))}
 
+  # Whoever started or stopped the sequencer (this screen, SeqScreen).
+  def handle_info({:magpie_audio, :transport, change, _}, socket),
+    do: {:noreply, Mob.Socket.assign(socket, :playing, change == :started)}
+
   def handle_info({:magpie_audio, _kind, _a, _b}, socket), do: {:noreply, socket}
 
   def handle_info({:magpie_kit, snapshot}, socket) do
@@ -245,7 +261,7 @@ defmodule Magpie.PadsScreen do
 
   def handle_info({:tap, {:bank, bank}}, socket) when bank in @banks do
     if socket.assigns.playing,
-      do: Engine.set_pattern(KitSession.pattern(kit(socket.assigns), bank), at: :bar)
+      do: Engine.set_pattern(KitSession.pattern(socket.assigns.snapshot, bank), at: :bar)
 
     {:noreply, Mob.Socket.assign(socket, :bank, bank)}
   end
@@ -253,16 +269,31 @@ defmodule Magpie.PadsScreen do
   def handle_info({:tap, :menu}, socket),
     do: {:noreply, Mob.Socket.push_screen(socket, MidiScreen, %{})}
 
+  def handle_info({:tap, :seq}, socket),
+    do: {:noreply, Mob.Socket.push_screen(socket, SeqScreen, %{bank: socket.assigns.bank})}
+
   def handle_info({:tap, :play}, %{assigns: %{playing: true}} = socket) do
     _ = Engine.stop()
     {:noreply, Mob.Socket.assign(socket, :playing, false)}
   end
 
   def handle_info({:tap, :play}, socket) do
+    case play(socket.assigns) do
+      :ok -> {:noreply, Mob.Socket.assign(socket, :playing, true)}
+      {:error, _} -> {:noreply, socket}
+    end
+  end
+
+  def handle_info({:tap, :record}, %{assigns: %{snapshot: %{recording: true}}} = socket) do
+    _ = KitSession.set_recording(false)
+    {:noreply, socket}
+  end
+
+  def handle_info({:tap, :record}, socket) do
     a = socket.assigns
 
-    with :ok <- Engine.set_pattern(KitSession.pattern(kit(a), a.bank), at: :now),
-         :ok <- Engine.play() do
+    with :ok <- if(Engine.state().playing, do: :ok, else: play(a)),
+         :ok <- KitSession.set_recording(true) do
       {:noreply, Mob.Socket.assign(socket, :playing, true)}
     else
       {:error, _} -> {:noreply, socket}
@@ -382,6 +413,12 @@ defmodule Magpie.PadsScreen do
     Mob.Socket.push_screen(socket, RecordScreen, %{pad: index, reply_to: KitSession.whereis()})
   end
 
+  # The selected bank's pattern from its start.
+  defp play(a) do
+    with :ok <- Engine.set_pattern(KitSession.pattern(a.snapshot, a.bank), at: :now),
+         do: Engine.play()
+  end
+
   defp edit(%{assigns: %{sheet: index}} = socket, fun) when index != nil do
     _ = KitSession.update_pad(index, fn pad -> pad && fun.(pad) end)
     socket
@@ -470,7 +507,12 @@ defmodule Magpie.PadsScreen do
     kit = kit(assigns)
     snap_tap = {self(), :snap}
     play_tap = {self(), :play}
+    record_tap = {self(), :record}
     menu_tap = {self(), :menu}
+    seq_tap = {self(), :seq}
+    armed = assigns.snapshot.recording
+    record_bg = Style.color(if armed, do: :danger, else: :raised)
+    record_dot = Style.color(if armed, do: :ink, else: :pad_coral)
     snap_bg = Style.color(if kit.snap, do: :selected, else: :surface)
     snap_fg = Style.color(if kit.snap, do: :fm, else: :muted)
     tabs = for bank <- @banks, do: bank_tab(bank, bank == assigns.bank)
@@ -564,10 +606,20 @@ defmodule Magpie.PadsScreen do
       >
         <Canvas width={16} height={16} draw={play_icon(assigns.playing)} />
       </Box>
-      <Box width={48} height={44} corner_radius={12} background={Style.color(:raised)} align="center">
-        <Box width={14} height={14} corner_radius={7} background={Style.color(:pad_coral)} />
+      <Box
+        id="record_pattern"
+        width={48}
+        height={44}
+        corner_radius={12}
+        background={record_bg}
+        align="center"
+        on_tap={record_tap}
+        on_press_out={held()}
+      >
+        <Box width={14} height={14} corner_radius={7} background={record_dot} />
       </Box>
       <Box
+        id="seq"
         fill_width={false}
         height={44}
         padding_left={12}
@@ -575,6 +627,8 @@ defmodule Magpie.PadsScreen do
         corner_radius={12}
         background={Style.color(:raised)}
         align="center"
+        on_tap={seq_tap}
+        on_press_out={held()}
       >
         <Text text="Seq" font={:semibold} text_size={13} text_color={Style.color(:text)} />
       </Box>

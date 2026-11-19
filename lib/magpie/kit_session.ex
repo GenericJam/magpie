@@ -18,6 +18,16 @@ defmodule Magpie.KitSession do
   - **Recording into a pad:** `Magpie.RecordScreen` sends `{:recorded, pad,
     %Magpie.Library.Sample{}}` to the pid it is given; give it this process
     (`whereis/0`) and the sample lands on the pad (`put_sample/2`).
+  - **Live recording into a pattern** (`set_recording/1`, the snapshot's
+    `recording`): armed, the session subscribes to the engine and writes
+    each hit (`{:magpie_audio, :hit, pad, %Magpie.Kit.Step{}}`: a touch, a
+    MIDI note) into the pad's lane of its bank's selected pattern while the
+    engine plays that pattern, replacing the step at that index: `tick: 0`
+    with Snap on, the hit's tick off. Hits on pads the kit doesn't have, on
+    another bank or pattern, or with the engine stopped are dropped. The
+    edit goes to the engine at once (`at: :now`) and is autosaved. It
+    disarms on the engine's `{:magpie_audio, :transport, :stopped, nil}`,
+    and when the Engine exits (monitored while armed).
 
   ## Which kit
 
@@ -34,12 +44,15 @@ defmodule Magpie.KitSession do
   require Logger
 
   alias Magpie.{Engine, Kit, Library, Style}
-  alias Magpie.Kit.{Pad, Region}
+  alias Magpie.Kit.{Pad, Pattern, Region, Step}
 
   @start_kit_path Path.expand("../../design/kits/dusty-breaks.kit.json", __DIR__)
   @external_resource @start_kit_path
   @start_kit_json File.read!(@start_kit_path)
 
+  @banks Style.pad().banks
+  @lengths Style.sequencer().steps
+  @max_patterns 4
   @wave_bars Style.pad().wave_bars
   @autosave_ms 1_000
   # A sample the engine couldn't unload yet, or a MIDI table it refused
@@ -48,21 +61,28 @@ defmodule Magpie.KitSession do
 
   defmodule Snapshot do
     @moduledoc """
-    What a screen needs to draw the kit: the kit, and per pad index with a
-    sample (`Magpie.Kit.pad_index/2`) its `status` (`:loading`, `:ready` or
-    `{:error, reason}`: not in the library, failed to load, refused by the
-    engine), its `wave` (#{Magpie.Style.pad().wave_bars} peaks 0..255 over
-    the pad's region, reversed with it; empty until the sample is loaded)
-    and `seconds` (the region's length at its pitch; nil until loaded).
+    What a screen needs to draw the kit: the kit, the selected pattern id per
+    bank (`pattern_ids`), whether live recording is armed (`recording`), and
+    per pad index with a sample (`Magpie.Kit.pad_index/2`) its `status`
+    (`:loading`, `:ready` or `{:error, reason}`: not in the library, failed
+    to load, refused by the engine), its `wave`
+    (#{Magpie.Style.pad().wave_bars} peaks 0..255 over the pad's region,
+    reversed with it; empty until the sample is loaded) and `seconds` (the
+    region's length at its pitch; nil until loaded).
     """
-    defstruct [:kit, pads: %{}]
+    defstruct [:kit, pads: %{}, pattern_ids: %{}, recording: false]
 
     @type pad_info :: %{
             status: :loading | :ready | {:error, term()},
             wave: [0..255],
             seconds: float() | nil
           }
-    @type t :: %__MODULE__{kit: Magpie.Kit.t(), pads: %{(0..63) => pad_info()}}
+    @type t :: %__MODULE__{
+            kit: Magpie.Kit.t(),
+            pads: %{(0..63) => pad_info()},
+            pattern_ids: %{Magpie.Kit.bank_id() => String.t()},
+            recording: boolean()
+          }
   end
 
   defstruct [
@@ -74,6 +94,10 @@ defmodule Magpie.KitSession do
     refused: %{},
     queue: [],
     subscribers: %{},
+    pattern_ids: %{},
+    # Live recording armed, and the Engine's monitor meanwhile.
+    recording: false,
+    engine_ref: nil,
     # The MIDI table last given to the engine (`Magpie.Midi.Map.config/1`).
     midi: nil
   ]
@@ -133,6 +157,116 @@ defmodule Magpie.KitSession do
   @doc "Snap on or off (the kit's `snap`)."
   def set_snap(on) when is_boolean(on), do: GenServer.call(__MODULE__, {:snap, on})
 
+  @doc "Set the kit's tempo (40..240 bpm). Applies to the engine first."
+  @spec set_tempo(number()) :: :ok | {:error, term()}
+  def set_tempo(bpm) when is_number(bpm) and bpm >= 40 and bpm <= 240,
+    do: GenServer.call(__MODULE__, {:tempo, bpm})
+
+  def set_tempo(_bpm), do: {:error, {:invalid, :tempo}}
+
+  @doc "Set the kit's swing (0.5..0.75). Applies to the engine first."
+  @spec set_swing(number()) :: :ok | {:error, term()}
+  def set_swing(swing) when is_number(swing) and swing >= 0.5 and swing <= 0.75,
+    do: GenServer.call(__MODULE__, {:swing, swing})
+
+  def set_swing(_swing), do: {:error, {:invalid, :swing}}
+
+  @doc """
+  The patterns of `bank` (1..#{@max_patterns} of them; an empty 16-step
+  `\"<bank>1\"` when the kit has none).
+  """
+  @spec patterns(Kit.t() | Snapshot.t(), Kit.bank_id()) :: [Pattern.t()]
+  def patterns(%Snapshot{kit: kit}, bank), do: patterns(kit, bank)
+
+  def patterns(%Kit{patterns: patterns}, bank) when bank in @banks do
+    case Enum.filter(patterns, &(&1.bank == bank)) do
+      [] -> [%Pattern{id: "#{bank}1", bank: bank, length: 16}]
+      found -> found
+    end
+  end
+
+  @doc """
+  Select pattern `id` for `bank`. While the engine plays `bank`, queues the
+  pattern for the next bar (`at: :bar`) first; the pattern already playing
+  is left playing (a pattern queued instead of it is dropped).
+  """
+  @spec select_pattern(Kit.bank_id(), String.t()) :: :ok | {:error, term()}
+  def select_pattern(bank, id) when bank in @banks and is_binary(id),
+    do: GenServer.call(__MODULE__, {:select_pattern, bank, id})
+
+  def select_pattern(bank, _id) when bank not in @banks, do: {:error, {:invalid, :bank}}
+  def select_pattern(_bank, _id), do: {:error, {:invalid, :pattern}}
+
+  @doc """
+  Add an empty 16-step pattern to `bank` (up to #{@max_patterns}:
+  `\"<bank>1\"..\"<bank>4\"`) and select it. While the engine plays `bank`,
+  queues the new pattern for the next bar (`at: :bar`) first.
+  """
+  @spec add_pattern(Kit.bank_id()) :: :ok | {:error, term()}
+  def add_pattern(bank) when bank in @banks,
+    do: GenServer.call(__MODULE__, {:add_pattern, bank})
+
+  def add_pattern(_bank), do: {:error, {:invalid, :bank}}
+
+  @doc """
+  Set the length (16 or 32 steps) of `bank`'s selected pattern. Shrinking
+  drops steps at index >= `length`. Applies `at: :now` to the engine first
+  when the edited pattern is playing.
+  """
+  @spec set_pattern_length(Kit.bank_id(), 16 | 32) :: :ok | {:error, term()}
+  def set_pattern_length(bank, length) when bank in @banks and length in @lengths,
+    do: GenServer.call(__MODULE__, {:pattern_length, bank, length})
+
+  def set_pattern_length(bank, _length) when bank not in @banks,
+    do: {:error, {:invalid, :bank}}
+
+  def set_pattern_length(_bank, _length), do: {:error, {:invalid, :length}}
+
+  @doc """
+  Toggle step `step` (0..length-1) on `slot` (0..15, must be a loaded pad in
+  `bank`) in `bank`'s selected pattern: removes the step if present, else adds
+  it at `vel` (1..127, default 100). Applies `at: :now` to the engine first
+  when the edited pattern is playing.
+  """
+  @spec toggle_step(Kit.bank_id(), 0..15, non_neg_integer(), 1..127) :: :ok | {:error, term()}
+  def toggle_step(bank, slot, step, vel \\ 100)
+
+  def toggle_step(bank, _slot, _step, _vel) when bank not in @banks,
+    do: {:error, {:invalid, :bank}}
+
+  def toggle_step(_bank, slot, _step, _vel) when slot not in 0..15,
+    do: {:error, {:invalid, :slot}}
+
+  def toggle_step(_bank, _slot, _step, vel) when vel not in 1..127,
+    do: {:error, {:invalid, :vel}}
+
+  def toggle_step(bank, slot, step, vel) when is_integer(step) and step >= 0,
+    do: GenServer.call(__MODULE__, {:toggle_step, bank, slot, step, vel})
+
+  def toggle_step(_bank, _slot, _step, _vel), do: {:error, {:invalid, :step}}
+
+  @doc """
+  Set the velocity (1..127) of `step` (0..length-1) on `slot` (0..15, must be
+  a loaded pad in `bank`) in `bank`'s selected pattern, creating the step if
+  not present. Applies `at: :now` to the engine first when the edited pattern
+  is playing.
+  """
+  @spec set_step_velocity(Kit.bank_id(), 0..15, non_neg_integer(), 1..127) ::
+          :ok | {:error, term()}
+  def set_step_velocity(bank, _slot, _step, _vel) when bank not in @banks,
+    do: {:error, {:invalid, :bank}}
+
+  def set_step_velocity(_bank, slot, _step, _vel) when slot not in 0..15,
+    do: {:error, {:invalid, :slot}}
+
+  def set_step_velocity(_bank, _slot, _step, vel) when vel not in 1..127,
+    do: {:error, {:invalid, :vel}}
+
+  def set_step_velocity(bank, slot, step, vel) when is_integer(step) and step >= 0,
+    do: GenServer.call(__MODULE__, {:step_velocity, bank, slot, step, vel})
+
+  def set_step_velocity(_bank, _slot, _step, _vel), do: {:error, {:invalid, :step}}
+
   @doc """
   The kit's MIDI settings: `in_channel` (`:all` or 1..16; notes out go on
   it, or 1 with `:all`) and `clock` (`:internal` or `:send` a MIDI clock).
@@ -154,17 +288,30 @@ defmodule Magpie.KitSession do
     end
   end
 
+  @doc """
+  Arm (`true`) or disarm (`false`) live recording into the patterns (see
+  the moduledoc). Arming needs the engine playing: `{:error, :not_playing}`
+  otherwise. The session disarms by itself once the engine stops.
+  """
+  @spec set_recording(boolean()) :: :ok | {:error, :not_playing}
+  def set_recording(on) when is_boolean(on), do: GenServer.call(__MODULE__, {:recording, on})
+
   @doc "Save now if a change is waiting for the autosave."
   def flush, do: GenServer.call(__MODULE__, :flush)
 
   @doc """
-  The pattern bank `bank` plays: the kit's first one for it, else an empty
+  The pattern bank `bank` plays: from a `%Snapshot{}` the bank's selected
+  pattern; from a `%Kit{}` its first one for the bank; else an empty
   16-step one.
   """
-  @spec pattern(Kit.t(), Kit.bank_id()) :: Kit.Pattern.t()
+  @spec pattern(Kit.t() | Snapshot.t(), Kit.bank_id()) :: Pattern.t()
+  def pattern(%Snapshot{kit: kit, pattern_ids: ids}, bank) when bank in @banks do
+    pattern_by_id(kit, bank, Map.get(ids, bank))
+  end
+
   def pattern(%Kit{patterns: patterns}, bank) do
     Enum.find(patterns, &(&1.bank == bank)) ||
-      %Kit.Pattern{id: "#{bank}1", bank: bank, length: 16}
+      %Pattern{id: "#{bank}1", bank: bank, length: 16}
   end
 
   @doc "The kit the app starts with when none is saved (see the moduledoc)."
@@ -244,8 +391,137 @@ defmodule Magpie.KitSession do
   def handle_call({:snap, on}, _from, s),
     do: {:reply, :ok, s |> put_kit(%{s.kit | snap: on}) |> publish()}
 
+  def handle_call({:tempo, bpm}, _from, s) do
+    case Engine.set_tempo(bpm) do
+      :ok -> {:reply, :ok, s |> put_kit(%{s.kit | tempo: bpm}) |> publish()}
+      {:error, _} = error -> {:reply, error, s}
+    end
+  end
+
+  def handle_call({:swing, swing}, _from, s) do
+    case Engine.set_swing(swing) do
+      :ok -> {:reply, :ok, s |> put_kit(%{s.kit | swing: swing}) |> publish()}
+      {:error, _} = error -> {:reply, error, s}
+    end
+  end
+
+  def handle_call({:select_pattern, bank, id}, _from, s) do
+    case Enum.find(patterns(s.kit, bank), &(&1.id == id)) do
+      nil ->
+        {:reply, {:error, {:invalid, :pattern}}, s}
+
+      pattern ->
+        case sync_switched_pattern(pattern) do
+          :ok ->
+            s = %{s | pattern_ids: Map.put(s.pattern_ids, bank, pattern.id)}
+            {:reply, :ok, publish(s)}
+
+          {:error, _} = error ->
+            {:reply, error, s}
+        end
+    end
+  end
+
+  def handle_call({:add_pattern, bank}, _from, s) do
+    existing = patterns(s.kit, bank)
+
+    case next_pattern_id(bank, existing) do
+      nil ->
+        {:reply, {:error, {:invalid, :pattern}}, s}
+
+      new_id ->
+        new_pattern = %Pattern{id: new_id, bank: bank, length: 16, lanes: %{}}
+        add_bank_pattern(s, bank, existing, new_pattern)
+    end
+  end
+
+  def handle_call({:pattern_length, bank, length}, _from, s) do
+    cur = selected_pattern(s, bank)
+
+    lanes =
+      Enum.reduce(cur.lanes, %{}, fn {slot, lane}, acc ->
+        steps = Enum.filter(lane.steps, &(&1.step < length))
+        put_lane(acc, slot, %{lane | steps: steps})
+      end)
+
+    reply(apply_pattern_edit(s, %{cur | length: length, lanes: lanes}))
+  end
+
+  def handle_call({:toggle_step, bank, slot, step, vel}, _from, s) do
+    cur = selected_pattern(s, bank)
+
+    cond do
+      not loaded_pad?(s.kit, bank, slot) ->
+        {:reply, {:error, {:invalid, :slot}}, s}
+
+      step >= cur.length ->
+        {:reply, {:error, {:invalid, :step}}, s}
+
+      true ->
+        lane = Map.get(cur.lanes, slot, %{mute: false, steps: []})
+
+        steps =
+          if Enum.any?(lane.steps, &(&1.step == step)) do
+            Enum.reject(lane.steps, &(&1.step == step))
+          else
+            Enum.sort_by([%Step{step: step, vel: vel, tick: 0} | lane.steps], & &1.step)
+          end
+
+        lanes = put_lane(cur.lanes, slot, %{lane | steps: steps})
+        reply(apply_pattern_edit(s, %{cur | lanes: lanes}))
+    end
+  end
+
+  def handle_call({:step_velocity, bank, slot, step, vel}, _from, s) do
+    cur = selected_pattern(s, bank)
+
+    cond do
+      not loaded_pad?(s.kit, bank, slot) ->
+        {:reply, {:error, {:invalid, :slot}}, s}
+
+      step >= cur.length ->
+        {:reply, {:error, {:invalid, :step}}, s}
+
+      true ->
+        lane = Map.get(cur.lanes, slot, %{mute: false, steps: []})
+
+        steps =
+          case Enum.split_with(lane.steps, &(&1.step == step)) do
+            {[existing | _], rest} ->
+              Enum.sort_by([%{existing | vel: vel} | rest], & &1.step)
+
+            {[], rest} ->
+              Enum.sort_by([%Step{step: step, vel: vel, tick: 0} | rest], & &1.step)
+          end
+
+        lanes = put_lane(cur.lanes, slot, %{lane | steps: steps})
+        reply(apply_pattern_edit(s, %{cur | lanes: lanes}))
+    end
+  end
+
   def handle_call({:midi, changes}, _from, s),
     do: {:reply, :ok, s |> put_kit(%{s.kit | midi: Map.merge(s.kit.midi, changes)}) |> publish()}
+
+  def handle_call({:recording, true}, _from, %{recording: true} = s), do: {:reply, :ok, s}
+
+  # Subscribed before reading `playing`, so no `:stopped` falls between the
+  # two; what the engine sent before (a `:stopped` or hits from an earlier
+  # subscription) is dropped, `playing` covers it.
+  def handle_call({:recording, true}, _from, s) do
+    :ok = Engine.subscribe()
+    drop_engine_messages()
+
+    if Engine.state().playing do
+      s = %{s | recording: true, engine_ref: Process.monitor(Engine)}
+      {:reply, :ok, publish(s)}
+    else
+      :ok = Engine.unsubscribe()
+      {:reply, {:error, :not_playing}, s}
+    end
+  end
+
+  def handle_call({:recording, false}, _from, %{recording: false} = s), do: {:reply, :ok, s}
+  def handle_call({:recording, false}, _from, s), do: {:reply, :ok, s |> disarm() |> publish()}
 
   def handle_call(:flush, _from, s) do
     {result, s} = save(s)
@@ -266,6 +542,10 @@ defmodule Magpie.KitSession do
     s = drop_unused(s, id)
     {:noreply, s |> next_load() |> publish()}
   end
+
+  # The Engine went away: its sequencer with it.
+  def handle_info({:DOWN, ref, :process, _pid, _}, %{engine_ref: ref} = s) when ref != nil,
+    do: {:noreply, publish(%{s | recording: false, engine_ref: nil})}
 
   def handle_info({:DOWN, ref, :process, pid, _}, s) do
     case s.subscribers do
@@ -295,6 +575,33 @@ defmodule Magpie.KitSession do
 
     {:noreply, s}
   end
+
+  # ── Live recording ──────────────────────────────────────────────────────────
+
+  def handle_info({:magpie_audio, :hit, index, %Step{} = hit}, %{recording: true} = s)
+      when index in 0..63 do
+    {bank, slot} = Kit.bank_slot(index)
+    %Pattern{id: id} = cur = selected_pattern(s, bank)
+
+    case Engine.state() do
+      %{playing: false} ->
+        {:noreply, s |> disarm() |> publish()}
+
+      %{pattern: %Pattern{id: ^id, bank: ^bank}} ->
+        {:noreply, record_hit(s, cur, slot, hit)}
+
+      _other_pattern ->
+        {:noreply, s}
+    end
+  end
+
+  def handle_info({:magpie_audio, :transport, :stopped, _}, %{recording: true} = s),
+    do: {:noreply, s |> disarm() |> publish()}
+
+  # The rest of what the engine forwards while armed (playheads, voices,
+  # meters…), and hits queued before disarming.
+  def handle_info({:magpie_audio, _kind, _a, _b}, s), do: {:noreply, s}
+  def handle_info({:magpie_audio, _kind, _a, _b, _c}, s), do: {:noreply, s}
 
   # ── Pads ────────────────────────────────────────────────────────────────────
 
@@ -412,6 +719,178 @@ defmodule Magpie.KitSession do
 
   defp palette_color(slot), do: Enum.at(Style.pad_palette(), rem(slot, 8))
 
+  # ── Patterns ────────────────────────────────────────────────────────────────
+
+  defp pattern_by_id(%Kit{patterns: patterns}, bank, selected_id) do
+    bank_patterns = Enum.filter(patterns, &(&1.bank == bank))
+
+    (selected_id && Enum.find(bank_patterns, &(&1.id == selected_id))) ||
+      List.first(bank_patterns) ||
+      %Pattern{id: "#{bank}1", bank: bank, length: 16}
+  end
+
+  defp selected_pattern(s, bank),
+    do: pattern_by_id(s.kit, bank, Map.get(s.pattern_ids, bank))
+
+  defp loaded_pad?(%Kit{banks: banks}, bank, slot),
+    do: match?(%Pad{sample: %Region{}}, get_in(banks, [bank, slot]))
+
+  defp put_lane(lanes, slot, %{mute: false, steps: []}), do: Map.delete(lanes, slot)
+  defp put_lane(lanes, slot, lane), do: Map.put(lanes, slot, lane)
+
+  defp apply_pattern_edit(s, %Pattern{id: id, bank: bank} = updated) do
+    case sync_edited_pattern(updated) do
+      :ok ->
+        patterns = upsert_pattern(s.kit.patterns, updated)
+
+        s =
+          %{s | pattern_ids: Map.put(s.pattern_ids, bank, id)}
+          |> put_kit(%{s.kit | patterns: patterns})
+          |> publish()
+
+        {:ok, s}
+
+      {:error, _} = error ->
+        {error, s}
+    end
+  end
+
+  # A hit on `slot` of the playing selected pattern `cur` becomes its step
+  # at that index (replacing one there): on the grid with Snap on, at the
+  # hit's tick off. Pads the kit doesn't have are left out.
+  defp record_hit(s, %Pattern{bank: bank} = cur, slot, %Step{} = hit) do
+    if loaded_pad?(s.kit, bank, slot) and hit.step < cur.length do
+      lane = Map.get(cur.lanes, slot, %{mute: false, steps: []})
+      step = if s.kit.snap, do: %{hit | tick: 0}, else: hit
+      steps = Enum.sort_by([step | Enum.reject(lane.steps, &(&1.step == hit.step))], & &1.step)
+
+      case apply_pattern_edit(s, %{cur | lanes: put_lane(cur.lanes, slot, %{lane | steps: steps})}) do
+        {:ok, s} ->
+          s
+
+        {{:error, reason}, s} ->
+          Logger.warning(
+            "Magpie.KitSession: recording a hit on #{bank} #{slot}: #{inspect(reason)}"
+          )
+
+          s
+      end
+    else
+      s
+    end
+  end
+
+  defp disarm(s) do
+    :ok = Engine.unsubscribe()
+    Process.demonitor(s.engine_ref, [:flush])
+    %{s | recording: false, engine_ref: nil}
+  end
+
+  defp drop_engine_messages do
+    receive do
+      {:magpie_audio, _kind, _a, _b} -> drop_engine_messages()
+      {:magpie_audio, _kind, _a, _b, _c} -> drop_engine_messages()
+    after
+      0 -> :ok
+    end
+  end
+
+  # An edit of the playing pattern goes in at once (`:now`, same position).
+  # `:now` also drops a switch the engine has queued for the bar (the
+  # Engine and the native sequencer alike), so a queued pattern is queued
+  # again after it.
+  defp sync_edited_pattern(%Pattern{id: id, bank: bank} = pattern) do
+    case Engine.state() do
+      %{playing: true, pending: %Pattern{id: ^id, bank: ^bank}} ->
+        Engine.set_pattern(pattern, at: :bar)
+
+      %{playing: true, pattern: %Pattern{id: ^id, bank: ^bank}, pending: pending} ->
+        with :ok <- Engine.set_pattern(pattern, at: :now), do: requeue(pending)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp requeue(nil), do: :ok
+
+  defp requeue(%Pattern{} = pending) do
+    with {:error, reason} <- Engine.set_pattern(pending, at: :bar) do
+      Logger.warning(
+        "Magpie.KitSession: queued pattern #{pending.id} lost to an edit: #{inspect(reason)}"
+      )
+    end
+
+    :ok
+  end
+
+  # Selecting a pattern while its bank plays: a different one takes over at
+  # the bar; the playing one is left alone (queued at the bar it would
+  # restart from step 0), and one queued instead of it is dropped (`:now`
+  # keeps the position).
+  defp sync_switched_pattern(%Pattern{id: id, bank: bank} = pattern) do
+    case Engine.state() do
+      %{playing: true, pattern: %Pattern{id: ^id, bank: ^bank}, pending: nil} ->
+        :ok
+
+      %{playing: true, pattern: %Pattern{id: ^id, bank: ^bank}, pending: %Pattern{bank: ^bank}} ->
+        Engine.set_pattern(pattern, at: :now)
+
+      %{playing: true, pending: %Pattern{bank: ^bank}} ->
+        Engine.set_pattern(pattern, at: :bar)
+
+      %{playing: true, pending: nil, pattern: %Pattern{bank: ^bank}} ->
+        Engine.set_pattern(pattern, at: :bar)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp upsert_pattern(patterns, %Pattern{id: id, bank: bank} = updated) do
+    if Enum.any?(patterns, &(&1.bank == bank and &1.id == id)),
+      do: Enum.map(patterns, &replace_pattern(&1, updated)),
+      else: patterns ++ [updated]
+  end
+
+  defp replace_pattern(%Pattern{id: id, bank: bank}, %Pattern{id: id, bank: bank} = updated),
+    do: updated
+
+  defp replace_pattern(other, _updated), do: other
+
+  defp next_pattern_id(_bank, existing) when length(existing) >= @max_patterns, do: nil
+
+  defp next_pattern_id(bank, existing) do
+    used = MapSet.new(existing, & &1.id)
+    Enum.find(for(n <- 1..@max_patterns, do: "#{bank}#{n}"), &(not MapSet.member?(used, &1)))
+  end
+
+  defp add_bank_pattern(s, bank, existing, %Pattern{id: new_id} = new_pattern) do
+    case sync_switched_pattern(new_pattern) do
+      :ok ->
+        patterns = append_bank_pattern(s.kit.patterns, bank, existing, new_pattern)
+
+        s =
+          %{s | pattern_ids: Map.put(s.pattern_ids, bank, new_id)}
+          |> put_kit(%{s.kit | patterns: patterns})
+          |> publish()
+
+        {:reply, :ok, s}
+
+      {:error, _} = error ->
+        {:reply, error, s}
+    end
+  end
+
+  defp append_bank_pattern(patterns, bank, existing, new_pattern) do
+    patterns =
+      Enum.reduce(existing, patterns, fn p, acc ->
+        if Enum.any?(acc, &(&1.bank == bank and &1.id == p.id)), do: acc, else: acc ++ [p]
+      end)
+
+    patterns ++ [new_pattern]
+  end
+
   # ── Loading ─────────────────────────────────────────────────────────────────
 
   defp sample_ids(kit) do
@@ -469,7 +948,11 @@ defmodule Magpie.KitSession do
         {index, pad_info(state, region)}
       end
 
-    %Snapshot{kit: s.kit, pads: pads}
+    %Snapshot{kit: s.kit, pads: pads, pattern_ids: pattern_ids(s), recording: s.recording}
+  end
+
+  defp pattern_ids(s) do
+    Map.new(@banks, fn bank -> {bank, selected_pattern(s, bank).id} end)
   end
 
   defp pad_info({:ok, info}, region),
