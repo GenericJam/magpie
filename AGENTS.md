@@ -836,3 +836,35 @@ these), 16 loaded pads (every one asking for moves), 40 rounds:
   line if the file is ever regenerated, until mob_new ships the fix.
 - Decisions go in `decisions/YYYY-MM-DD-<slug>.md` (Context / Decision /
   Consequences), as in mob.
+
+## Releasing (Android APK)
+
+Sideloaded APKs on GitHub releases (no Play listing yet); the site links
+`https://github.com/GenericJam/magpie/releases/latest/download/Magpie.apk`,
+so every release attaches `Magpie.apk` beside `Magpie-<version>.apk` and its
+`.sha256`.
+
+- **The key** is Magpie's permanent identity: `android/upload_jks.keystore`
+  (JKS, alias `upload`, certificate SHA-256
+  `160e5f78fc787c2b4e88d8d8973bed2a1e51307964bc69c02cd15a77cfeb4800`), its
+  passwords in `android/keystore.properties`; both mode 600, git-ignored,
+  only in the main checkout. An APK signed with another key can't update an
+  installed release (uninstalling wipes the stash and kits), so never
+  replace it; a worktree that builds a release copies both files in.
+- **Version:** `version` in `mix.exs` = `versionName` in
+  `android/app/build.gradle`; bump `versionCode` every release.
+- **Build** from master: `mise exec -- mix mob.release --android` (native
+  build for every ABI, `android/app/src/release/assets/otp.zip`, the AAB),
+  then `cd android && ./gradlew assembleRelease` →
+  `android/app/build/outputs/apk/release/app-release.apk`. Check it with
+  `apksigner verify --print-certs` (the digest above).
+- `mix mob.connect` can't reach a release build (it can't write the dist
+  cookie into a non-debuggable app), so neither can `scripts/*_check.exs`.
+  Smoke it by hand (launch, starter drums in the stash, a pad plays);
+  underruns are the `Underruns` column (frames) of the app's track in `adb
+  shell dumpsys media.audio_flinger`.
+- **Licences:** Magpie is MIT (`LICENSE`); everything bundled under another
+  licence (the CC0 drums, the OFL fonts, the Apache-2.0 runtime) is listed
+  in `THIRD_PARTY_NOTICES.md` with its text in `LICENSES/`, and the build
+  copies all three into the APK (`assets/licenses/`). A new bundled font,
+  sound or dependency under another licence goes in there too.
