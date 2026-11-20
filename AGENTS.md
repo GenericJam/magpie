@@ -834,6 +834,16 @@ these), 16 loaded pads (every one asking for moves), 40 rounds:
   `androideabi` target compiles all C soft-float: on the moto e the mixer
   took 298 % of real time for 30 voices without it, 53 % with it. Keep the
   line if the file is ever regenerated, until mob_new ships the fix.
+- Security scan: `mix mob.security_scan.log --project-root .` (needs
+  osv-scanner ≥ 2.7, semgrep, flawfinder, detekt), then commit
+  `SECURITY_SCAN.md`, `SECURITY_HISTORY.md` and `.security_scan/state.json`.
+  Pass `--project-root .`, or the finding keys carry the checkout's absolute
+  path and the next run from another checkout shows everything as new. The
+  `gradle_deps` layer can't read `build.gradle` (MOB-533): check Gradle with
+  a `--write-locks` init script (see the MOB-533 description) and
+  osv-scanner, and don't commit the lockfiles. Only `releaseRuntimeClasspath`
+  ships. guava is pinned to 33.7.2-android in `android/app/build.gradle`
+  until mob_new's media3 is fixed (MOB-532).
 - Decisions go in `decisions/YYYY-MM-DD-<slug>.md` (Context / Decision /
   Consequences), as in mob.
 

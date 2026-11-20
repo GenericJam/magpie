@@ -1,7 +1,7 @@
 {
   "findings": [
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": "3.5.10",
       "id": "CVE-2026-107493",
       "key": "CVE-2026-107493|openssl|3.5.9",
@@ -14,7 +14,7 @@
       "version": "3.5.9"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": "3.5.10",
       "id": "CVE-2026-107496",
       "key": "CVE-2026-107496|openssl|3.5.9",
@@ -27,7 +27,7 @@
       "version": "3.5.9"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": "3.5.10",
       "id": "CVE-2026-124709",
       "key": "CVE-2026-124709|openssl|3.5.9",
@@ -40,7 +40,7 @@
       "version": "3.5.9"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": "3.5.10",
       "id": "CVE-2026-35190",
       "key": "CVE-2026-35190|openssl|3.5.9",
@@ -53,7 +53,7 @@
       "version": "3.5.9"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": "3.5.10",
       "id": "CVE-2026-88822",
       "key": "CVE-2026-88822|openssl|3.5.9",
@@ -66,7 +66,7 @@
       "version": "3.5.9"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": "3.5.10",
       "id": "CVE-2026-88823",
       "key": "CVE-2026-88823|openssl|3.5.9",
@@ -79,7 +79,7 @@
       "version": "3.5.9"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": "3.5.10",
       "id": "CVE-2026-95691",
       "key": "CVE-2026-95691|openssl|3.5.9",
@@ -92,7 +92,7 @@
       "version": "3.5.9"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": "3.5.10",
       "id": "CVE-2026-95692",
       "key": "CVE-2026-95692|openssl|3.5.9",
@@ -105,7 +105,7 @@
       "version": "3.5.9"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "MOB-DRIFT-ios_device-elixir",
       "key": "MOB-DRIFT-ios_device-elixir|mob/otp-tarball|ios_device@5c9c69fc",
@@ -118,7 +118,7 @@
       "version": "ios_device@5c9c69fc"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "MOB-DRIFT-ios_device-elixir",
       "key": "MOB-DRIFT-ios_device-elixir|mob/otp-tarball|ios_device@d199a49a",
@@ -131,7 +131,7 @@
       "version": "ios_device@d199a49a"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "MOB-DRIFT-ios_sim-elixir",
       "key": "MOB-DRIFT-ios_sim-elixir|mob/otp-tarball|ios_sim@5c9c69fc",
@@ -144,7 +144,7 @@
       "version": "ios_sim@5c9c69fc"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "MOB-DRIFT-ios_sim-elixir",
       "key": "MOB-DRIFT-ios_sim-elixir|mob/otp-tarball|ios_sim@d199a49a",
@@ -157,12 +157,12 @@
       "version": "ios_sim@d199a49a"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 1269",
+      "key": "flawfinder/buffer|./c_src/magpie_audio.c|line 1269",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -170,12 +170,12 @@
       "version": "line 1269"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 1272",
+      "key": "flawfinder/buffer|./c_src/magpie_audio.c|line 1272",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "high",
       "source": "flawfinder",
       "title": "buffer: Consider using snprintf, strcpy_s, or strlcpy (warning: strncpy easily misused).\",,CWE-120,\"        if (strcmp(s, \"\"deni…",
@@ -183,12 +183,12 @@
       "version": "line 1272"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 1327",
+      "key": "flawfinder/buffer|./c_src/magpie_audio.c|line 1327",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -196,12 +196,12 @@
       "version": "line 1327"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 1568",
+      "key": "flawfinder/buffer|./c_src/magpie_audio.c|line 1568",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"            if (fresh_n > 0) memcpy(p, REC.peaks + IN.p…",
@@ -209,12 +209,12 @@
       "version": "line 1568"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 1782",
+      "key": "flawfinder/buffer|./c_src/magpie_audio.c|line 1782",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"            memcpy(buf + n, MI.stale[i].b, MI.stale[i].…",
@@ -222,12 +222,12 @@
       "version": "line 1782"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 1818",
+      "key": "flawfinder/buffer|./c_src/magpie_audio.c|line 1818",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"            memcpy(buf + n, ev.b, ev.len);\",f027147cc98…",
@@ -235,12 +235,12 @@
       "version": "line 1818"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 2114",
+      "key": "flawfinder/buffer|./c_src/magpie_audio.c|line 2114",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"        memcpy(out + 4 * i, &x, sizeof(x));\",5becfe0402…",
@@ -248,12 +248,12 @@
       "version": "line 2114"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 2157",
+      "key": "flawfinder/buffer|./c_src/magpie_audio.c|line 2157",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -261,12 +261,12 @@
       "version": "line 2157"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 2361",
+      "key": "flawfinder/buffer|./c_src/magpie_audio.c|line 2361",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"    memcpy(v, ring, sizeof(float) * (size_t)n);\",20b087…",
@@ -274,12 +274,12 @@
       "version": "line 2361"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 2680",
+      "key": "flawfinder/buffer|./c_src/magpie_audio.c|line 2680",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"    memcpy(p, REC.peaks, (size_t)n_peaks);\",8b16ab97065…",
@@ -287,12 +287,12 @@
       "version": "line 2680"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 2815",
+      "key": "flawfinder/buffer|./c_src/magpie_audio.c|line 2815",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"    memcpy(MI.outs, MI.next, len * sizeof(midi_out));\",…",
@@ -300,12 +300,12 @@
       "version": "line 2815"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/recorder.c|line 274",
+      "key": "flawfinder/buffer|./c_src/recorder.c|line 274",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/recorder.c",
+      "package": "./c_src/recorder.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"    memcpy(r->buf + r->done * ch, src, (size_t)n * (siz…",
@@ -313,12 +313,12 @@
       "version": "line 274"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/recorder.c|line 302",
+      "key": "flawfinder/buffer|./c_src/recorder.c|line 302",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/recorder.c",
+      "package": "./c_src/recorder.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"        memcpy(r->ring + slot * ch, in + i * ch, (size_…",
@@ -326,12 +326,12 @@
       "version": "line 302"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c|line 808",
+      "key": "flawfinder/buffer|./c_src/test/midi_host.c|line 808",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c",
+      "package": "./c_src/test/midi_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"    memcpy(port.queued + port.n_queued, bytes, len);\",6…",
@@ -339,12 +339,12 @@
       "version": "line 808"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c|line 857",
+      "key": "flawfinder/buffer|./c_src/test/midi_host.c|line 857",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c",
+      "package": "./c_src/test/midi_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"        memcpy(buf + n, evs[i].b, evs[i].len);\",4491467…",
@@ -352,12 +352,12 @@
       "version": "line 857"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c|line 1549",
+      "key": "flawfinder/buffer|./c_src/test/sampler_host.c|line 1549",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c",
+      "package": "./c_src/test/sampler_host.c",
       "severity": "medium",
       "source": "flawfinder",
       "title": "buffer:  and the same variable can be set more than once (CWE-807, CWE-20).\",Check environment variables carefully before using …",
@@ -365,12 +365,12 @@
       "version": "line 1549"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c|line 1549",
+      "key": "flawfinder/buffer|./c_src/test/sampler_host.c|line 1549",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c",
+      "package": "./c_src/test/sampler_host.c",
       "severity": "medium",
       "source": "flawfinder",
       "title": "buffer:  and the same variable can be set more than once (CWE-807, CWE-20).\",Check environment variables carefully before using …",
@@ -378,12 +378,12 @@
       "version": "line 1549"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c|line 938",
+      "key": "flawfinder/buffer|./c_src/test/sampler_host.c|line 938",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c",
+      "package": "./c_src/test/sampler_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"    memcpy(raw + 1, f, sizeof(f));\",8b2490d1d97850bae36…",
@@ -391,12 +391,12 @@
       "version": "line 938"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c|line 1273",
+      "key": "flawfinder/buffer|./deps/exqlite/c_src/sqlite3_nif.c|line 1273",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c",
+      "package": "./deps/exqlite/c_src/sqlite3_nif.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: ,,CWE-126,\"        columns[i] = make_binary(env, name, strlen(name));\",1b2a47a800cc0d4f67c1b836d0713704ee62f0be2cac39212…",
@@ -404,12 +404,12 @@
       "version": "line 1273"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c|line 1438",
+      "key": "flawfinder/buffer|./deps/exqlite/c_src/sqlite3_nif.c|line 1438",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c",
+      "package": "./deps/exqlite/c_src/sqlite3_nif.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"    memcpy(buffer, serialized.data, size);\",3657a6a3c1c…",
@@ -417,12 +417,12 @@
       "version": "line 1438"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c|line 1802",
+      "key": "flawfinder/buffer|./deps/exqlite/c_src/sqlite3_nif.c|line 1802",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c",
+      "package": "./deps/exqlite/c_src/sqlite3_nif.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: ,,CWE-126,\"    ERL_NIF_TERM database = make_binary(msg_env, sqlite_database, strlen(sqlite_database));\",076d6c957f14361c…",
@@ -430,12 +430,12 @@
       "version": "line 1802"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c|line 1803",
+      "key": "flawfinder/buffer|./deps/exqlite/c_src/sqlite3_nif.c|line 1803",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c",
+      "package": "./deps/exqlite/c_src/sqlite3_nif.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: ,,CWE-126,\"    ERL_NIF_TERM table    = make_binary(msg_env, sqlite_table, strlen(sqlite_table));\",016f3e4f2c64ca16f71551…",
@@ -443,12 +443,12 @@
       "version": "line 1803"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c|line 1869",
+      "key": "flawfinder/buffer|./deps/exqlite/c_src/sqlite3_nif.c|line 1869",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c",
+      "package": "./deps/exqlite/c_src/sqlite3_nif.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -456,12 +456,12 @@
       "version": "line 1869"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c|line 2053",
+      "key": "flawfinder/buffer|./deps/exqlite/c_src/sqlite3_nif.c|line 2053",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c",
+      "package": "./deps/exqlite/c_src/sqlite3_nif.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: ,,CWE-126,\"    ERL_NIF_TERM error = make_binary(msg_env, zMsg, strlen(zMsg));\",b205045ec6312101015771f14aa5be5502a8c31a3…",
@@ -469,12 +469,12 @@
       "version": "line 2053"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c|line 224",
+      "key": "flawfinder/buffer|./deps/exqlite/c_src/sqlite3_nif.c|line 224",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c",
+      "package": "./deps/exqlite/c_src/sqlite3_nif.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"    memcpy(blob.data, bytes, size);\",3e6f67d676a83083c2…",
@@ -482,12 +482,12 @@
       "version": "line 224"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c|line 2270",
+      "key": "flawfinder/buffer|./deps/exqlite/c_src/sqlite3_nif.c|line 2270",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c",
+      "package": "./deps/exqlite/c_src/sqlite3_nif.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: ,,CWE-126,\"    return make_binary(env, msg, strlen(msg));\",594dc28b7097d494202190ed21d0599a84036877a1489778fe73ea5e26332…",
@@ -495,12 +495,12 @@
       "version": "line 2270"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c|line 2282",
+      "key": "flawfinder/buffer|./deps/exqlite/c_src/sqlite3_nif.c|line 2282",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c",
+      "package": "./deps/exqlite/c_src/sqlite3_nif.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: ,,CWE-126,\"    return make_binary(env, msg, strlen(msg));\",594dc28b7097d494202190ed21d0599a84036877a1489778fe73ea5e26332…",
@@ -508,12 +508,12 @@
       "version": "line 2282"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c|line 235",
+      "key": "flawfinder/buffer|./deps/exqlite/c_src/sqlite3_nif.c|line 235",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/exqlite/c_src/sqlite3_nif.c",
+      "package": "./deps/exqlite/c_src/sqlite3_nif.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: ,,CWE-126,    size_t len      = strlen(msg);,3cac19b5161ef7ea1c1d1be281e9d33fb3ab94f5e8bab458660285bf99715cd5,2.0.20,FF1…",
@@ -521,12 +521,12 @@
       "version": "line 235"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_code_versions.h|line 104",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_code_versions.h|line 104",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_code_versions.h",
+      "package": "./deps/mob/ios/mob_code_versions.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -534,12 +534,12 @@
       "version": "line 104"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_code_versions.h|line 143",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_code_versions.h|line 143",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_code_versions.h",
+      "package": "./deps/mob/ios/mob_code_versions.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -547,12 +547,12 @@
       "version": "line 143"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_code_versions.h|line 144",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_code_versions.h|line 144",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_code_versions.h",
+      "package": "./deps/mob/ios/mob_code_versions.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -560,12 +560,12 @@
       "version": "line 144"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_code_versions.h|line 160",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_code_versions.h|line 160",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_code_versions.h",
+      "package": "./deps/mob/ios/mob_code_versions.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -573,12 +573,12 @@
       "version": "line 160"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_code_versions.h|line 198",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_code_versions.h|line 198",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_code_versions.h",
+      "package": "./deps/mob/ios/mob_code_versions.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -586,12 +586,12 @@
       "version": "line 198"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h|line 45",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_dist_cookie.h|line 45",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h",
+      "package": "./deps/mob/ios/mob_dist_cookie.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -599,12 +599,12 @@
       "version": "line 45"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h|line 60",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_dist_cookie.h|line 60",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h",
+      "package": "./deps/mob/ios/mob_dist_cookie.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"    memcpy(out, buf, MOB_DIST_COOKIE_HEX_LEN);\",2dd6101…",
@@ -612,12 +612,12 @@
       "version": "line 60"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h|line 71",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_dist_cookie.h|line 71",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h",
+      "package": "./deps/mob/ios/mob_dist_cookie.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: ,,CWE-126,        size_t len = strlen(env_cookie);,0a72f2f28a52d5dcffa3c7c31b6dacdc0c532f574418731b49b49bf8223e2b94,2.0.…",
@@ -625,12 +625,12 @@
       "version": "line 71"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h|line 73",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_dist_cookie.h|line 73",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h",
+      "package": "./deps/mob/ios/mob_dist_cookie.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"            memcpy(out, env_cookie, len + 1);\",52d23db1…",
@@ -638,12 +638,12 @@
       "version": "line 73"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h|line 79",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_dist_cookie.h|line 79",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h",
+      "package": "./deps/mob/ios/mob_dist_cookie.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -651,12 +651,12 @@
       "version": "line 79"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h|line 86",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_dist_cookie.h|line 86",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h",
+      "package": "./deps/mob/ios/mob_dist_cookie.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -664,12 +664,12 @@
       "version": "line 86"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_port.h|line 65",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_dist_port.h|line 65",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_port.h",
+      "package": "./deps/mob/ios/mob_dist_port.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -677,12 +677,12 @@
       "version": "line 65"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_erts_dir.h|line 69",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_erts_dir.h|line 69",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_erts_dir.h",
+      "package": "./deps/mob/ios/mob_erts_dir.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: ,,CWE-126,        size_t n = strlen(e->d_name);,54cf20230fbf516e4b0299d262bc75fd322a9f2373fb8853ef01ec67b3199d7c,2.0.20,…",
@@ -690,12 +690,12 @@
       "version": "line 69"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_erts_dir.h|line 76",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_erts_dir.h|line 76",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_erts_dir.h",
+      "package": "./deps/mob/ios/mob_erts_dir.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -703,12 +703,12 @@
       "version": "line 76"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_erts_dir.h|line 81",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_erts_dir.h|line 81",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_erts_dir.h",
+      "package": "./deps/mob/ios/mob_erts_dir.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: Make sure destination can always hold the source data.,,CWE-120,\"        memcpy(out, e->d_name, n + 1);\",4a6fdc54c833e77…",
@@ -716,12 +716,12 @@
       "version": "line 81"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_init_args.h|line 29",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_init_args.h|line 29",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_init_args.h",
+      "package": "./deps/mob/ios/mob_init_args.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -729,12 +729,12 @@
       "version": "line 29"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_init_args.h|line 30",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_init_args.h|line 30",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_init_args.h",
+      "package": "./deps/mob/ios/mob_init_args.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -742,12 +742,12 @@
       "version": "line 30"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_node_host.h|line 100",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_node_host.h|line 100",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_node_host.h",
+      "package": "./deps/mob/ios/mob_node_host.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer: ,Risk is low because the source is a constant string.,CWE-120,\"    strncpy(buf, \"\"127.0.0.1\"\", len - 1);\",3696664b938df6…",
@@ -755,12 +755,12 @@
       "version": "line 100"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/buffer",
-      "key": "flawfinder/buffer|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_stored_queue.h|line 26",
+      "key": "flawfinder/buffer|./deps/mob/ios/mob_stored_queue.h|line 26",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_stored_queue.h",
+      "package": "./deps/mob/ios/mob_stored_queue.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "buffer:  leading to potential overflows or other issues (CWE-119!/CWE-120).\",\"Perform bounds checking, use functions that limit …",
@@ -768,12 +768,12 @@
       "version": "line 26"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/format",
-      "key": "flawfinder/format|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c|line 35",
+      "key": "flawfinder/format|./c_src/test/midi_host.c|line 35",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c",
+      "package": "./c_src/test/midi_host.c",
       "severity": "high",
       "source": "flawfinder",
       "title": "format:  they can be exploited (CWE-134).\",Use a constant for the format specification.,,CWE-134,        printf(__VA_ARGS__);   …",
@@ -781,12 +781,12 @@
       "version": "line 35"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/format",
-      "key": "flawfinder/format|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c|line 989",
+      "key": "flawfinder/format|./c_src/test/midi_host.c|line 989",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c",
+      "package": "./c_src/test/midi_host.c",
       "severity": "high",
       "source": "flawfinder",
       "title": "format:  they can be exploited (CWE-134).\",Use a constant for the format specification.,,CWE-134,\"    printf(failures ? \"\"FAILED…",
@@ -794,12 +794,12 @@
       "version": "line 989"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/format",
-      "key": "flawfinder/format|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c|line 36",
+      "key": "flawfinder/format|./c_src/test/sampler_host.c|line 36",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c",
+      "package": "./c_src/test/sampler_host.c",
       "severity": "high",
       "source": "flawfinder",
       "title": "format:  they can be exploited (CWE-134).\",Use a constant for the format specification.,,CWE-134,        printf(__VA_ARGS__);   …",
@@ -807,12 +807,12 @@
       "version": "line 36"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/misc",
-      "key": "flawfinder/misc|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 743",
+      "key": "flawfinder/misc|./c_src/magpie_audio.c|line 743",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "misc:  force the opening of special file type (e.g., device files), move things around to create a race condition, control its…",
@@ -820,12 +820,12 @@
       "version": "line 743"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/misc",
-      "key": "flawfinder/misc|/Users/kevin/code/magpie-worktrees/security-audit/c_src/recorder.c|line 110",
+      "key": "flawfinder/misc|./c_src/recorder.c|line 110",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/recorder.c",
+      "package": "./c_src/recorder.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "misc:  force the opening of special file type (e.g., device files), move things around to create a race condition, control its…",
@@ -833,12 +833,12 @@
       "version": "line 110"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/misc",
-      "key": "flawfinder/misc|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c|line 941",
+      "key": "flawfinder/misc|./c_src/test/midi_host.c|line 941",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c",
+      "package": "./c_src/test/midi_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "misc:  force the opening of special file type (e.g., device files), move things around to create a race condition, control its…",
@@ -846,12 +846,12 @@
       "version": "line 941"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/misc",
-      "key": "flawfinder/misc|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c|line 953",
+      "key": "flawfinder/misc|./c_src/test/midi_host.c|line 953",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c",
+      "package": "./c_src/test/midi_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "misc:  force the opening of special file type (e.g., device files), move things around to create a race condition, control its…",
@@ -859,12 +859,12 @@
       "version": "line 953"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/misc",
-      "key": "flawfinder/misc|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c|line 955",
+      "key": "flawfinder/misc|./c_src/test/midi_host.c|line 955",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c",
+      "package": "./c_src/test/midi_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "misc:  force the opening of special file type (e.g., device files), move things around to create a race condition, control its…",
@@ -872,12 +872,12 @@
       "version": "line 955"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/misc",
-      "key": "flawfinder/misc|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c|line 958",
+      "key": "flawfinder/misc|./c_src/test/midi_host.c|line 958",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c",
+      "package": "./c_src/test/midi_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "misc:  force the opening of special file type (e.g., device files), move things around to create a race condition, control its…",
@@ -885,12 +885,12 @@
       "version": "line 958"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/misc",
-      "key": "flawfinder/misc|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c|line 967",
+      "key": "flawfinder/misc|./c_src/test/midi_host.c|line 967",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/midi_host.c",
+      "package": "./c_src/test/midi_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "misc:  force the opening of special file type (e.g., device files), move things around to create a race condition, control its…",
@@ -898,12 +898,12 @@
       "version": "line 967"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/misc",
-      "key": "flawfinder/misc|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c|line 460",
+      "key": "flawfinder/misc|./c_src/test/sampler_host.c|line 460",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c",
+      "package": "./c_src/test/sampler_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "misc:  force the opening of special file type (e.g., device files), move things around to create a race condition, control its…",
@@ -911,12 +911,12 @@
       "version": "line 460"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/misc",
-      "key": "flawfinder/misc|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c|line 463",
+      "key": "flawfinder/misc|./c_src/test/sampler_host.c|line 463",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c",
+      "package": "./c_src/test/sampler_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "misc:  force the opening of special file type (e.g., device files), move things around to create a race condition, control its…",
@@ -924,12 +924,12 @@
       "version": "line 463"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/misc",
-      "key": "flawfinder/misc|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h|line 42",
+      "key": "flawfinder/misc|./deps/mob/ios/mob_dist_cookie.h|line 42",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_dist_cookie.h",
+      "package": "./deps/mob/ios/mob_dist_cookie.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "misc:  force the opening of special file type (e.g., device files), move things around to create a race condition, control its…",
@@ -937,12 +937,12 @@
       "version": "line 42"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/misc",
-      "key": "flawfinder/misc|/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_init_args.h|line 86",
+      "key": "flawfinder/misc|./deps/mob/ios/mob_init_args.h|line 86",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/deps/mob/ios/mob_init_args.h",
+      "package": "./deps/mob/ios/mob_init_args.h",
       "severity": "low",
       "source": "flawfinder",
       "title": "misc:  force the opening of special file type (e.g., device files), move things around to create a race condition, control its…",
@@ -950,12 +950,12 @@
       "version": "line 86"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/obsolete",
-      "key": "flawfinder/obsolete|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 1798",
+      "key": "flawfinder/obsolete|./c_src/magpie_audio.c|line 1798",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "obsolete:  alarm(), setitimer(), and nanosleep() is unspecified (CWE-676).\",Use nanosleep(2) or setitimer(2) instead.,,CWE-676,   …",
@@ -963,12 +963,12 @@
       "version": "line 1798"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/obsolete",
-      "key": "flawfinder/obsolete|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 1805",
+      "key": "flawfinder/obsolete|./c_src/magpie_audio.c|line 1805",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "obsolete:  alarm(), setitimer(), and nanosleep() is unspecified (CWE-676).\",Use nanosleep(2) or setitimer(2) instead.,,CWE-676,   …",
@@ -976,12 +976,12 @@
       "version": "line 1805"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/obsolete",
-      "key": "flawfinder/obsolete|/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c|line 715",
+      "key": "flawfinder/obsolete|./c_src/magpie_audio.c|line 715",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/magpie_audio.c",
+      "package": "./c_src/magpie_audio.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "obsolete:  alarm(), setitimer(), and nanosleep() is unspecified (CWE-676).\",Use nanosleep(2) or setitimer(2) instead.,,CWE-676,   …",
@@ -989,12 +989,12 @@
       "version": "line 715"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/obsolete",
-      "key": "flawfinder/obsolete|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c|line 1438",
+      "key": "flawfinder/obsolete|./c_src/test/sampler_host.c|line 1438",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c",
+      "package": "./c_src/test/sampler_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "obsolete:  alarm(), setitimer(), and nanosleep() is unspecified (CWE-676).\",Use nanosleep(2) or setitimer(2) instead.,,CWE-676,   …",
@@ -1002,12 +1002,12 @@
       "version": "line 1438"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/obsolete",
-      "key": "flawfinder/obsolete|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c|line 1443",
+      "key": "flawfinder/obsolete|./c_src/test/sampler_host.c|line 1443",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c",
+      "package": "./c_src/test/sampler_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "obsolete:  alarm(), setitimer(), and nanosleep() is unspecified (CWE-676).\",Use nanosleep(2) or setitimer(2) instead.,,CWE-676,   …",
@@ -1015,12 +1015,12 @@
       "version": "line 1443"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/obsolete",
-      "key": "flawfinder/obsolete|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c|line 1479",
+      "key": "flawfinder/obsolete|./c_src/test/sampler_host.c|line 1479",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c",
+      "package": "./c_src/test/sampler_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "obsolete:  alarm(), setitimer(), and nanosleep() is unspecified (CWE-676).\",Use nanosleep(2) or setitimer(2) instead.,,CWE-676,   …",
@@ -1028,12 +1028,12 @@
       "version": "line 1479"
     },
     {
-      "first_seen_at": "2026-11-20T23:12:20.086473Z",
+      "first_seen_at": "2026-11-20T23:23:18.645192Z",
       "fixed_in": null,
       "id": "flawfinder/obsolete",
-      "key": "flawfinder/obsolete|/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c|line 1598",
+      "key": "flawfinder/obsolete|./c_src/test/sampler_host.c|line 1598",
       "layer": "c_source",
-      "package": "/Users/kevin/code/magpie-worktrees/security-audit/c_src/test/sampler_host.c",
+      "package": "./c_src/test/sampler_host.c",
       "severity": "low",
       "source": "flawfinder",
       "title": "obsolete:  alarm(), setitimer(), and nanosleep() is unspecified (CWE-676).\",Use nanosleep(2) or setitimer(2) instead.,,CWE-676,   …",
@@ -1041,6 +1041,6 @@
       "version": "line 1598"
     }
   ],
-  "last_run_at": "2026-11-20T23:12:20.086473Z",
+  "last_run_at": "2026-11-20T23:23:18.645192Z",
   "version": 1
 }
