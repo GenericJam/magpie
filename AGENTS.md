@@ -836,3 +836,29 @@ these), 16 loaded pads (every one asking for moves), 40 rounds:
   line if the file is ever regenerated, until mob_new ships the fix.
 - Decisions go in `decisions/YYYY-MM-DD-<slug>.md` (Context / Decision /
   Consequences), as in mob.
+
+## Releasing (Android APK)
+
+Sideloaded APKs on GitHub releases (no Play listing yet); the site links
+`https://github.com/GenericJam/magpie/releases/latest/download/Magpie.apk`,
+so every release attaches `Magpie.apk` beside `Magpie-<version>.apk` and its
+`.sha256`.
+
+- **The key** is Magpie's permanent identity: `android/upload_jks.keystore`
+  (JKS, alias `upload`, certificate SHA-256
+  `160e5f78fc787c2b4e88d8d8973bed2a1e51307964bc69c02cd15a77cfeb4800`), its
+  passwords in `android/keystore.properties`; both mode 600, git-ignored,
+  only in the main checkout. An APK signed with another key can't update an
+  installed release (uninstalling wipes the stash and kits), so never
+  replace it; a worktree that builds a release copies both files in.
+- **Version:** `version` in `mix.exs` = `versionName` in
+  `android/app/build.gradle`; bump `versionCode` every release.
+- **Build** from master: `mise exec -- mix mob.release --android` (native
+  build for every ABI, `android/app/src/release/assets/otp.zip`, the AAB),
+  then `cd android && ./gradlew assembleRelease` →
+  `android/app/build/outputs/apk/release/app-release.apk`. Check it with
+  `apksigner verify --print-certs` (the digest above).
+- A release build has no Erlang distribution: `mix mob.connect` and the
+  `scripts/*_check.exs` don't reach it. Smoke it by hand (launch, starter
+  drums in the stash, a pad plays); underruns show in `adb shell dumpsys
+  media.audio_flinger` (the app's track).
