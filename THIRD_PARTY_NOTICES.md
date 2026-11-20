@@ -23,6 +23,7 @@ does not replace any upstream copyright, attribution or licence.
 | Mob (Copyright (c) 2026 Kevin Smith), including its Android bridge in the dex code | the APK's `otp.zip`, dex code and native libraries | MIT | [LICENSES/Mob-MIT.txt](LICENSES/Mob-MIT.txt) |
 | mob_midi, mob_bluetooth | the APK's `otp.zip`, dex code and native libraries | MIT (declared on Hex; the packages ship no licence file) | |
 | exqlite and ecto_sqlite3 (both Copyright (c) 2021 Matthew A. Johnston) | the APK's `otp.zip` and native libraries | MIT | [LICENSES/exqlite-MIT.txt](LICENSES/exqlite-MIT.txt) |
+| jQuery and jQuery Migrate (Copyright OpenJS Foundation and other contributors), tablesorter 2.32 (Copyright (c) 2007 Christian Bach), in Erlang/OTP's `common_test` | the APK's `otp.zip` | MIT | [LICENSES/jQuery-MIT.txt](LICENSES/jQuery-MIT.txt), [LICENSES/tablesorter-MIT.txt](LICENSES/tablesorter-MIT.txt) |
 | SQLite (bundled by exqlite) | native libraries | public domain | |
 | OpenSSL (Erlang's `crypto`) | native libraries | Apache License 2.0 | [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt) |
 | AndroidX (Compose, Activity, AppCompat, CameraX, Media3), Kotlin standard library, kotlinx.coroutines, Coil, OkHttp, Okio | the APK's dex code | Apache License 2.0 | [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt) |
