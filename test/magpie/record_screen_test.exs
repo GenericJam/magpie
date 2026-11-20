@@ -6,7 +6,7 @@ defmodule Magpie.RecordScreenTest do
   import Magpie.Test.Screens
 
   alias Magpie.Audio.Fake
-  alias Magpie.{Bird, Engine, Library, RecordScreen, Style, Wav}
+  alias Magpie.{Bird, Engine, Library, LibraryScreen, RecordScreen, Style, Wav}
   alias Magpie.Test.Aiff
   alias Magpie.Test.Repo, as: TestRepo
 
@@ -107,6 +107,23 @@ defmodule Magpie.RecordScreenTest do
       assert Engine.state().input == nil
       assert {:error, :not_recording} = Engine.stop_recording()
       assert navigated_to(view) == {:pop}
+    end
+
+    test "The stash closes the input, pushes LibraryScreen with target params, and reopens on Mic tap" do
+      view = RecordScreen |> mount_screen(%{pad: 14, reply_to: self()}) |> pump()
+      assert %{source: :mic, status: :open} = Engine.state().input
+
+      view = press(view, {:source, :stash})
+      assert Engine.state().input == nil
+      assert chip(view) == "NO INPUT"
+      assert navigated_to(view) == LibraryScreen
+
+      assert view.socket.__mob__.nav_action ==
+               {:push, LibraryScreen, %{pad: 14, reply_to: self()}}
+
+      view = view |> press({:source, :mic}) |> pump()
+      assert %{source: :mic, status: :open} = Engine.state().input
+      assert chip(view) == "READY"
     end
   end
 

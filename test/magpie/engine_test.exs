@@ -265,6 +265,33 @@ defmodule Magpie.EngineTest do
       assert %{playing: false, pattern: ^b, pending: nil} = Engine.state()
     end
 
+    test "subscribers hear the sequencer start and stop, once per change" do
+      :ok = Engine.set_pattern(pattern("A1", %{}))
+      :ok = Engine.stop()
+      refute_received {:magpie_audio, :transport, _, _}
+
+      :ok = Engine.play()
+      assert_received {:magpie_audio, :transport, :started, nil}
+      :ok = Engine.play()
+      refute_received {:magpie_audio, :transport, _, _}
+
+      :ok = Engine.stop()
+      assert_received {:magpie_audio, :transport, :stopped, nil}
+      :ok = Engine.stop()
+      refute_received {:magpie_audio, :transport, _, _}
+    end
+
+    test "a start or stop the audio engine refuses changes nothing and tells nobody" do
+      :ok = Engine.set_pattern(pattern("A1", %{}))
+      other = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(other, :kill) end)
+      {:ok, _} = Fake.open(other)
+
+      assert {:error, :not_owner} = Engine.play()
+      refute Engine.state().playing
+      refute_received {:magpie_audio, :transport, _, _}
+    end
+
     test "kit steps become engine ticks: muted lanes out, negative ticks wrap, pads by bank" do
       lanes = %{
         0 => lane([%{step: 0, vel: 100, tick: -12}, %{step: 3, vel: 60, tick: 5}]),

@@ -34,6 +34,8 @@ defmodule Magpie.App do
     {:ok, _} = Magpie.Engine.start_link()
     # The kit being played: loads its samples into the engine, autosaves.
     {:ok, _} = Magpie.KitSession.start_link()
+    # Bundled starter drums: imported in the background into the library.
+    {:ok, _} = Magpie.StarterPack.start_link()
     # MIDI devices: USB and Bluetooth open as they appear (notes and clock
     # themselves go between Kotlin and the engine, not through here).
     {:ok, _} = Magpie.Midi.start_link()

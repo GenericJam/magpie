@@ -6,7 +6,7 @@ defmodule Magpie.PadsScreenTest do
   import Magpie.Test.Screens, only: [assert_every_tap_held: 1, canvas_ops: 2, texts: 1]
 
   alias Magpie.Audio.Fake
-  alias Magpie.{Bird, Kit, KitSession, PadsScreen, RecordScreen}
+  alias Magpie.{Bird, Engine, Kit, KitSession, PadsScreen, RecordScreen, SeqScreen, Style}
   alias Magpie.Kit.{Pad, Region}
   alias Magpie.Test.Screens
   alias Mob.Event.Touch
@@ -99,6 +99,9 @@ defmodule Magpie.PadsScreenTest do
 
   defp face_texts(view, index),
     do: for(%{type: :text, props: %{text: t}} <- flatten(face(view, index)), do: t)
+
+  # The Play button's icon: play, or a stop square while playing.
+  defp play_icon(view), do: hd(find(view, :box, id: "play").children).props.draw
 
   defp long_press_message(pointer) do
     assert_receive {:long_press, ^pointer, _token} = msg, 1_000
@@ -496,6 +499,68 @@ defmodule Magpie.PadsScreenTest do
     view = render_info(view, {:tap, :play})
     refute Fake.state().playing
     refute assigns(view).playing
+  end
+
+  test "Play plays the bank's selected pattern" do
+    :ok = KitSession.add_pattern("A")
+    :ok = KitSession.toggle_step("A", 0, 4, 110)
+
+    view = mount() |> render_info({:tap, :play})
+    assert assigns(view).playing
+    assert %{playing: true, pattern: %Kit.Pattern{id: "A2"}} = Engine.state()
+    assert %{pattern: %{events: [{96, 0, 110, nil}]}} = Fake.state()
+  end
+
+  test "Record pattern starts the bank's pattern and arms; pads played land in it; again disarms" do
+    view = mount() |> render_info({:tap, :record}) |> pump()
+    assert %{playing: true, pattern: %Kit.Pattern{id: "A1"}} = Engine.state()
+    assert assigns(view).playing
+    assert assigns(view).snapshot.recording
+    assert find(view, :box, id: "record_pattern").props.background == Style.color(:danger)
+
+    view = view |> down(2, 1, 50.0) |> pump()
+
+    assert %{2 => %{steps: [%Kit.Step{step: 0, vel: 90, tick: 0}]}} =
+             KitSession.pattern(assigns(view).snapshot, "A").lanes
+
+    view = view |> render_info({:tap, :record}) |> pump()
+    refute assigns(view).snapshot.recording
+    assert Engine.state().playing
+    assert find(view, :box, id: "record_pattern").props.background == Style.color(:raised)
+  end
+
+  test "Stop disarms Record pattern" do
+    view = mount() |> render_info({:tap, :play}) |> render_info({:tap, :record}) |> pump()
+    assert assigns(view).snapshot.recording
+
+    view = view |> render_info({:tap, :play}) |> pump()
+    refute Engine.state().playing
+    refute assigns(view).snapshot.recording
+    assert find(view, :box, id: "record_pattern").props.background == Style.color(:raised)
+  end
+
+  test "stopping from the sequencer disarms and turns the pads' stop button back to play" do
+    pads = mount()
+    idle_icon = play_icon(pads)
+    pads = pads |> render_info({:tap, :record}) |> pump()
+    assert assigns(pads).playing
+    refute play_icon(pads) == idle_icon
+
+    seq = mount_screen(SeqScreen, %{bank: "A"})
+    _seq = render_info(seq, {:tap, :play})
+    refute Engine.state().playing
+
+    pads = pump(pads)
+    refute assigns(pads).playing
+    refute assigns(pads).snapshot.recording
+    assert play_icon(pads) == idle_icon
+    assert find(pads, :box, id: "record_pattern").props.background == Style.color(:raised)
+  end
+
+  test "Seq opens SeqScreen on the selected bank" do
+    view = mount() |> render_info({:tap, {:bank, "B"}}) |> render_info({:tap, :seq})
+    assert navigated_to(view) == SeqScreen
+    assert view.socket.__mob__.nav_action == {:push, SeqScreen, %{bank: "B"}}
   end
 
   test "note_label/1 names notes with C4 = 60" do
