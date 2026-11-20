@@ -37,7 +37,7 @@ defmodule Magpie.MixProject do
       # ABI magpie_audio.c sends and receives through (see mob.exs).
       {:mob_midi, "~> 0.3.0"},
       # Tests check kit files against design/kit.schema.json itself.
-      {:jsv, "~> 0.27.0", only: :test},
+      {:jsv, "~> 0.28.0", only: :test},
       # Code quality — Credo + ex_slop (catches AI-generated patterns
       # like blanket rescue, narrator docs, redundant Enum chains, etc).
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
