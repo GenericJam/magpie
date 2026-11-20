@@ -858,7 +858,13 @@ so every release attaches `Magpie.apk` beside `Magpie-<version>.apk` and its
   then `cd android && ./gradlew assembleRelease` →
   `android/app/build/outputs/apk/release/app-release.apk`. Check it with
   `apksigner verify --print-certs` (the digest above).
-- A release build has no Erlang distribution: `mix mob.connect` and the
-  `scripts/*_check.exs` don't reach it. Smoke it by hand (launch, starter
-  drums in the stash, a pad plays); underruns show in `adb shell dumpsys
-  media.audio_flinger` (the app's track).
+- `mix mob.connect` can't reach a release build (it can't write the dist
+  cookie into a non-debuggable app), so neither can `scripts/*_check.exs`.
+  Smoke it by hand (launch, starter drums in the stash, a pad plays);
+  underruns are the `Underruns` column (frames) of the app's track in `adb
+  shell dumpsys media.audio_flinger`.
+- **Licences:** Magpie is MIT (`LICENSE`); everything bundled under another
+  licence (the CC0 drums, the OFL fonts, the Apache-2.0 runtime) is listed
+  in `THIRD_PARTY_NOTICES.md` with its text in `LICENSES/`, and the build
+  copies all three into the APK (`assets/licenses/`). A new bundled font,
+  sound or dependency under another licence goes in there too.

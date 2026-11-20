@@ -109,7 +109,23 @@ android {
         }
         debug   { jniDebuggable true }
     }
+
+    sourceSets {
+        main { assets.srcDirs += layout.buildDirectory.dir('generated/licenseAssets') }
+    }
 }
+
+// LICENSE, THIRD_PARTY_NOTICES.md and LICENSES/ ship in the APK under
+// assets/licenses/ (the fonts' OFL and the Apache-2.0 runtime need their
+// texts with the binaries; see THIRD_PARTY_NOTICES.md).
+def copyLicenseAssets = tasks.register('copyLicenseAssets', Copy) {
+    from(rootProject.file('../LICENSE'))
+    from(rootProject.file('../THIRD_PARTY_NOTICES.md'))
+    from(rootProject.file('../LICENSES')) { into 'LICENSES' }
+    into layout.buildDirectory.dir('generated/licenseAssets/licenses')
+}
+
+tasks.named('preBuild') { dependsOn copyLicenseAssets }
 
 // Strong skipping (on by default since Kotlin 2.0.20) changes which
 // composables recompose: an unstable parameter passed the same instance now
