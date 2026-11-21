@@ -10,7 +10,7 @@ defmodule Magpie.Audio.NativeTest do
   import ExUnit.CaptureLog
 
   alias Magpie.Audio.Native
-  alias Magpie.Audio.Native.{Decode, Io}
+  alias Magpie.Audio.Native.Io
   alias Magpie.Test.FakeAudioNif
   alias Magpie.Wav
   alias MobAudioIo.Fake
@@ -134,13 +134,31 @@ defmodule Magpie.Audio.NativeTest do
                stream("magpie_mic")
     end
 
-    test "a device that refuses unprocessed input gets its default preset" do
+    test "a device that refuses unprocessed input: its default preset, on a fresh input id" do
       Fake.fail_next_open({:unavailable, "open: AAUDIO_ERROR_ILLEGAL_ARGUMENT"})
 
-      log = capture_log(fn -> assert {:ok, _} = Native.input_open(:mic) end)
+      log = capture_log(fn -> assert {:ok, 2} = Native.input_open(:mic) end)
 
+      # The refused start left input 1 closed (as lost): input 2 gets the stream.
+      assert_received {:fake_nif, :input_open, [:mic]}
+      assert_received {:fake_nif, :input_open, [:mic]}
       assert log =~ "unprocessed input refused"
       assert %{preset: :default} = stream("magpie_mic")
+    end
+
+    test "replacing the mic: the old input and its stream are gone before the new input opens" do
+      assert {:ok, _} = Native.input_open(:mic)
+      test = self()
+
+      FakeAudioNif.answer(:input_open, fn :mic ->
+        send(test, {:mic_at_open, stream("magpie_mic")})
+        {:ok, 42, 48_000}
+      end)
+
+      assert {:ok, 42} = Native.input_open(:mic)
+      assert_received {:fake_nif, :input_close, []}
+      assert_received {:mic_at_open, nil}
+      assert %{processor: "magpie_mic"} = stream("magpie_mic")
     end
 
     test "no permission: :no_permission and no input left" do
@@ -187,9 +205,10 @@ defmodule Magpie.Audio.NativeTest do
 
     test "not the owner: nothing changes" do
       assert {:ok, _} = Native.input_open(:mic)
-      FakeAudioNif.answer(:input_open, {:error, :not_owner})
+      FakeAudioNif.answer(:input_close, {:error, :not_owner})
       assert {:error, :not_owner} = Native.input_open(:mic)
       assert %{processor: "magpie_mic"} = stream("magpie_mic")
+      FakeAudioNif.answer(:input_close, :ok)
     end
 
     test "a lost microphone is logged; the NIF tells the owner, who closes it" do
@@ -315,30 +334,34 @@ defmodule Magpie.Audio.NativeTest do
       :ok
     end
 
-    test "claims its turn, decodes off the caller, hands the PCM to the loader", %{dir: dir} do
+    test "queues its turn before returning, decodes off the caller, hands the PCM over", %{
+      dir: dir
+    } do
       path = wav!(dir, "a.wav", 500, 22_050, 2, fn _, c -> c * 0.25 end)
       assert :ok = Native.load_sample("a", path)
+      # Claimed (queued in order, in C) before load_sample/2 returned.
       assert_received {:fake_nif, :load_claim, ["a"]}
-      assert_receive {:fake_nif, :load_ticket, ["a", {0, _}, pcm, 22_050, 2]}
+      assert_receive {:fake_nif, :load_ticket, [1, pcm, 22_050, 2]}
       assert byte_size(pcm) == 500 * 2 * 4
     end
 
-    test "a file that won't decode reaches the owner in the load's turn", %{dir: dir} do
+    test "a file that won't decode finishes its load with the reason", %{dir: dir} do
       assert :ok = Native.load_sample("b", Path.join(dir, "nope.wav"))
-      assert_receive {:fake_nif, :load_ticket_failed, ["b", {0, _}, :not_found]}
+      assert_receive {:fake_nif, :load_ticket_failed, [1, :not_found]}
+    end
+
+    test "a decode that crashes still finishes its load, so the loader doesn't wait for it",
+         %{dir: dir} do
+      path = wav!(dir, "c.wav", 300, 48_000, 1, fn _, _ -> 0.1 end)
+      FakeAudioNif.answer(:load_ticket, fn _ticket, _pcm, _rate, _ch -> raise "boom" end)
+      assert :ok = Native.load_sample("c", path)
+      assert_receive {:fake_nif, :load_ticket_failed, [1, :decode_error]}, 2_000
     end
 
     test "not the owner (or no slot): answered at once, nothing decodes", %{dir: dir} do
       FakeAudioNif.answer(:load_claim, {:error, :too_many_samples})
       assert {:error, :too_many_samples} = Native.load_sample("c", Path.join(dir, "x.wav"))
       refute_receive {:fake_nif, :load_ticket_failed, _}, 100
-    end
-
-    test "decoding failures the loader doesn't know go as :decode_error" do
-      ticket = {0, 1}
-      assert :ok = Decode.load("d", ticket, "/")
-      assert_receive {:fake_nif, :load_ticket_failed, ["d", ^ticket, reason]}
-      assert reason in [:not_found, :unsupported, :decode_error, :no_audio]
     end
   end
 end

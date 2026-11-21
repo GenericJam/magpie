@@ -51,9 +51,19 @@ plugin calls it only on API 31+.
   closes the stream, so a close is never taken for a loss.
 - Sample loads and imports decode with `decode_stream/3` in an Elixir
   process (the caller for imports, a task for `load_sample/2`), each chunk
-  made into the library's form by the NIF (`import_chunk/2`); a file load
-  claims its turn among the loads and unloads of its id first
-  (`load_claim/1`), so the request order still decides which load wins.
+  made into the library's form by the NIF (`import_chunk/2`). A file load
+  is queued in the loader when it is claimed (`load_claim/1`, pending
+  until its decode hands over the PCM or the failure; `c_src/load_queue.c`),
+  so loads, and their `loaded` messages, finish in the order they were
+  made, as when the loader decoded files itself: `Magpie.Engine` hands
+  each `loaded` to the caller waiting longest for that id. A watcher
+  reports a crashed decode as `:decode_error`; the loader gives up on a
+  pending load after 10 minutes.
+- Opening an input closes the one before, its stream included, before the
+  NIF makes the new one opening, so a reopen the plugin had under way for
+  the old mic can't pass for the new one. The plugin calls `STARTED`
+  before it starts a stream and `STOPPED` if the start fails, so the
+  preset fallback opens a fresh input (and id) for its second try.
 - Other apps' audio stays Android's (`plugins/magpie_capture`); on iOS
   the NIF answers `{:error, :unsupported}`, `Engine.input_sources/0`
   says `[:mic]` and the Record screen shows the source disabled.

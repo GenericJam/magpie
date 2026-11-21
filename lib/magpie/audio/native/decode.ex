@@ -39,15 +39,15 @@ defmodule Magpie.Audio.Native.Decode do
   end
 
   @doc """
-  Finish the file load `ticket` (`Magpie.Audio.Nif.load_claim/1`) of
-  sample `id` from `path`: the decoded PCM goes to the loader, or the
-  failure to the owner, in the load's turn.
+  Finish the file load `ticket` (`Magpie.Audio.Nif.load_claim/1`) from
+  `path`: the decoded PCM goes to the loader, or the failure to the owner,
+  in the load's turn.
   """
-  @spec load(term(), term(), Path.t()) :: :ok | {:error, term()}
-  def load(id, ticket, path) do
+  @spec load(pos_integer(), Path.t()) :: :ok | {:error, term()}
+  def load(ticket, path) do
     case decode(path) do
-      {:ok, d} -> @nif.load_ticket(id, ticket, d.pcm, d.rate, d.channels)
-      {:error, reason} -> @nif.load_ticket_failed(id, ticket, load_reason(reason))
+      {:ok, d} -> @nif.load_ticket(ticket, d.pcm, d.rate, d.channels)
+      {:error, reason} -> @nif.load_ticket_failed(ticket, load_reason(reason))
     end
   end
 

@@ -460,8 +460,11 @@ the engine's own AAudio code from before MOB-531 (the numbers on
   presentation time, a live hit stamped where it was heard, the mic opening,
   capture times with and without `present_ns`, a lost mic and a reopen that
   feeds nothing, the count-in through an output and an input latency
-  starting the take on the frame heard at the downbeat, the import chunks).
-  Also with `-g -O1 -fsanitize=address,undefined`.
+  starting the take on the frame heard at the downbeat, the import chunks,
+  and the loader's queue (`c_src/load_queue.c`: a file load claimed before
+  a PCM load of the same id finishes first, a decode that never reports
+  fails as `:decode_error` after the timeout). Also with `-g -O1
+  -fsanitize=address,undefined` and `-fsanitize=thread`.
 - The NIF, every platform, `-Werror`: `$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang
   --target=aarch64-linux-android28 --sysroot=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/sysroot
   -I ~/.mob/cache/otp-android-*/erts-*/include

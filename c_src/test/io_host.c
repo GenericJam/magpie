@@ -23,6 +23,7 @@
 #include <stdlib.h>
 
 #include "../magpie_io.c"
+#include "../load_queue.c"
 
 #define RATE 48000
 #define BLOCK 240               /* 5 ms */
@@ -420,6 +421,74 @@ static void test_import_chunk(void) {
     free(o2);
 }
 
+/* ── The loader's queue (load_queue.c) ───────────────────────────────────── */
+
+typedef struct {
+    lq_job q;
+    const char *name;
+    int value;
+} test_job;
+
+static lq_queue LQ;
+static const char *taken[8];
+static _Atomic int n_taken;
+
+static void *taker(void *arg) {
+    int n = *(int *)arg;
+    for (int i = 0; i < n; i++) {
+        test_job *j = (test_job *)lq_take(&LQ, 5000);
+        taken[atomic_load(&n_taken)] = j->name;
+        atomic_fetch_add(&n_taken, 1);
+    }
+    return NULL;
+}
+
+static void fill_value(lq_job *q, void *arg) { ((test_job *)q)->value = *(int *)arg; }
+
+static void sleep_ms(int ms) {
+    struct timespec ts = {0, ms * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
+static void test_load_queue(void) {
+    printf("the loader's queue (load order kept across decodes)\n");
+    lq_init(&LQ);
+    /* A file load (pending, ticket 1), then a PCM load of the same id: the
+     * PCM load waits for the file's turn. */
+    test_job a = {.q = {.request = 1, .pending = true}, .name = "file"};
+    test_job b = {.name = "pcm"};
+    lq_push(&LQ, &a.q);
+    lq_push(&LQ, &b.q);
+    pthread_t t;
+    int two = 2, three = 3;
+    atomic_store(&n_taken, 0);
+    pthread_create(&t, NULL, taker, &two);
+    sleep_ms(50);
+    CHECK(atomic_load(&n_taken) == 0, "the PCM load waits behind the pending file load");
+    CHECK(lq_fill(&LQ, 1, fill_value, &three), "the file's decode hands its result over");
+    pthread_join(t, NULL);
+    CHECK(n_taken == 2 && strcmp(taken[0], "file") == 0 && strcmp(taken[1], "pcm") == 0 && a.value == 3 &&
+              !a.q.failure,
+          "they finish in the order they were made: %s, then %s", n_taken > 0 ? taken[0] : "-",
+          n_taken > 1 ? taken[1] : "-");
+    CHECK(!lq_fill(&LQ, 1, fill_value, &three) && !lq_fill(&LQ, 99, fill_value, &three),
+          "a finished or unknown ticket fills nothing");
+
+    /* A decode that finishes before its turn: no wait. */
+    test_job c = {.q = {.request = 2, .pending = true}, .name = "early"};
+    lq_push(&LQ, &c.q);
+    CHECK(lq_fill(&LQ, 2, fill_value, &two), "filled while still queued");
+    CHECK(lq_take(&LQ, 0) == &c.q && c.value == 2 && !c.q.failure, "taken at once");
+
+    /* A decode nobody finishes: given up as decode_error, and too late after. */
+    test_job d = {.q = {.request = 3, .pending = true}, .name = "lost"};
+    lq_push(&LQ, &d.q);
+    lq_job *got = lq_take(&LQ, 30);
+    CHECK(got == &d.q && !d.q.pending && d.q.failure && strcmp(d.q.failure, "decode_error") == 0,
+          "a pending load nobody finishes fails as decode_error after the timeout");
+    CHECK(!lq_fill(&LQ, 3, fill_value, &two), "its late result fills nothing");
+}
+
 int main(void) {
     mio_init();
     test_register();
@@ -429,6 +498,7 @@ int main(void) {
     test_mic_events();
     test_count_in_through_streams();
     test_import_chunk();
+    test_load_queue();
     collect();
     printf("%s: %d failure%s\n", failures ? "FAILED" : "passed", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;

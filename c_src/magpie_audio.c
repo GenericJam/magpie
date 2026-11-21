@@ -104,6 +104,7 @@
 /* The processors, the sampler and the recorder (mob_audio_io.h with them). */
 #include "magpie_io.c"
 #include "midi_out.c"
+#include "load_queue.c"
 
 #define MAX_SECONDS 300 /* longest sample a load accepts */
 #define EVENT_PERIOD_US 2000
@@ -135,12 +136,13 @@ typedef struct {
     size_t bytes;
 } id_entry;
 
-/* A load: f32 PCM (`pcm`, held in `env`), or a failure to report in order
- * (`failure`: the file's decode failed). */
+/* A load: f32 PCM (`pcm`, held in `env`), or a failure to report
+ * (`q.failure`). A file load is queued pending when it is claimed
+ * (load_claim/1), and its decode finishes it (load_ticket/4,
+ * load_ticket_failed/2): see load_queue.c. */
 typedef struct load_job {
-    struct load_job *next;
+    lq_job q; /* first: the queue's link, ticket, pending, failure */
     ERL_NIF_TERM pcm;
-    const char *failure;
     int source_rate, channels;
     int slot;
     uint64_t request;
@@ -151,7 +153,7 @@ typedef struct load_job {
 
 static struct {
     pthread_mutex_t lock, jobs_lock, stats_lock;
-    pthread_cond_t jobs_cv;
+    lq_queue loads;
 
     /* Under OUT.ctl. */
     bool events_alive; /* the event thread runs (it alone frees garbage then) */
@@ -166,7 +168,6 @@ static struct {
     _Atomic bool events_run;
 
     /* Under jobs_lock. */
-    load_job *jobs_head, *jobs_tail;
     bool loader_started;
 
     /* Trigger latency, newest LATENCIES (under stats_lock). */
@@ -384,7 +385,7 @@ static const char *convert_pcm(load_job *job, decoded *d) {
 static void run_job(load_job *job) {
     int64_t t0 = now_ns();
     decoded d = {0};
-    const char *failure = job->failure ? job->failure : convert_pcm(job, &d);
+    const char *failure = job->q.failure ? job->q.failure : convert_pcm(job, &d);
     sp_sample *s = NULL;
     if (!failure) {
         int64_t frames = d.frames;
@@ -448,15 +449,15 @@ static void free_job(load_job *job) {
     free(job);
 }
 
+/* How long the loader waits for a claimed file's decode before giving it
+ * up (Magpie.Audio.Native reports a crashed decode itself; this is for a
+ * decode nobody will ever finish). */
+#define PENDING_TIMEOUT_MS (600 * 1000)
+
 static void *loader_main(void *arg) {
     (void)arg;
     for (;;) {
-        pthread_mutex_lock(&E.jobs_lock);
-        while (!E.jobs_head) pthread_cond_wait(&E.jobs_cv, &E.jobs_lock);
-        load_job *job = E.jobs_head;
-        E.jobs_head = job->next;
-        if (!E.jobs_head) E.jobs_tail = NULL;
-        pthread_mutex_unlock(&E.jobs_lock);
+        load_job *job = (load_job *)lq_take(&E.loads, PENDING_TIMEOUT_MS);
         run_job(job);
         free_job(job);
     }
@@ -1309,14 +1310,7 @@ static bool ensure_loader(void) {
     return ok;
 }
 
-static void queue_job(load_job *job) {
-    pthread_mutex_lock(&E.jobs_lock);
-    if (E.jobs_tail) E.jobs_tail->next = job;
-    else E.jobs_head = job;
-    E.jobs_tail = job;
-    pthread_cond_signal(&E.jobs_cv);
-    pthread_mutex_unlock(&E.jobs_lock);
-}
+static void queue_job(load_job *job) { lq_push(&E.loads, &job->q); }
 
 /* Claim (or reuse) sample `id`'s slot for a new request, making every
  * earlier load of it stale: the slot, or -1 with `*failure` set. Caller
@@ -1374,87 +1368,83 @@ static ERL_NIF_TERM nif_load_pcm(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
 
 /* load_claim(Id) -> {ok, Ticket} | {error, not_owner | too_many_samples}:
  * a file load of sample Id begins (Magpie.Audio.Native decodes it): the
- * slot is claimed now, so loads and unloads of Id keep the order they were
- * made in. load_ticket/5 or load_ticket_failed/3 finishes it. */
+ * slot is claimed and the load queued now, pending, so loads and unloads of
+ * Id keep the order they were made in, and so do their `loaded` messages.
+ * load_ticket/4 or load_ticket_failed/2 with Ticket finishes it. */
 static ERL_NIF_TERM nif_load_claim(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
-    const char *failure = NULL;
-    uint64_t request = 0;
-    int slot = -1;
-    pthread_mutex_lock(&OUT.ctl);
-    if (!is_owner(env)) failure = "not_owner";
-    else slot = claim_slot_locked(argv[0], &request, &failure);
-    pthread_mutex_unlock(&OUT.ctl);
-    if (failure) return error_tuple(env, failure);
-    return enif_make_tuple2(env, ok_atom(env),
-                            enif_make_tuple2(env, enif_make_int(env, slot), enif_make_uint64(env, request)));
-}
-
-static bool get_ticket(ErlNifEnv *env, ERL_NIF_TERM term, int *slot, uint64_t *request) {
-    const ERL_NIF_TERM *t;
-    int arity;
-    ErlNifUInt64 r;
-    if (!enif_get_tuple(env, term, &arity, &t) || arity != 2 || !get_range(env, t[0], 0, SP_SLOTS - 1, slot) ||
-        !enif_get_uint64(env, t[1], &r))
-        return false;
-    *request = r;
-    return true;
-}
-
-/* load_ticket(Id, Ticket, Pcm, Rate, Channels) -> ok | {error, thread |
- * alloc}: the claimed load's decoded f32le PCM, as load_pcm/4 (stale if
- * Id was loaded or unloaded since the claim: {error, cancelled}). Anyone
- * (the decoding process). */
-static ERL_NIF_TERM nif_load_ticket(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
-    int slot, rate, channels;
-    uint64_t request;
-    if (!get_ticket(env, argv[1], &slot, &request) || !enif_is_binary(env, argv[2]) ||
-        !get_range(env, argv[3], 1000, 384000, &rate) || !get_range(env, argv[4], 1, 8, &channels))
-        return enif_make_badarg(env);
     if (!ensure_loader()) return error_tuple(env, "thread");
     load_job *job = calloc(1, sizeof(*job));
     if (!job) return error_tuple(env, "alloc");
     job->env = enif_alloc_env();
-    job->pcm = enif_make_copy(job->env, argv[2]);
-    job->source_rate = rate;
-    job->channels = channels;
-    job->slot = slot;
-    job->request = request;
-    job->rate = mio_rate();
     job->id = enif_make_copy(job->env, argv[0]);
+    job->q.pending = true;
+    const char *failure = NULL;
+    pthread_mutex_lock(&OUT.ctl);
+    if (!is_owner(env)) failure = "not_owner";
+    else job->slot = claim_slot_locked(argv[0], &job->request, &failure);
+    job->rate = mio_rate();
+    pthread_mutex_unlock(&OUT.ctl);
+    if (failure) {
+        free_job(job);
+        return error_tuple(env, failure);
+    }
+    uint64_t ticket = job->q.request = job->request;
     queue_job(job);
-    return ok_atom(env);
+    return enif_make_tuple2(env, ok_atom(env), enif_make_uint64(env, ticket));
 }
 
-/* load_ticket_failed(Id, Ticket, Reason) -> ok | {error, thread | alloc}:
- * the claimed load's file didn't decode; the owner hears {error, Reason}
- * (in order with the loads queued before it). Anyone. */
+typedef struct {
+    ERL_NIF_TERM pcm;
+    int rate, channels;
+    const char *failure;
+} ticket_fill;
+
+/* lq_fill's: the decode's PCM, or its failure, into the pending job. */
+static void fill_job(lq_job *q, void *arg) {
+    load_job *job = (load_job *)q;
+    const ticket_fill *f = arg;
+    if (f->failure) {
+        job->q.failure = f->failure;
+        return;
+    }
+    job->pcm = enif_make_copy(job->env, f->pcm);
+    job->source_rate = f->rate;
+    job->channels = f->channels;
+}
+
+/* load_ticket(Ticket, Pcm, Rate, Channels) -> ok | {error, not_pending}:
+ * the claimed load's decoded f32le PCM (as load_pcm/4; a load of the same
+ * Id made since the claim makes it {error, cancelled}). Anyone (the
+ * decoding process). */
+static ERL_NIF_TERM nif_load_ticket(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    ErlNifUInt64 ticket;
+    int rate, channels;
+    if (!enif_get_uint64(env, argv[0], &ticket) || !enif_is_binary(env, argv[1]) ||
+        !get_range(env, argv[2], 1000, 384000, &rate) || !get_range(env, argv[3], 1, 8, &channels))
+        return enif_make_badarg(env);
+    ticket_fill f = {argv[1], rate, channels, NULL};
+    return lq_fill(&E.loads, ticket, fill_job, &f) ? ok_atom(env) : error_tuple(env, "not_pending");
+}
+
+/* load_ticket_failed(Ticket, Reason) -> ok | {error, not_pending}: the
+ * claimed load's file didn't decode; the owner hears {error, Reason} in the
+ * load's turn. Anyone. */
 static ERL_NIF_TERM nif_load_ticket_failed(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     static const char *reasons[] = {"not_found", "unsupported", "no_audio", "decode_error",
                                     "too_long",  "alloc",       "busy",     "cancelled"};
-    int slot;
-    uint64_t request;
+    ErlNifUInt64 ticket;
     char name[16];
     const char *reason = NULL;
-    if (!get_ticket(env, argv[1], &slot, &request) ||
-        !enif_get_atom(env, argv[2], name, sizeof(name), ERL_NIF_LATIN1))
+    if (!enif_get_uint64(env, argv[0], &ticket) || !enif_get_atom(env, argv[1], name, sizeof(name), ERL_NIF_LATIN1))
         return enif_make_badarg(env);
     for (size_t i = 0; i < sizeof(reasons) / sizeof(reasons[0]) && !reason; i++)
         if (strcmp(name, reasons[i]) == 0) reason = reasons[i];
     if (!reason) return enif_make_badarg(env);
-    if (!ensure_loader()) return error_tuple(env, "thread");
-    load_job *job = calloc(1, sizeof(*job));
-    if (!job) return error_tuple(env, "alloc");
-    job->env = enif_alloc_env();
-    job->failure = reason;
-    job->slot = slot;
-    job->request = request;
-    job->rate = mio_rate();
-    job->id = enif_make_copy(job->env, argv[0]);
-    queue_job(job);
-    return ok_atom(env);
+    ticket_fill f = {0, 0, 0, reason};
+    return lq_fill(&E.loads, ticket, fill_job, &f) ? ok_atom(env) : error_tuple(env, "not_pending");
 }
 
 /* import_chunk(Chunk, Channels) -> {Pcm, Peaks}: a decoded chunk of
@@ -2137,7 +2127,7 @@ static int on_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     for (int i = 0; i < MIDI_SOURCES; i++) pthread_mutex_init(&MI.sources[i].lock, NULL);
     pthread_mutex_init(&E.jobs_lock, NULL);
     pthread_mutex_init(&E.stats_lock, NULL);
-    pthread_cond_init(&E.jobs_cv, NULL);
+    lq_init(&E.loads);
     mio_init();
     /* The output and the mic: open/1 refuses without them. */
     E.io_registered = mio_register();
@@ -2162,8 +2152,8 @@ static ErlNifFunc nif_funcs[] = {
     {"reset", 0, nif_reset, 0},
     {"load_pcm", 4, nif_load_pcm, 0},
     {"load_claim", 1, nif_load_claim, 0},
-    {"load_ticket", 5, nif_load_ticket, 0},
-    {"load_ticket_failed", 3, nif_load_ticket_failed, 0},
+    {"load_ticket", 4, nif_load_ticket, 0},
+    {"load_ticket_failed", 2, nif_load_ticket_failed, 0},
     {"import_chunk", 2, nif_import_chunk, 0},
     {"unload_sample", 1, nif_unload_sample, 0},
     {"set_pad", 3, nif_set_pad, 0},

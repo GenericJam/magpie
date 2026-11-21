@@ -30,6 +30,8 @@ defmodule Magpie.Audio.Native do
 
   @behaviour Magpie.Audio
 
+  require Logger
+
   alias Magpie.Audio.Native.{Decode, Io}
 
   @nif Application.compile_env(:magpie, :audio_nif, Magpie.Audio.Nif)
@@ -49,16 +51,27 @@ defmodule Magpie.Audio.Native do
   @impl true
   def reset, do: @nif.reset()
 
-  # The file is decoded in a process of its own (the engine stays free);
-  # the claim keeps this load in order with the other loads and unloads of
-  # `id`, and the result reaches the owner as `:loaded`, as for load_pcm/4.
+  # The file is decoded in a process of its own (the engine stays free).
+  # The claim queues the load now, pending, so it finishes (and its
+  # `:loaded` goes out) in the order loads were made, as for load_pcm/4. A
+  # decode that dies before handing over its result still finishes the load
+  # (`:decode_error`), so the loads queued behind it never wait for it.
   @impl true
   def load_sample(id, path) do
     path = IO.chardata_to_string(path)
 
     with {:ok, ticket} <- @nif.load_claim(id) do
-      {:ok, _pid} = Task.start(Decode, :load, [id, ticket, path])
+      {:ok, _pid} = Task.start(fn -> watch_load(ticket, path) end)
       :ok
+    end
+  end
+
+  defp watch_load(ticket, path) do
+    {pid, ref} = spawn_monitor(Decode, :load, [ticket, path])
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, :normal} -> :ok
+      {:DOWN, ^ref, :process, ^pid, _crash} -> @nif.load_ticket_failed(ticket, :decode_error)
     end
   end
 
@@ -140,32 +153,50 @@ defmodule Magpie.Audio.Native do
   @impl true
   def input_sources, do: @nif.input_sources()
 
-  # The NIF closes what was open, then opens: the mic as an input waiting
-  # for its stream, which Io opens next (the stream before it closed
-  # first). A mic that can't open leaves no input, as before.
+  # What was open goes first, its stream included (`input_close/0`: the NIF
+  # shuts the input, then Io closes the mic stream), so nothing of the old
+  # stream (a reopen the plugin had under way) can be taken for the new
+  # input's. Then the NIF opens the new input and, for the mic, Io its
+  # stream. A mic that can't open leaves no input, as before.
   @impl true
   def input_open(source) when source in [:mic, :apps] do
-    case @nif.input_open(source) do
-      {:error, :not_owner} = error ->
-        error
-
-      {:ok, id, rate} ->
-        :ok = Io.close_mic()
-
-        case Io.open_mic(rate) do
-          :ok ->
-            {:ok, id}
-
-          {:error, _} = error ->
-            :ok = @nif.input_close()
-            error
-        end
-
-      result ->
-        :ok = Io.close_mic()
-        result
+    with :ok <- input_close() do
+      if source == :mic, do: open_mic([:unprocessed, :default]), else: @nif.input_open(:apps)
     end
   end
+
+  # The plugin tells the processor STARTED before it starts the stream and
+  # STOPPED when the start fails, so a refused preset leaves the input
+  # closed (as lost): the next preset gets a fresh input (and id) from the
+  # NIF, and only the id of the one that opened is answered.
+  defp open_mic([preset | fallbacks]) do
+    with {:ok, id, rate} <- @nif.input_open(:mic) do
+      case Io.open_mic(rate, preset) do
+        :ok ->
+          {:ok, id}
+
+        {:error, {:unavailable, detail}} when fallbacks != [] ->
+          Logger.info(
+            "[magpie_audio] #{preset} input refused (#{detail}): #{hd(fallbacks)} instead"
+          )
+
+          open_mic(fallbacks)
+
+        {:error, reason} ->
+          :ok = @nif.input_close()
+          {:error, mic_error(reason)}
+      end
+    end
+  end
+
+  defp mic_error(:permission), do: :no_permission
+
+  defp mic_error({:unavailable, detail}) do
+    Logger.warning("[magpie_audio] no microphone: #{detail}")
+    :input_unavailable
+  end
+
+  defp mic_error(reason), do: reason
 
   @impl true
   def input_close do

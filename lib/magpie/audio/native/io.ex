@@ -16,10 +16,10 @@ defmodule Magpie.Audio.Native.Io do
   plugin event with a `[mob_audio_io]` prefix; this process logs what it
   decides with `[magpie_audio]`.
 
-  The microphone opens mono at the engine's rate, `:unprocessed` (no AGC
-  or noise suppression; iOS's Measurement mode), and falls back to the
-  platform's default preset (Android's VOICE_RECOGNITION) when the device
-  refuses it.
+  The microphone opens mono at the engine's rate with the preset
+  `Magpie.Audio.Native` asks for (`:unprocessed` first: no AGC or noise
+  suppression, iOS's Measurement mode; the platform's default when that is
+  refused).
   """
 
   use GenServer
@@ -61,12 +61,12 @@ defmodule Magpie.Audio.Native.Io do
   def close_output, do: call(:close_output, :ok)
 
   @doc """
-  Open the microphone at `rate` for the input the NIF just made opening
-  (any mic stream before is closed): `:ok`, or `{:error, :no_permission |
-  :input_unavailable | reason}`.
+  Open the microphone at `rate` with `preset` for the input the NIF just
+  made opening (any mic stream before is closed): `:ok`, or the plugin's
+  `{:error, reason}`.
   """
-  @spec open_mic(pos_integer()) :: :ok | {:error, term()}
-  def open_mic(rate) when is_integer(rate), do: call({:open_mic, rate})
+  @spec open_mic(pos_integer(), MobAudioIo.preset()) :: :ok | {:error, term()}
+  def open_mic(rate, preset) when is_integer(rate), do: call({:open_mic, rate, preset})
 
   @doc "Close the microphone's stream (`:ok` with none)."
   @spec close_mic() :: :ok
@@ -115,12 +115,13 @@ defmodule Magpie.Audio.Native.Io do
 
   def handle_call(:close_output, _from, s), do: {:reply, :ok, close(s, :output)}
 
-  def handle_call({:open_mic, rate}, _from, s) do
+  def handle_call({:open_mic, rate, preset}, _from, s) do
     s = close(s, :mic)
+    opts = [processor: "magpie_mic", module: @nif, rate: rate, input_channels: 1, preset: preset]
 
-    case open_mic(rate, :unprocessed) do
+    case MobAudioIo.open(self(), :input, opts) do
       {:ok, stream} -> {:reply, :ok, %{s | mic: stream}}
-      {:error, reason} -> {:reply, {:error, mic_error(reason)}, s}
+      {:error, _} = error -> {:reply, error, s}
     end
   end
 
@@ -159,30 +160,6 @@ defmodule Magpie.Audio.Native.Io do
     s |> close(:mic) |> close(:output)
     :ok
   end
-
-  # The preset the device refuses, then its default (Android's
-  # VOICE_RECOGNITION), as the engine did before the plugin.
-  defp open_mic(rate, preset) do
-    opts = [processor: "magpie_mic", module: @nif, rate: rate, input_channels: 1, preset: preset]
-
-    case MobAudioIo.open(self(), :input, opts) do
-      {:error, {:unavailable, detail}} when preset == :unprocessed ->
-        Logger.info("[magpie_audio] unprocessed input refused (#{detail}): the default preset")
-        open_mic(rate, :default)
-
-      result ->
-        result
-    end
-  end
-
-  defp mic_error(:permission), do: :no_permission
-
-  defp mic_error({:unavailable, detail}) do
-    Logger.warning("[magpie_audio] no microphone: #{detail}")
-    :input_unavailable
-  end
-
-  defp mic_error(reason), do: reason
 
   defp close(s, which) do
     case Map.fetch!(s, which) do

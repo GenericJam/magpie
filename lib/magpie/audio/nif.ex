@@ -41,22 +41,27 @@ defmodule Magpie.Audio.Nif do
   def load_pcm(_id, _pcm, _rate, _channels), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
-  A file load of sample `id` begins (owner only): `{:ok, ticket}`, its
-  place among the loads and unloads of `id`. `load_ticket/5` or
-  `load_ticket_failed/3` finishes it; the result arrives as a `:loaded`
-  message.
+  A file load of sample `id` begins (owner only): `{:ok, ticket}`. The load
+  is queued now, pending, so loads and unloads of `id` keep their order and
+  so do their `:loaded` messages; `load_ticket/4` or `load_ticket_failed/2`
+  finishes it (the loader gives up after 10 minutes as `:decode_error`).
   """
   def load_claim(_id), do: :erlang.nif_error(:nif_not_loaded)
 
-  @doc "The claimed load's decoded f32le PCM (anyone); `{:error, :cancelled}` if `id` was loaded or unloaded since."
-  def load_ticket(_id, _ticket, _pcm, _rate, _channels), do: :erlang.nif_error(:nif_not_loaded)
+  @doc """
+  The claimed load's decoded f32le PCM (anyone): `:ok`, or `{:error,
+  :not_pending}` once it finished. A load of the same id made since the
+  claim makes it `{:error, :cancelled}` for the owner.
+  """
+  def load_ticket(_ticket, _pcm, _rate, _channels), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
   The claimed load's file didn't decode (anyone): `reason` (`:not_found`,
   `:unsupported`, `:no_audio`, `:decode_error`, `:too_long`, `:alloc`,
-  `:busy`, `:cancelled`) reaches the owner in the load's turn.
+  `:busy`, `:cancelled`) reaches the owner in the load's turn. `{:error,
+  :not_pending}` once it finished.
   """
-  def load_ticket_failed(_id, _ticket, _reason), do: :erlang.nif_error(:nif_not_loaded)
+  def load_ticket_failed(_ticket, _reason), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
   A decoded chunk (native-endian f32, `channels` per frame) as the library

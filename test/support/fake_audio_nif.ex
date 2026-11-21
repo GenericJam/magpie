@@ -42,13 +42,13 @@ defmodule Magpie.Test.FakeAudioNif do
   def close, do: call(:close, [], fn -> :ok end)
   def reset, do: call(:reset, [], fn -> :ok end)
   def load_pcm(id, pcm, rate, ch), do: call(:load_pcm, [id, pcm, rate, ch], fn -> :ok end)
-  def load_claim(id), do: call(:load_claim, [id], fn -> {:ok, {0, next_id()}} end)
+  def load_claim(id), do: call(:load_claim, [id], fn -> {:ok, next_id()} end)
 
-  def load_ticket(id, ticket, pcm, rate, ch),
-    do: call(:load_ticket, [id, ticket, pcm, rate, ch], fn -> :ok end)
+  def load_ticket(ticket, pcm, rate, ch),
+    do: call(:load_ticket, [ticket, pcm, rate, ch], fn -> :ok end)
 
-  def load_ticket_failed(id, ticket, reason),
-    do: call(:load_ticket_failed, [id, ticket, reason], fn -> :ok end)
+  def load_ticket_failed(ticket, reason),
+    do: call(:load_ticket_failed, [ticket, reason], fn -> :ok end)
 
   def import_chunk(chunk, channels), do: library_form(chunk, channels)
   def unload_sample(id), do: call(:unload_sample, [id], fn -> :ok end)
@@ -97,9 +97,10 @@ defmodule Magpie.Test.FakeAudioNif do
   # ±1, and a peak byte per 256 frames.
   defp library_form(chunk, channels) do
     keep = min(channels, 2)
+    frame_bytes = 4 * channels
 
     frames =
-      for <<frame::binary-size(4 * channels) <- chunk>> do
+      for <<frame::binary-size(^frame_bytes) <- chunk>> do
         for <<x::float-32-native <- binary_part(frame, 0, 4 * keep)>>,
           do: x |> max(-1.0) |> min(1.0)
       end
