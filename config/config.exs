@@ -9,8 +9,9 @@ config :magpie, ecto_repos: [Magpie.Repo]
 # state persistence. Remove this line to disable screen state persistence.
 config :mob, :repo, Magpie.Repo
 
-# The audio engine: the magpie_audio NIF on the phone, a fake the tests drive
-# on the host. MIDI devices likewise: mob_midi, or a fake of it.
+# The audio engine: Magpie.Audio.Native (the magpie_audio NIF over
+# mob_audio_io's streams) on the phone, a fake the tests drive on the host.
+# MIDI devices likewise: mob_midi, or a fake of it.
 config :magpie,
   audio: if(config_env() == :test, do: Magpie.Audio.Fake, else: Magpie.Audio.Native),
   midi: if(config_env() == :test, do: Magpie.Midi.Fake, else: MobMidi)
@@ -28,4 +29,9 @@ if config_env() == :test do
   # Screens skip the phone's own calls (permission dialogs, the file picker,
   # orientation): tests drive their results as messages.
   config :magpie, device_calls: false
+
+  # Magpie.Audio.Native's own tests run it on the host: the plugin's fake
+  # streams and decodes, and a double of the magpie_audio NIF.
+  config :mob_audio_io, backend: MobAudioIo.Fake
+  config :magpie, audio_nif: Magpie.Test.FakeAudioNif
 end

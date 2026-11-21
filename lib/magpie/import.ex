@@ -1,8 +1,10 @@
 defmodule Magpie.Import do
   @moduledoc """
-  A file into the stash: `Magpie.Engine.decode/1` (MediaCodec on the
-  phone: wav, mp3, m4a, flac, ogg…) and `Magpie.Library.put_pcm/2` with
-  the engine's peaks, `source: :imported` by default.
+  A file into the stash: `Magpie.Engine.decode/1` (the phone's decoder
+  through mob_audio_io: AMediaCodec on Android, ExtAudioFile on iOS; wav,
+  mp3, m4a, flac…) and `Magpie.Library.put_pcm/2` with the engine's peaks,
+  `source: :imported` by default. The decode runs in the caller and stops
+  with it (a screen's cancelled import task).
 
   AIFF, AIFF-C and WAV files the phone's decoder refuses go through
   `Magpie.Aiff` or `Magpie.Wav`: decoded here, written as a float WAV to

@@ -3,7 +3,9 @@ defmodule Magpie.RecordScreen do
   Record a sample (`design/boards/Record.dc.html`, landscape, HANDOFF §5).
 
   Left: back, the title and the sources (Microphone, FMutate shown
-  disabled until pairing exists, Other apps, Import a file). Right: the
+  disabled until pairing exists, Other apps (disabled, "not on this
+  phone", where `Magpie.Engine.input_sources/0` lacks it: iOS), Import a
+  file). Right: the
   waveform card (one `<Canvas>`: the recording's peaks as 120 bars, the
   playhead, a status chip and the magpie), the IN meter, the start mode
   (Now / When sound starts / Count in 1 bar) and Record / Stop.
@@ -121,6 +123,7 @@ defmodule Magpie.RecordScreen do
         tick: nil,
         saved: nil,
         import_name: nil,
+        sources: Engine.input_sources(),
         notice: nil
       )
 
@@ -228,8 +231,12 @@ defmodule Magpie.RecordScreen do
 
   defp sources, do: @sources
 
+  # Other apps' audio is Android's (MediaProjection): elsewhere the row is
+  # shown disabled, as FMutate's is until pairing exists.
   defp source_row(key, source, assigns) do
-    disabled = key == :fmutate
+    unavailable = key == :apps and :apps not in assigns.sources
+    disabled = key == :fmutate or unavailable
+    source = if unavailable, do: %{source | sub: "not on this phone"}, else: source
     selected = key == assigns.selected
     tap = if not disabled, do: {self(), {:source, key}}
 

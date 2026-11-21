@@ -51,9 +51,11 @@ installed and no account; pairing only adds.
 
 **Scope decisions (Kevin, 2026-11-12):**
 
-- **Android only for now.** iOS is a later port (Choir Coach's
-  `plugins/choir_audio_ios` shows how). Keep Elixir platform-neutral where
-  it costs nothing; the generated `ios/` tree stays.
+- **Android only for now.** iOS is a later port. The audio engine is
+  ready for it (MOB-531: `mob_audio_io`'s streams, mob_midi 0.4's C ABI on
+  CoreMIDI, `archs: [:all]`, the iOS simulator app links); nothing has run
+  on an iPhone yet. Keep Elixir platform-neutral where it costs nothing;
+  the generated `ios/` tree stays.
 - **Standalone first.** No pairing in the first milestones: FMutate doesn't
   exist yet, its protocol v1 has no record call or library sharing, and
   Humdinger has no pairing server. The Connect screen and a family protocol
@@ -234,18 +236,19 @@ at the end, the progress line on every file.
 pad on_touch (MOB-518: pointer id, y in pad) ─► velocity ─► Engine.trigger ─┐
 MIDI in (mob_midi) ─────────────────────────────────────────────────────────┤
                                                                             ▼
-             audio engine (C NIF, AAudio): voice pool, choke groups, sequencer clock (96 PPQN, swing)
+             audio engine (C NIF on mob_audio_io): voice pool, choke groups, sequencer clock (96 PPQN, swing)
                                                                             │
                          events (step played, playhead, voice ended) ◄──────┘ ─► screens
 ```
 
 - **Timing lives in the audio thread.** The Android BEAM runs one
   scheduler, so sequencer steps, swing and MIDI clock are scheduled in the
-  engine's AAudio callback, not by BEAM timers. The BEAM edits patterns and
+  engine's audio callback, not by BEAM timers. The BEAM edits patterns and
   receives playhead/step events for display.
 - **Engine base:** Choir Coach's `c_src/choir_audio.c` (AAudio via dlopen,
   low-latency shared float stream, NDK MediaCodec decode, `getTimestamp`
-  clock mapping, mic input), reworked into a sampler. Behind a behaviour
+  clock mapping, mic input), reworked into a sampler; since MOB-531 the
+  streams and decoding are `mob_audio_io`'s (below). Behind a behaviour
   with `Native` and `Fake` implementations so screens test on the host
   (the Choir Coach / Humdinger pattern).
 - **Library:** sample audio as files under `Mob.Storage.dir(:app_support)`,
@@ -255,14 +258,25 @@ MIDI in (mob_midi) ────────────────────�
 
 ## The audio engine
 
-`c_src/magpie_audio.c` is a static NIF (`mob.exs` `:static_nifs`, Android
-only), `ERL_NIF_INIT(Elixir.Magpie.Audio.Nif, …)`. It includes
-`c_src/sampler.c`, plain C (no Android, no erl_nif) that builds on the Mac:
-voices, choke, the sequencer, the queues, the resampler. Elixir side:
-`Magpie.Audio` (the behaviour; `Native` on the phone, `Fake` in host tests,
-`config :magpie, :audio`) owned by **`Magpie.Engine`**, one GenServer
-started in `App.on_start`. Why it is built this way:
-`decisions/2026-11-12-audio-engine-design.md`.
+`c_src/magpie_audio.c` is a static NIF (`mob.exs` `:static_nifs`, `archs:
+[:all]`), `ERL_NIF_INIT(Elixir.Magpie.Audio.Nif, …)`. It includes
+`c_src/magpie_io.c` (the two `mob_audio_io` processors and the state they
+share with the NIF), which includes `c_src/sampler.c` and
+`c_src/recorder.c`: plain C (no platform API, no erl_nif) that builds on
+the Mac: voices, choke, the sequencer, the queues, the resampler, the
+recorder. The streams belong to the **`mob_audio_io`** plugin
+(`deps/mob_audio_io`, AAudio on Android, RemoteIO and the `AVAudioSession`
+on iOS; `#include "../deps/mob_audio_io/priv/include/mob_audio_io.h"`),
+and so does file decoding (AMediaCodec, ExtAudioFile). The NIF registers
+`"magpie_out"` (render: `sp_render`) and `"magpie_mic"` (capture: the
+recorder) when it loads; `Magpie.Audio.Native.Io` opens their streams
+(`MobAudioIo.open/3`). The only platform code left in `c_src/` is the
+other-apps input's JNI (Android) and the log/thread-priority calls. Elixir
+side: `Magpie.Audio` (the behaviour; `Native` on the phone, `Fake` in host
+tests, `config :magpie, :audio`) owned by **`Magpie.Engine`**, one
+GenServer started in `App.on_start`. Why it is built this way:
+`decisions/2026-11-12-audio-engine-design.md`, and for the move onto the
+plugin `decisions/2026-11-21-audio-on-mob-audio-io.md`.
 
 ### `Magpie.Engine` API
 
@@ -277,15 +291,17 @@ started in `App.on_start`. Why it is built this way:
   `state/0` so none is missed). Frames are engine frames;
   `Magpie.Audio.frame_time(clock(), frame)` is when one is heard, in
   `System.monotonic_time(:nanosecond)`.
-- **Samples:** `load_sample(id, path)` (MediaCodec: wav 16/24/float, mp3,
-  m4a, flac, ogg checked), `load_pcm(id, f32le, rate, channels)` (the
-  library's PCM, no decoder: use this for kits), both blocking the caller
-  until the sample is in RAM and returning `%{frames, channels, rate, peaks,
-  peak_frames, bytes, source_rate, load_ms}`; `decode(path)` (import: f32le
-  at the file's rate, up to 2 channels, plus peaks, for
-  `Magpie.Library.put_pcm/2`); `unload_sample/1` (clears pads using it);
-  `samples/0`, `memory/0`. Ids are library ids. Up to 256 samples, 5
-  minutes each.
+- **Samples:** `load_sample(id, path)` (the phone's decoder through
+  `MobAudioIo.decode_stream/3`; wav 16/24/float, mp3, m4a, flac and ogg
+  were checked on Android before the move), `load_pcm(id, f32le, rate,
+  channels)` (the library's PCM, no decoder: use this for kits), both
+  blocking the caller until the sample is in RAM and returning `%{frames,
+  channels, rate, peaks, peak_frames, bytes, source_rate, load_ms}`;
+  `decode(path)` (import: f32le at the file's rate, up to 2 channels,
+  clipped to ±1, plus peaks, for `Magpie.Library.put_pcm/2`; it decodes
+  in the caller and stops when the caller exits); `unload_sample/1` (clears
+  pads using it); `samples/0`, `memory/0`. Ids are library ids. Up to 256
+  samples, 5 minutes each.
 - **Peaks:** one byte per 256 frames, the largest |sample| over the
   channels, linear, 255 = full scale.
 - **Pads:** `set_pad(index, %Magpie.Kit.Pad{} | nil, stop: false)` (regions
@@ -316,14 +332,26 @@ started in `App.on_start`. Why it is built this way:
   the output latency doesn't drag the recording late. Snap on: store it
   with `tick: 0`.
 - `clock/0`, `info/0` (stream, underruns, callback timing, voices, steals,
-  trigger latency, sample bytes, dropped events); `Native.reset_stats/0`.
-  A restarted Engine resets the engine: load the kit again.
+  trigger latency, sample bytes, dropped events; the streams' own
+  `MobAudioIo.status/1` maps under `io`); `Native.reset_stats/0`. A
+  restarted Engine resets the engine: load the kit again.
 
 ### Inside
 
-- **Output:** AAudio low-latency, shared, stereo float at the device's
-  rate. Buffer 2 bursts; the event thread adds a burst after an underrun
-  and reopens the stream after a disconnect (headphones, Bluetooth).
+- **Output:** `mob_audio_io`'s output stream: low latency, shared, stereo
+  float at the device's rate. The plugin keeps it: 2 bursts of buffer on
+  Android, a burst more after an underrun, a reopen after a lost device
+  (headphones, Bluetooth) or a route change, iOS interruptions. Its stream
+  events (`STARTED`/`STOPPED`) hand the renderer's role over: the stream
+  renders at its rate (`SP_CMD_RATE`), or the control path drains.
+- **Clock:** every 20 ms the render maps the engine frame it is about to
+  render onto `mai_time.present_ns`, when that block is heard
+  (`sp_set_clock`; AAudio timestamps on Android 12+, an estimate from the
+  buffer on 8–11, `mHostTime` + the session's latency on iOS), on
+  `mai_now_ns()` (`CLOCK_MONOTONIC` on Android, `mach_absolute_time` on
+  iOS), the clock of mob_midi's timestamps too (`mob_midi_now_ns`; the NIF
+  logs a skew between the two at load). There is no `getFramesWritten`
+  offset any more: engine frames are `sp_render`'s own count.
 - **Commands:** a lock-free ring (1024) the callback drains at the start
   of each buffer: a live call sounds from the next callback's first frame.
   While no stream renders, control calls apply themselves and live calls
@@ -352,15 +380,18 @@ started in `App.on_start`. Why it is built this way:
   (Blackman-windowed sinc, 16 zero crossings), mono or stereo (more
   channels: the first two). 96 KB per second mono, 192 KB stereo at 48 kHz.
 - **Events:** an event thread every 2 ms sends one playhead, at most a
-  start and an end per pad, every hit and pattern change; it also frees
-  retired samples and patterns and refreshes the clock mapping (20 ms).
-- **Locks:** `lock` (stream lifecycle; only dirty NIFs and the event
-  thread's trylock) → `ctl` (owner, sample table) → `push` / `jobs_lock`
-  → `stats_lock`. The callback takes none.
+  start and an end per pad, every hit and pattern change, the input's news
+  and meters; it also frees retired samples and patterns.
+- **Locks:** `lock` (the threads' lifecycle; only dirty NIFs) → `IN.lock`
+  → `OUT.ctl` (owner, sample table, the renderer's role) → `OUT.push` /
+  `jobs_lock` → `stats_lock`. The callbacks take none; the stream events
+  take `OUT.ctl` / `IN.lock`.
 
 ### Measured
 
-On the moto g power 2021 (Android 11), `scripts/engine_check.exs`:
+On the moto g power 2021 (Android 11), `scripts/engine_check.exs`, with
+the engine's own AAudio code from before MOB-531 (the numbers on
+`mob_audio_io` are pending the device checks in its PR):
 
 - **Stream:** 48 kHz, 240-frame bursts (5 ms), buffer 480 frames, low
   latency, shared (no exclusive mode on this phone). Output latency (frames
@@ -420,15 +451,36 @@ On the moto g power 2021 (Android 11), `scripts/engine_check.exs`:
   `-fsanitize=address,undefined` and `-fsanitize=thread`.
   `/tmp/sampler_host bench` (built with `-Os`, as the app is) for render
   cost.
-- The NIF for Android: `$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang
+- Host, the processors: `cc -std=c11 -O2 -Wall -Wextra -Werror
+  -Wno-unused-function -o /tmp/io_host c_src/test/io_host.c -lm -lpthread
+  && /tmp/io_host` (needs `deps/mob_audio_io`; a fake plugin drives
+  `"magpie_out"` and `"magpie_mic"`: the renderer's role and rate on
+  STARTED/STOPPED and a reopen, a second output silenced, the engine clock
+  from `present_ns` and its 20 ms refresh, sequenced steps heard at their
+  presentation time, a live hit stamped where it was heard, the mic opening,
+  capture times with and without `present_ns`, a lost mic and a reopen that
+  feeds nothing, the count-in through an output and an input latency
+  starting the take on the frame heard at the downbeat, the import chunks,
+  and the loader's queue (`c_src/load_queue.c`: a file load claimed before
+  a PCM load of the same id finishes first, a decode that never reports
+  fails as `:decode_error` after the timeout). Also with `-g -O1
+  -fsanitize=address,undefined` and `-fsanitize=thread`.
+- The NIF, every platform, `-Werror`: `$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang
   --target=aarch64-linux-android28 --sysroot=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/sysroot
   -I ~/.mob/cache/otp-android-*/erts-*/include
-  -DSTATIC_ERLANG_NIF_LIBNAME=magpie_audio -Wall -Wextra -c c_src/magpie_audio.c`
-  (also `armv7a-linux-androideabi28`, `x86_64-linux-android28`).
+  -DSTATIC_ERLANG_NIF_LIBNAME=magpie_audio -std=c11 -Wall -Wextra -Werror -c c_src/magpie_audio.c`
+  (also `armv7a-linux-androideabi28`, `x86_64-linux-android28`); iOS:
+  `xcrun --sdk iphonesimulator clang -target arm64-apple-ios15.0-simulator
+  -I ~/.mob/cache/otp-ios-sim-*/erts-*/include` with the same flags (and
+  `--sdk iphoneos -target arm64-apple-ios15.0` with `otp-ios-device`).
 - Host, Elixir: `mix test test/magpie/engine_test.exs` (the Fake: ownership,
   loading and errors, pads in seconds, pattern compile, swap at the bar,
   edits now, hits as kit steps), `engine_record_test.exs`,
-  `record_screen_test.exs`, `aiff_test.exs`, `bird_test.exs`.
+  `record_screen_test.exs`, `aiff_test.exs`, `bird_test.exs`, and
+  `audio/native_test.exs` (`Magpie.Audio.Native` itself on
+  `MobAudioIo.Fake` and a NIF double: the streams' owner, one output at a
+  time, the mic's options and fallback, the close order, `info/0`'s keys,
+  decoding and file loads).
 - Device: `mix mob.deploy --native --android --device <serial>`, `mix
   mob.connect --no-iex --android-only --device <serial>`, then
   `SERIAL=<serial> mix run --no-start scripts/engine_check.exs` (needs
@@ -444,13 +496,18 @@ Why it is built this way: `decisions/2026-11-13-recording-other-apps.md`.
 `c_src/recorder.c` (plain C, in the host harness) is the recorder for every
 source: a buffer of the maximum length allocated when armed, a ring of the
 last ½ s while waiting, the meter, the peaks, and the start modes. The mic
-is an AAudio input stream of its own (mono, the output's rate, low latency
-requested, `UNPROCESSED`); other apps come from
-`plugins/magpie_capture` (Kotlin only: MediaProjection consent, a
-`mediaProjection` foreground service, `AudioRecord` on the playback
-capture, 16-bit stereo, Magpie's own UID excluded), whose read thread hands
-blocks to the NIF. Every block carries its capture time, so a count-in
-starts the take on the frame captured when its downbeat is heard.
+is a `mob_audio_io` input stream of its own on `"magpie_mic"` (mono, the
+output's rate, `preset: :unprocessed`, the platform's default preset when
+that is refused; on iOS the session becomes PlayAndRecord while it is
+open); other apps come from `plugins/magpie_capture` (Android only;
+Kotlin: MediaProjection consent, a `mediaProjection` foreground service,
+`AudioRecord` on the playback capture, 16-bit stereo, Magpie's own UID
+excluded), whose read thread hands blocks to the NIF. On iOS
+`Engine.input_sources/0` is `[:mic]`, `open_input(:apps)` answers
+`{:error, :unsupported}` and the Record screen shows the source
+disabled. Every block carries its capture time (the mic's from
+`mai_time.present_ns`), so a count-in starts the take on the frame
+captured when its downbeat is heard.
 
 ### `Magpie.Engine` recording API
 
@@ -460,9 +517,14 @@ starts the take on the frame captured when its downbeat is heard.
   input, :started, %{source, rate, channels}}` / `{:magpie_audio, :input,
   input, :closed, :denied | :stopped | :disconnected | :error}`.
   `state/0`'s `input` (`%{id, source, status, rate, channels}`; status
-  `:closing` while a mic stream that wouldn't stop is closed again, every
+  `:closing` while an input that wouldn't stop is closed again, every
   second and slower, by the Engine on its own; `close_input/0` answers
-  `{:error, :input_stuck}` then).
+  `{:error, :input_stuck}` then: the contract keeps it, but
+  `Magpie.Audio.Native` no longer produces it, since `MobAudioIo.close/1`
+  returns once no callback can run). A mic whose device goes (or, on iOS,
+  a call that takes the session) closes as `:disconnected`: the
+  processor's STOPPED, reported by the event thread; the plugin's own
+  reopen of that stream feeds nothing.
 - `{:magpie_audio, :meter, input, level_db, %{take, state, frames,
   peaks}}` every 40 ms while an input is open: peak dBFS since the last
   one, the armed take (nil none), the recorder's state (`:idle | :waiting
@@ -481,12 +543,13 @@ starts the take on the frame captured when its downbeat is heard.
 - `stop_recording/0` → `{:ok, %{pcm, rate, channels, frames, peaks,
   peak_frames}}` (the recorder's own buffer as a resource binary, no copy)
   or `{:error, :not_recording | :not_started}`; `cancel_recording/0`.
-- Inside: the input's producer (the mic callback, Kotlin's read thread)
+- Inside: the input's producer (the mic's capture, Kotlin's read thread)
   writes through a gate (`rc_enter`/`rc_leave`) open only for the input's
-  id; closing shuts it and waits out a producer inside, so a stream that
-  wouldn't stop or a capture thread that outlived its join never writes
-  into the next input. The count-in's start time is tagged with its take
-  (`rc_start_at`).
+  id; closing shuts it and waits out a producer inside, so a capture
+  thread that outlived its join never writes into the next input. The NIF
+  closes the input before `Magpie.Audio.Native.Io` closes the mic's
+  stream, so that stream's STOPPED is no lost device. The count-in's start
+  time is tagged with its take (`rc_start_at`).
 - Changing `lib/magpie/audio/nif.ex` and hot-pushing (`mix mob.deploy`
   without `--native`) reloads the module and drops the static NIF
   (`:nif_not_loaded`): restart the app (`mix mob.connect`).
@@ -543,8 +606,9 @@ Why it is built this way: `decisions/2026-11-13-midi.md` (and the move to
 mob_midi: `decisions/2026-11-13-midi-on-mob-midi.md`). No MIDI byte passes
 through the BEAM.
 
-- **Devices and ports: mob_midi** (`~> 0.3.0` from Hex, signed with the
-  shared key and trusted in `mob.exs`). Magpie's own
+- **Devices and ports: mob_midi** (`~> 0.4.0` from Hex, signed with the
+  shared key and trusted in `mob.exs`; 0.4.0 has the C ABI on iOS too,
+  over CoreMIDI). Magpie's own
   device "Magpie" (one input, one output) is declared by `mix
   mob_midi.gen.virtual_device` from `config :mob_midi, :virtual_device`
   (`res/xml/mob_midi_device.xml` + a fenced `<service>` for
@@ -560,7 +624,9 @@ through the BEAM.
   (from `Magpie.Midi` when a device closes or goes, or another app starts
   or stops sending into Magpie's device) ends what closed sources held
   (`mob_midi_source_info`). Out: the sending thread (started in `open/1`)
-  sleeps until a message's frame is heard and calls `mob_midi_send(handle,
+  sleeps until a message's frame is heard (the engine clock, on
+  `mai_now_ns()`, the clock `mob_midi_now_ns()` reads on both platforms)
+  and calls `mob_midi_send(handle,
   bytes, len, t)` per output (`midi_outputs/1`: Magpie's own output and
   each opened device's input port 0). `c_src/midi_out.c`: what each output
   took, refused and is owed (below). `c_src/midi.c` (plain C): parser, the
@@ -809,7 +875,7 @@ these), 16 loaded pads (every one asking for moves), 40 rounds:
   build).
 - Gate before every commit: `mix format`, `mix compile --warnings-as-errors`,
   `mix credo --strict`, `mix test`, and the host C tests (`midi_host`,
-  `sampler_host`, also under ASan/UBSan). Not `mix
+  `sampler_host`, `io_host`, also under ASan/UBSan). Not `mix
   mob_midi.gen.virtual_device --check`: the task puts its `<service>` block
   last in `<application>` and mob_dev's native build moves its own
   `mob:plugin-components` block back after it, so the check fails after

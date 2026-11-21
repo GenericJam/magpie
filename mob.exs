@@ -43,9 +43,12 @@ config :mob_dev,
   # Mob.Scene (not released yet, mob#184): keep false until then.
   multi_window: false,
 
-  # The audio engine (c_src/magpie_audio.c, which includes c_src/sampler.c):
-  # AAudio, NDK MediaCodec, the sampler and sequencer. Android only for now.
-  static_nifs: [%{module: :magpie_audio, archs: [:android]}]
+  # The audio engine (c_src/magpie_audio.c, which includes c_src/magpie_io.c,
+  # c_src/sampler.c and c_src/recorder.c): the sampler, sequencer and
+  # recorder as mob_audio_io processors, MIDI through mob_midi's C ABI. Plain
+  # C over both plugins' C ABIs (they own the streams and the MIDI ports), so
+  # it builds for both platforms; only the other-apps input is Android's.
+  static_nifs: [%{module: :magpie_audio, archs: [:all]}]
 
 # Activated capability plugins (the packages added in mix.exs). Each contributes
 # its native code, permissions, and any demo screens at build time. Drop a name
@@ -55,12 +58,16 @@ config :mob_dev,
 # magpie_capture: the "Other apps" recording source (plugins/magpie_capture,
 # Kotlin only: the MediaProjection consent, its foreground service and the
 # AudioRecord read thread feeding the magpie_audio NIF), part of this repo.
+# Android only: on iOS the NIF answers {:error, :unsupported} for it.
 # mob_midi: MIDI devices (USB, Bluetooth, other apps' ports), the app's own
 # "Magpie" device (its declaration is generated from `config :mob_midi,
 # :virtual_device` by `mix mob_midi.gen.virtual_device`) and the C ABI the
 # magpie_audio NIF receives and sends MIDI through
 # (deps/mob_midi/priv/include/mob_midi.h). A signed Hex release (trusted below).
-config :mob, :plugins, [:magpie_capture, :mob_midi]
+# mob_audio_io: the audio streams (the output, the microphone) under
+# c_src/magpie_io.c's processors, and file decoding
+# (deps/mob_audio_io/priv/include/mob_audio_io.h).
+config :mob, :plugins, [:magpie_capture, :mob_midi, :mob_audio_io]
 
 # magpie_capture is this app's own code, reviewed with it, so it builds
 # unsigned instead of carrying a signing key (mob_dev prints a banner).
@@ -76,6 +83,7 @@ config :mob, :acknowledge_unsafe_plugins, [:magpie_capture]
 # [...]` for an unsigned prototype.
 config :mob, :trusted_plugins, %{
   mob_audio_capture: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
+  mob_audio_io: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
   mob_camera: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
   mob_location: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
   mob_biometric: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",

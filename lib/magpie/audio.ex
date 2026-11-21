@@ -1,8 +1,8 @@
 defmodule Magpie.Audio do
   @moduledoc """
   The audio engine contract. `impl/0` is `Magpie.Audio.Native` on the phone
-  (the `magpie_audio` NIF, `c_src/magpie_audio.c` + `c_src/sampler.c`) and
-  `Magpie.Audio.Fake` in host tests (`config :magpie, :audio`).
+  (the `magpie_audio` NIF over `mob_audio_io`'s streams, Android and iOS)
+  and `Magpie.Audio.Fake` in host tests (`config :magpie, :audio`).
 
   Use it through `Magpie.Engine`, which owns it: the engine converts kit
   pads and patterns (`Magpie.Kit`) into the engine's units (frames, flat
@@ -37,12 +37,13 @@ defmodule Magpie.Audio do
   message about an input or a take that is over can still be on its way
   when the next one starts, so match on the id.
 
-  - `:input, :started`: the input runs. The mic starts at once (mono at
-    the engine's rate); other apps after the MediaProjection consent and
-    the capture service start (stereo).
-  - `:input, :closed`: `:denied` (consent refused), `:disconnected`,
-    `:stopped` (the user ended the projection) or `:error`. Call
-    `c:input_close/0` to release it.
+  - `:input, :started`: the input runs. The mic starts once its stream
+    does (mono at the engine's rate); other apps (Android) after the
+    MediaProjection consent and the capture service start (stereo).
+  - `:input, :closed`: `:denied` (consent refused), `:disconnected` (the
+    mic's device went, or iOS gave the session to a call), `:stopped` (the
+    user ended the projection) or `:error`. Call `c:input_close/0` to
+    release it.
   - `:meter`, every ~40 ms while an input is open: `level_db` is the
     input's peak dBFS since the previous meter (float, floor -120.0);
     `take` the armed take (nil: none); `state` is `:idle` (monitoring
@@ -163,7 +164,8 @@ defmodule Magpie.Audio do
   @type clock :: %{frame: integer(), time: integer(), rate: pos_integer()}
   @doc """
   Open the output stream (if it isn't) and become the owner:
-  `{:ok, %{rate, burst, buffer_frames, low_latency}}`.
+  `{:ok, %{rate, burst, buffer_frames, low_latency}}` (`low_latency` nil
+  when the platform doesn't say).
   """
   @callback open(owner :: pid()) :: {:ok, map()} | {:error, term()}
   @doc "Stop and close the stream; what is loaded stays."
@@ -171,11 +173,12 @@ defmodule Magpie.Audio do
   @doc "Everything off: voices fade, pads cleared, samples unloaded, no pattern, stopped, 120 bpm, straight."
   @callback reset() :: :ok | {:error, term()}
   @doc """
-  Decode the file at `path` (Android: MediaCodec, so wav, mp3, aac/m4a,
-  flac, ogg…) into RAM on the loader thread; the result arrives as
-  `{:magpie_audio, :loaded, id, result}`. Errors there: `:not_found`,
-  `:unsupported`, `:no_audio`, `:decode_error`, `:too_long` (over 5
-  minutes), `:alloc`, `:cancelled` (a later load or unload of `id`).
+  Decode the file at `path` (the phone's decoder: AMediaCodec on Android,
+  ExtAudioFile on iOS, so wav, mp3, aac/m4a, flac…) into RAM, off the
+  caller; the result arrives as `{:magpie_audio, :loaded, id, result}`.
+  Errors there: `:not_found`, `:unsupported`, `:no_audio`,
+  `:decode_error`, `:too_long` (over 5 minutes), `:alloc`, `:busy` (four
+  decodes running), `:cancelled` (a later load or unload of `id`).
   """
   @callback load_sample(id :: term(), path :: Path.t()) :: :ok | {:error, term()}
   @doc """
@@ -191,7 +194,8 @@ defmodule Magpie.Audio do
               :ok | {:error, term()}
   @doc """
   Decode a file for import into the library: f32le PCM at its own rate
-  plus peaks. Synchronous, in the caller; touches no engine state.
+  plus peaks. Synchronous, in the caller (it stops when the caller exits);
+  touches no engine state.
   """
   @callback decode(path :: Path.t()) :: {:ok, decoded()} | {:error, term()}
   @doc "Unload a sample: its voices fade, pads using it are cleared."
@@ -235,22 +239,29 @@ defmodule Magpie.Audio do
   @doc "Diagnostics: stream, callback timing, underruns, voices, latency, memory."
   @callback info() :: map()
   @doc """
+  The sources `c:input_open/1` can open on this platform: `[:mic, :apps]`
+  on Android, `[:mic]` on iOS (other apps' audio is Android's
+  MediaProjection).
+  """
+  @callback input_sources() :: [:mic | :apps]
+  @doc """
   Close any open input, then open `:mic` or `:apps` (other apps'
   playback, Android 10+) as a new input id. The outcome arrives as
   `{:magpie_audio, :input, input, :started, info}` or `{:magpie_audio,
   :input, input, :closed, reason}`. Errors returned directly:
-  `:not_owner` (nothing changed); `:input_stuck` (the open mic wouldn't
-  stop: it is closed to the owner but still allocated, and the next
-  close or open tries again); after the close, `:unsupported` (apps
-  below API 29), `:busy` (a consent dialog is still up),
-  `:no_permission` (RECORD_AUDIO not granted), `:input_unavailable`
-  (AAudio refused), `{:missing, lib}`.
+  `:not_owner` (nothing changed); `:input_stuck` (an input that wouldn't
+  stop: closed to the owner but still allocated, and the next close or
+  open tries again; `Magpie.Audio.Native` no longer has one, since its
+  streams close once no callback can run); after the close,
+  `:unsupported` (apps below API 29, or on iOS), `:busy` (a consent
+  dialog is still up), `:no_permission` (the microphone not granted),
+  `:input_unavailable` (the platform refused the stream).
   """
   @callback input_open(source :: :mic | :apps) :: {:ok, input()} | {:error, term()}
   @doc """
   Close the input; a recording in progress is dropped. `:input_stuck`:
-  the mic stream wouldn't stop (closed to the owner, still allocated):
-  try again later.
+  it wouldn't stop (closed to the owner, still allocated): try again
+  later.
   """
   @callback input_close() :: :ok | {:error, term()}
   @doc """
