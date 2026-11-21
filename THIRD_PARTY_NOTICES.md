@@ -22,6 +22,7 @@ does not replace any upstream copyright, attribution or licence.
 | AsmJit (Copyright (c) 2008-2025 Petr Kobalicek), the Erlang runtime's JIT | native libraries | zlib | [LICENSES/asmjit-Zlib.txt](LICENSES/asmjit-Zlib.txt) |
 | Mob (Copyright (c) 2026 Kevin Smith), including its Android bridge in the dex code | the APK's `otp.zip`, dex code and native libraries | MIT | [LICENSES/Mob-MIT.txt](LICENSES/Mob-MIT.txt) |
 | mob_midi, mob_bluetooth | the APK's `otp.zip`, dex code and native libraries | MIT (declared on Hex; the packages ship no licence file) | |
+| mob_audio_io (Copyright (c) 2026 GenericJam) | the APK's `otp.zip` and native libraries | MIT | [LICENSES/mob_audio_io-MIT.txt](LICENSES/mob_audio_io-MIT.txt) |
 | exqlite and ecto_sqlite3 (both Copyright (c) 2021 Matthew A. Johnston) | the APK's `otp.zip` and native libraries | MIT | [LICENSES/exqlite-MIT.txt](LICENSES/exqlite-MIT.txt) |
 | jQuery and jQuery Migrate (Copyright OpenJS Foundation and other contributors), tablesorter 2.32 (Copyright (c) 2007 Christian Bach), in Erlang/OTP's `common_test` | the APK's `otp.zip` | MIT | [LICENSES/jQuery-MIT.txt](LICENSES/jQuery-MIT.txt), [LICENSES/tablesorter-MIT.txt](LICENSES/tablesorter-MIT.txt) |
 | SQLite (bundled by exqlite) | native libraries | public domain | |

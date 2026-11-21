@@ -59,9 +59,10 @@ defmodule Magpie.Engine do
 
   ## Samples
 
-  `load_sample/2` decodes a file (MediaCodec on the phone), `load_pcm/4`
-  takes the library's f32le PCM (`Magpie.Library.pcm/1`). Both block the
-  caller until the sample is in RAM, resampled to the engine's rate, and
+  `load_sample/2` decodes a file (the phone's decoder, through
+  mob_audio_io), `load_pcm/4` takes the library's f32le PCM
+  (`Magpie.Library.pcm/1`). Both block the caller until the sample is in
+  RAM, resampled to the engine's rate, and
   return its info (`t:Magpie.Audio.sample_info/0`); this process stays
   free meanwhile. `decode/1` decodes a file for importing into the
   library. A restarted engine starts clean: load the kit again.
@@ -263,12 +264,20 @@ defmodule Magpie.Engine do
   def info, do: Audio.impl().info()
 
   @doc """
+  The sources `open_input/1` can open on this phone: `[:mic, :apps]` on
+  Android, `[:mic]` on iOS (other apps' audio is Android's; there
+  `open_input(:apps)` answers `{:error, :unsupported}`).
+  """
+  @spec input_sources() :: [:mic | :apps]
+  def input_sources, do: Audio.impl().input_sources()
+
+  @doc """
   Close any input, then open `:mic` or `:apps` (what other apps play; the
   phone asks the user first). `{:ok, input}` means it is opening:
   `{:magpie_audio, :input, input, :started, info}` or `{:magpie_audio,
   :input, input, :closed, reason}` follows. An error after the close
-  leaves no input (`:input_stuck`: the old mic wouldn't stop; the Engine
-  keeps closing it). The input closes when the caller exits.
+  leaves no input (`:input_stuck`: the old input wouldn't stop; the
+  Engine keeps closing it). The input closes when the caller exits.
   """
   @spec open_input(:mic | :apps) :: {:ok, Audio.input()} | {:error, term()}
   def open_input(source) when source in [:mic, :apps],

@@ -1,32 +1,32 @@
 /*
- * c_src/magpie_audio.c — Magpie's audio engine on Android: the sampler core
- * (sampler.c) behind an AAudio output stream, the recorder (recorder.c) on
- * an input (the mic, or other apps through plugins/magpie_capture), NDK
- * MediaCodec decoding, MIDI in and out through mob_midi's C ABI, and the
- * NIF (Magpie.Audio.Nif).
+ * c_src/magpie_audio.c — Magpie's audio engine: the sampler core
+ * (sampler.c) and the recorder (recorder.c) behind mob_audio_io's streams
+ * (c_src/magpie_io.c's processors), MIDI in and out through mob_midi's C
+ * ABI, and the NIF (Magpie.Audio.Nif). The same code builds for Android and
+ * iOS; only the "other apps" input (plugins/magpie_capture, MediaProjection)
+ * is Android's.
  *
- *   output callback  AAudio, low-latency performance mode, shared, stereo
- *                    float at the device's own rate. Runs sp_render: drains
- *                    the command queue, runs the sequencer and the count-in
- *                    clicks, mixes the voices.
- *   mic callback     AAudio input, low latency, mono at the output's rate:
- *                    feeds the recorder, each block stamped with when it
- *                    was captured (the input timestamp).
- *   capture thread   Kotlin's (MagpieCapture), for other apps: 16-bit
- *                    blocks into the recorder through native_write.
+ *   output stream    mob_audio_io's (AAudio low latency / RemoteIO), stereo
+ *                    float at the device's own rate, opened by
+ *                    Magpie.Audio.Native.Io. "magpie_out" runs sp_render:
+ *                    drains the command queue, runs the sequencer and the
+ *                    count-in clicks, mixes the voices; it maps engine
+ *                    frames onto when they are heard (the engine clock).
+ *   mic stream       mob_audio_io's input, mono at the output's rate:
+ *                    "magpie_mic" feeds the recorder, each block stamped
+ *                    with when it was captured.
+ *   capture thread   Kotlin's (MagpieCapture, Android), for other apps:
+ *                    16-bit blocks into the recorder through native_write.
  *   event thread     Every 2 ms: turns the renderer's events into messages
  *                    for the owner (coalesced: one playhead and at most a
  *                    start and an end per pad per pass), frees retired
- *                    samples and patterns, refreshes the clock mappings
- *                    (getTimestamp, output and mic) every 20 ms, grows the
- *                    buffer by a burst after an underrun, reopens the stream
- *                    after a disconnect (headphones, Bluetooth), gives the
- *                    recorder the count-in's downbeat and sends the input's
+ *                    samples and patterns, gives the recorder the
+ *                    count-in's downbeat and sends the input's news and
  *                    meters.
- *   loader thread    load_sample/2 jobs in order: AMediaExtractor +
- *                    AMediaCodec decode a file to 16-bit (wav, mp3, aac,
- *                    flac, ogg, …), resample to the engine's rate, peaks,
- *                    then hand the sample to the renderer.
+ *   loader thread    load jobs in order: f32 PCM (load_pcm/4, and a file
+ *                    load_sample/2's Elixir side decoded with
+ *                    MobAudioIo.decode_stream) to 16-bit, resampled to the
+ *                    engine's rate, peaks, then handed to the renderer.
  *   MIDI receive     mob_midi's, one per open input port: midi_sink parses
  *                    the bytes into the command queue.
  *   MIDI sending     Sends what the renderer stamped (notes, clock) to the
@@ -52,261 +52,78 @@
  * one starts. Frames are engine frames (rendered since the engine
  * started); clock/0 maps them onto erlang:monotonic_time/1.
  *
+ * Time: mai_now_ns() (CLOCK_MONOTONIC on Android, mach_absolute_time on
+ * iOS), the clock of mob_audio_io's mai_time and of mob_midi's timestamps
+ * (mob_midi_now_ns), so audio frames, MIDI in and MIDI out share one clock
+ * on both platforms.
+ *
  * Control calls (samples, pads, patterns, tempo, play, reset, close, the
  * input and the recorder) are the owner's alone ({error, not_owner} for
  * anyone else); live calls (trigger, release, note_on, note_off) are open
  * to every process and only queue a command: they never wait on the stream.
  *
- * Locks, always taken in this order: lock → IN.lock → ctl → jobs_lock /
- * push → stats_lock. `lock` covers the stream's lifecycle (open, close,
- * reopen) and the NIFs that ask the stream (info); `IN.lock` the input's
- * lifecycle and the recorder's buffers. NIFs taking either run on dirty IO
- * schedulers. `ctl` covers the owner, the sample table and, while no stream
- * renders, the renderer's role (sp_drain). `push` serialises producers into
- * the command queue; the audio callbacks never take a lock.
- *
- * AAudio and libmediandk are opened with dlopen: the app links against
- * android-24 headers, where AAudio (API 26) doesn't exist, while the app's
- * minSdk is 28, so both libraries are always present at run time.
+ * Locks, always taken in this order: lock → IN.lock → OUT.ctl → jobs_lock /
+ * OUT.push → stats_lock. `lock` covers the threads' lifecycle (open,
+ * close) and the NIFs that read across the engine (info); `IN.lock` the
+ * input's lifecycle and the recorder's buffers. NIFs taking either run on
+ * dirty IO schedulers. `OUT.ctl` covers the owner, the sample table and,
+ * while no stream renders, the renderer's role (sp_drain). `OUT.push`
+ * serialises producers into the command queue; the audio callbacks never
+ * take a lock.
  */
 
-#include <errno.h>
-#include <dlfcn.h>
 #include <erl_nif.h>
-#include <fcntl.h>
-#include <jni.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __ANDROID__
 #include <android/log.h>
+#include <jni.h>
+#include <sys/resource.h>
+#define LOG_TAG "magpie_audio"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#else
+#include <os/log.h>
+#include <pthread/qos.h>
+#define LOGI(...) os_log(OS_LOG_DEFAULT, "magpie_audio: " __VA_ARGS__)
+#define LOGE(...) os_log_error(OS_LOG_DEFAULT, "magpie_audio: " __VA_ARGS__)
+#endif
 
 /* mob_midi's C ABI (a dependency: its own path, see its README). */
 #include "../deps/mob_midi/priv/include/mob_midi.h"
 
-#include "sampler.c"
+/* The processors, the sampler and the recorder (mob_audio_io.h with them). */
+#include "magpie_io.c"
 #include "midi_out.c"
-#include "recorder.c"
 
-#define LOG_TAG "magpie_audio"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-
-#define MAX_SECONDS 300            /* longest sample load_sample/2 accepts */
+#define MAX_SECONDS 300 /* longest sample a load accepts */
 #define EVENT_PERIOD_US 2000
-#define CLOCK_PERIOD_NS 20000000LL /* refresh the timestamp mapping */
-#define REOPEN_PERIOD_NS 500000000LL
 #define LATENCIES 256
-#define DEFAULT_RATE 48000
 
-/* ── AAudio, declared by hand (see header comment) ───────────────────────── */
+static int64_t now_ns(void) { return mai_now_ns(); }
 
-typedef struct AAudioStreamBuilderStruct AAudioStreamBuilder;
-typedef struct AAudioStreamStruct AAudioStream;
-typedef int32_t aaudio_result_t;
-typedef int32_t (*aa_data_cb)(AAudioStream *, void *, void *, int32_t);
-typedef void (*aa_error_cb)(AAudioStream *, void *, aaudio_result_t);
-
-enum {
-    AA_OK = 0,
-    AA_UNSPECIFIED = 0,
-    AA_DIRECTION_OUTPUT = 0,
-    AA_DIRECTION_INPUT = 1,
-    AA_FORMAT_PCM_FLOAT = 2,
-    AA_SHARING_EXCLUSIVE = 0,
-    AA_SHARING_SHARED = 1,
-    AA_PERF_LOW_LATENCY = 12,
-    AA_USAGE_MEDIA = 1,
-    AA_CONTENT_MUSIC = 2,
-    AA_PRESET_VOICE_RECOGNITION = 6,
-    AA_PRESET_UNPROCESSED = 9,
-    AA_CALLBACK_CONTINUE = 0,
-    AA_STATE_OPEN = 2,
-    AA_STATE_STARTING = 3,
-    AA_STATE_STARTED = 4,
-    AA_STATE_PAUSED = 6,
-    AA_STATE_FLUSHED = 8,
-    AA_STATE_STOPPED = 10,
-    AA_STATE_DISCONNECTED = 13,
-};
-
-static struct {
-    aaudio_result_t (*createStreamBuilder)(AAudioStreamBuilder **);
-    void (*setDirection)(AAudioStreamBuilder *, int32_t);
-    void (*setSampleRate)(AAudioStreamBuilder *, int32_t);
-    void (*setInputPreset)(AAudioStreamBuilder *, int32_t);
-    void (*setChannelCount)(AAudioStreamBuilder *, int32_t);
-    void (*setFormat)(AAudioStreamBuilder *, int32_t);
-    void (*setSharingMode)(AAudioStreamBuilder *, int32_t);
-    void (*setPerformanceMode)(AAudioStreamBuilder *, int32_t);
-    void (*setUsage)(AAudioStreamBuilder *, int32_t);
-    void (*setContentType)(AAudioStreamBuilder *, int32_t);
-    void (*setDataCallback)(AAudioStreamBuilder *, aa_data_cb, void *);
-    void (*setErrorCallback)(AAudioStreamBuilder *, aa_error_cb, void *);
-    aaudio_result_t (*openStream)(AAudioStreamBuilder *, AAudioStream **);
-    aaudio_result_t (*builderDelete)(AAudioStreamBuilder *);
-    aaudio_result_t (*close)(AAudioStream *);
-    aaudio_result_t (*requestStart)(AAudioStream *);
-    aaudio_result_t (*requestStop)(AAudioStream *);
-    int32_t (*getDeviceId)(AAudioStream *);
-    int32_t (*getSampleRate)(AAudioStream *);
-    int32_t (*getChannelCount)(AAudioStream *);
-    int32_t (*getInputPreset)(AAudioStream *);
-    int32_t (*getFramesPerBurst)(AAudioStream *);
-    int32_t (*getBufferSizeInFrames)(AAudioStream *);
-    aaudio_result_t (*setBufferSizeInFrames)(AAudioStream *, int32_t);
-    int32_t (*getBufferCapacityInFrames)(AAudioStream *);
-    int32_t (*getXRunCount)(AAudioStream *);
-    int32_t (*getPerformanceMode)(AAudioStream *);
-    int32_t (*getSharingMode)(AAudioStream *);
-    int64_t (*getFramesWritten)(AAudioStream *);
-    aaudio_result_t (*getTimestamp)(AAudioStream *, clockid_t, int64_t *, int64_t *);
-    int32_t (*getState)(AAudioStream *);
-    aaudio_result_t (*waitForStateChange)(AAudioStream *, int32_t, int32_t *, int64_t);
-} aa;
-
-/* ── libmediandk, declared by hand ───────────────────────────────────────── */
-
-typedef struct AMediaExtractor AMediaExtractor;
-typedef struct AMediaFormat AMediaFormat;
-typedef struct AMediaCodec AMediaCodec;
-typedef struct {
-    int32_t offset;
-    int32_t size;
-    int64_t presentationTimeUs;
-    uint32_t flags;
-} codec_buffer_info;
-
-#define CODEC_EOS 4
-#define CODEC_TRY_AGAIN -1
-#define CODEC_FORMAT_CHANGED -2
-#define CODEC_BUFFERS_CHANGED -3
-#define PCM_16BIT 2
-#define PCM_FLOAT 4
-
-static struct {
-    AMediaExtractor *(*exNew)(void);
-    int (*exDelete)(AMediaExtractor *);
-    int (*exSetDataSourceFd)(AMediaExtractor *, int, off64_t, off64_t);
-    size_t (*exGetTrackCount)(AMediaExtractor *);
-    AMediaFormat *(*exGetTrackFormat)(AMediaExtractor *, size_t);
-    int (*exSelectTrack)(AMediaExtractor *, size_t);
-    ssize_t (*exReadSampleData)(AMediaExtractor *, uint8_t *, size_t);
-    int64_t (*exGetSampleTime)(AMediaExtractor *);
-    bool (*exAdvance)(AMediaExtractor *);
-    bool (*fmtGetString)(AMediaFormat *, const char *, const char **);
-    bool (*fmtGetInt32)(AMediaFormat *, const char *, int32_t *);
-    bool (*fmtGetInt64)(AMediaFormat *, const char *, int64_t *);
-    int (*fmtDelete)(AMediaFormat *);
-    AMediaCodec *(*codecCreateDecoderByType)(const char *);
-    int (*codecConfigure)(AMediaCodec *, const AMediaFormat *, void *, void *, uint32_t);
-    int (*codecStart)(AMediaCodec *);
-    int (*codecStop)(AMediaCodec *);
-    int (*codecDelete)(AMediaCodec *);
-    ssize_t (*codecDequeueInputBuffer)(AMediaCodec *, int64_t);
-    uint8_t *(*codecGetInputBuffer)(AMediaCodec *, size_t, size_t *);
-    int (*codecQueueInputBuffer)(AMediaCodec *, size_t, off_t, size_t, uint64_t, uint32_t);
-    ssize_t (*codecDequeueOutputBuffer)(AMediaCodec *, codec_buffer_info *, int64_t);
-    uint8_t *(*codecGetOutputBuffer)(AMediaCodec *, size_t, size_t *);
-    int (*codecReleaseOutputBuffer)(AMediaCodec *, size_t, bool);
-    AMediaFormat *(*codecGetOutputFormat)(AMediaCodec *);
-} md;
-
-static const char *libs_error = NULL;
-static bool libs_ok = false;
-
-#define BIND(table, handle, field, name)              \
-    do {                                              \
-        *(void **)&table.field = dlsym(handle, name); \
-        if (!table.field) {                           \
-            libs_error = name;                        \
-            return false;                             \
-        }                                             \
-    } while (0)
-
-static bool bind_libraries(void) {
-    void *a = dlopen("libaaudio.so", RTLD_NOW);
-    void *m = dlopen("libmediandk.so", RTLD_NOW);
-    if (!a) {
-        libs_error = "libaaudio.so";
-        return false;
-    }
-    if (!m) {
-        libs_error = "libmediandk.so";
-        return false;
-    }
-    BIND(aa, a, createStreamBuilder, "AAudio_createStreamBuilder");
-    BIND(aa, a, setDirection, "AAudioStreamBuilder_setDirection");
-    BIND(aa, a, setSampleRate, "AAudioStreamBuilder_setSampleRate");
-    BIND(aa, a, setInputPreset, "AAudioStreamBuilder_setInputPreset");
-    BIND(aa, a, setChannelCount, "AAudioStreamBuilder_setChannelCount");
-    BIND(aa, a, setFormat, "AAudioStreamBuilder_setFormat");
-    BIND(aa, a, setSharingMode, "AAudioStreamBuilder_setSharingMode");
-    BIND(aa, a, setPerformanceMode, "AAudioStreamBuilder_setPerformanceMode");
-    BIND(aa, a, setUsage, "AAudioStreamBuilder_setUsage");
-    BIND(aa, a, setContentType, "AAudioStreamBuilder_setContentType");
-    BIND(aa, a, setDataCallback, "AAudioStreamBuilder_setDataCallback");
-    BIND(aa, a, setErrorCallback, "AAudioStreamBuilder_setErrorCallback");
-    BIND(aa, a, openStream, "AAudioStreamBuilder_openStream");
-    BIND(aa, a, builderDelete, "AAudioStreamBuilder_delete");
-    BIND(aa, a, close, "AAudioStream_close");
-    BIND(aa, a, requestStart, "AAudioStream_requestStart");
-    BIND(aa, a, requestStop, "AAudioStream_requestStop");
-    BIND(aa, a, getDeviceId, "AAudioStream_getDeviceId");
-    BIND(aa, a, getSampleRate, "AAudioStream_getSampleRate");
-    BIND(aa, a, getChannelCount, "AAudioStream_getChannelCount");
-    BIND(aa, a, getInputPreset, "AAudioStream_getInputPreset");
-    BIND(aa, a, getFramesPerBurst, "AAudioStream_getFramesPerBurst");
-    BIND(aa, a, getBufferSizeInFrames, "AAudioStream_getBufferSizeInFrames");
-    BIND(aa, a, setBufferSizeInFrames, "AAudioStream_setBufferSizeInFrames");
-    BIND(aa, a, getBufferCapacityInFrames, "AAudioStream_getBufferCapacityInFrames");
-    BIND(aa, a, getXRunCount, "AAudioStream_getXRunCount");
-    BIND(aa, a, getPerformanceMode, "AAudioStream_getPerformanceMode");
-    BIND(aa, a, getSharingMode, "AAudioStream_getSharingMode");
-    BIND(aa, a, getFramesWritten, "AAudioStream_getFramesWritten");
-    BIND(aa, a, getTimestamp, "AAudioStream_getTimestamp");
-    BIND(aa, a, getState, "AAudioStream_getState");
-    BIND(aa, a, waitForStateChange, "AAudioStream_waitForStateChange");
-
-    BIND(md, m, exNew, "AMediaExtractor_new");
-    BIND(md, m, exDelete, "AMediaExtractor_delete");
-    BIND(md, m, exSetDataSourceFd, "AMediaExtractor_setDataSourceFd");
-    BIND(md, m, exGetTrackCount, "AMediaExtractor_getTrackCount");
-    BIND(md, m, exGetTrackFormat, "AMediaExtractor_getTrackFormat");
-    BIND(md, m, exSelectTrack, "AMediaExtractor_selectTrack");
-    BIND(md, m, exReadSampleData, "AMediaExtractor_readSampleData");
-    BIND(md, m, exGetSampleTime, "AMediaExtractor_getSampleTime");
-    BIND(md, m, exAdvance, "AMediaExtractor_advance");
-    BIND(md, m, fmtGetString, "AMediaFormat_getString");
-    BIND(md, m, fmtGetInt32, "AMediaFormat_getInt32");
-    BIND(md, m, fmtGetInt64, "AMediaFormat_getInt64");
-    BIND(md, m, fmtDelete, "AMediaFormat_delete");
-    BIND(md, m, codecCreateDecoderByType, "AMediaCodec_createDecoderByType");
-    BIND(md, m, codecConfigure, "AMediaCodec_configure");
-    BIND(md, m, codecStart, "AMediaCodec_start");
-    BIND(md, m, codecStop, "AMediaCodec_stop");
-    BIND(md, m, codecDelete, "AMediaCodec_delete");
-    BIND(md, m, codecDequeueInputBuffer, "AMediaCodec_dequeueInputBuffer");
-    BIND(md, m, codecGetInputBuffer, "AMediaCodec_getInputBuffer");
-    BIND(md, m, codecQueueInputBuffer, "AMediaCodec_queueInputBuffer");
-    BIND(md, m, codecDequeueOutputBuffer, "AMediaCodec_dequeueOutputBuffer");
-    BIND(md, m, codecGetOutputBuffer, "AMediaCodec_getOutputBuffer");
-    BIND(md, m, codecReleaseOutputBuffer, "AMediaCodec_releaseOutputBuffer");
-    BIND(md, m, codecGetOutputFormat, "AMediaCodec_getOutputFormat");
-    return true;
+/* A real-time-ish priority for our own threads (the event thread, MIDI
+ * sending), best effort: Android's audio niceness, iOS's interactive QoS. */
+static void raise_priority(int android_nice, const char *who) {
+#ifdef __ANDROID__
+    if (setpriority(PRIO_PROCESS, (id_t)gettid(), android_nice) != 0) LOGE("%s: could not raise the thread's priority", who);
+#else
+    (void)android_nice;
+    if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) != 0)
+        LOGE("%{public}s: could not raise the thread's priority", who);
+#endif
 }
 
 /* ── State ───────────────────────────────────────────────────────────────── */
-
-static sp_engine SP;
 
 /* A sample id (any term) and what its slot holds. */
 typedef struct {
@@ -318,11 +135,12 @@ typedef struct {
     size_t bytes;
 } id_entry;
 
-/* A load: a file to decode (`path`) or f32le PCM (`pcm`, held in `env`). */
+/* A load: f32 PCM (`pcm`, held in `env`), or a failure to report in order
+ * (`failure`: the file's decode failed). */
 typedef struct load_job {
     struct load_job *next;
-    char *path;
     ERL_NIF_TERM pcm;
+    const char *failure;
     int source_rate, channels;
     int slot;
     uint64_t request;
@@ -332,28 +150,18 @@ typedef struct load_job {
 } load_job;
 
 static struct {
-    pthread_mutex_t lock, ctl, push, jobs_lock, stats_lock;
+    pthread_mutex_t lock, jobs_lock, stats_lock;
     pthread_cond_t jobs_cv;
 
-    /* Under `lock`; the event thread changes them only while it runs, and
-     * close/1 joins it first. */
-    AAudioStream *out;
-    int burst, capacity;
-    _Atomic int32_t buffer_frames;
-    _Atomic int rate;
-    _Atomic bool running;  /* a stream renders: live calls go in */
-    _Atomic bool out_dead; /* the stream reported an error: the event thread reopens */
-    _Atomic int64_t reopens;
-
-    /* Under `ctl`. */
-    bool drains;        /* no stream renders: control calls drain the queue */
-    bool events_alive;  /* the event thread runs (it alone frees garbage then) */
+    /* Under OUT.ctl. */
+    bool events_alive; /* the event thread runs (it alone frees garbage then) */
     ErlNifPid owner;
     bool has_owner;
     id_entry ids[SP_SLOTS];
     uint64_t requests;
     uint32_t patterns;
 
+    /* Under `lock`. */
     pthread_t events;
     _Atomic bool events_run;
 
@@ -361,25 +169,16 @@ static struct {
     load_job *jobs_head, *jobs_tail;
     bool loader_started;
 
-    /* Callback timing (relaxed atomics, written by the callback). */
-    _Atomic int64_t cb_count, cb_ns_sum, cb_ns_max, cb_gap_max, cb_last_start, cb_frames;
-    _Atomic int64_t frame_offset; /* engine frame − stream frame */
-    _Atomic int64_t engine_frame;
-
     /* Trigger latency, newest LATENCIES (under stats_lock). */
     float latency_ms[LATENCIES];
     int64_t latency_n;
-    int32_t xruns_base;
 
     _Atomic int64_t sample_bytes;
+    int32_t io_registered; /* mio_register's result at load */
 } E;
 
-/* The input and the recorder (further down): the event thread refreshes
- * the input's clock, sends its meters and hands the count-in's downbeat
- * to the recorder. */
-static void refresh_input_clock(void);
-static void deliver_input(ErlNifEnv *env, int64_t now);
 static void count_in_heard(ErlNifEnv *env, const ErlNifPid *owner, bool has_owner, const sp_event *ev);
+static void deliver_input(ErlNifEnv *env, int64_t now);
 static ERL_NIF_TERM input_info(ErlNifEnv *env);
 static void midi_in_latency(const sp_event *ev);
 
@@ -390,12 +189,6 @@ static ERL_NIF_TERM error_tuple(ErlNifEnv *env, const char *reason) {
 }
 
 static ERL_NIF_TERM ok_atom(ErlNifEnv *env) { return atom(env, "ok"); }
-
-static int64_t now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
-}
 
 static ERL_NIF_TERM make_map(ErlNifEnv *env, ERL_NIF_TERM *keys, ERL_NIF_TERM *vals, size_t n) {
     ERL_NIF_TERM map;
@@ -410,150 +203,17 @@ static void free_garbage(const sp_garbage *g) {
 
 /* ── Commands ────────────────────────────────────────────────────────────── */
 
-static bool push_cmd(const sp_cmd *c) {
-    pthread_mutex_lock(&E.push);
-    bool ok = sp_push(&SP, c);
-    pthread_mutex_unlock(&E.push);
-    return ok;
-}
-
-/* A control command. Caller holds ctl. With no stream rendering, the
+/* A control command. Caller holds OUT.ctl. With no stream rendering, the
  * control path plays the renderer and applies it now; with no event
  * thread, it also frees what was retired. */
 static bool ctl_push(const sp_cmd *c) {
-    bool ok = push_cmd(c);
-    if (E.drains) sp_drain(&SP, false);
+    bool ok = mio_push(c);
+    if (OUT.drains) sp_drain(&SP, false);
     if (!E.events_alive) {
         sp_garbage g;
         while (sp_pop_garbage(&SP, &g)) free_garbage(&g);
     }
     return ok;
-}
-
-/* ── The output stream ───────────────────────────────────────────────────── */
-
-static int32_t output_cb(AAudioStream *s, void *user, void *data, int32_t frames) {
-    (void)user;
-    int64_t t0 = now_ns();
-    int64_t last = atomic_load_explicit(&E.cb_last_start, memory_order_relaxed);
-    if (last > 0 && t0 - last > atomic_load_explicit(&E.cb_gap_max, memory_order_relaxed))
-        atomic_store_explicit(&E.cb_gap_max, t0 - last, memory_order_relaxed);
-    atomic_store_explicit(&E.cb_last_start, t0, memory_order_relaxed);
-    atomic_store_explicit(&E.frame_offset, SP.frame - aa.getFramesWritten(s), memory_order_relaxed);
-
-    sp_render(&SP, data, frames);
-
-    int64_t dt = now_ns() - t0;
-    atomic_fetch_add_explicit(&E.cb_count, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&E.cb_ns_sum, dt, memory_order_relaxed);
-    atomic_fetch_add_explicit(&E.cb_frames, frames, memory_order_relaxed);
-    if (dt > atomic_load_explicit(&E.cb_ns_max, memory_order_relaxed))
-        atomic_store_explicit(&E.cb_ns_max, dt, memory_order_relaxed);
-    atomic_store_explicit(&E.engine_frame, SP.frame, memory_order_relaxed);
-    return AA_CALLBACK_CONTINUE;
-}
-
-/* Disconnected (headphones unplugged, Bluetooth gone) or failed: the
- * stream has stopped. AAudio forbids closing it here; the event thread
- * reopens it. */
-static void output_error_cb(AAudioStream *s, void *user, aaudio_result_t err) {
-    (void)s;
-    (void)user;
-    LOGE("output stream error %d", err);
-    atomic_store(&E.running, false);
-    atomic_store(&E.out_dead, true);
-}
-
-static bool stream_quiet(int32_t state) {
-    return state == AA_STATE_OPEN || state == AA_STATE_PAUSED || state == AA_STATE_FLUSHED ||
-           state == AA_STATE_STOPPED || state == AA_STATE_DISCONNECTED;
-}
-
-/* Stop the stream and wait until no callback can run; false if it was
- * still running after a second. */
-static bool stop_stream(AAudioStream *s) {
-    int64_t deadline = now_ns() + 1000000000LL;
-    int32_t state = aa.getState(s);
-    while (!stream_quiet(state) && now_ns() < deadline) {
-        if (state == AA_STATE_STARTING || state == AA_STATE_STARTED) aa.requestStop(s);
-        int32_t next = state;
-        aa.waitForStateChange(s, state, &next, 100000000LL);
-        state = aa.getState(s);
-    }
-    if (!stream_quiet(state)) {
-        LOGE("stream still running (state %d): left open", state);
-        return false;
-    }
-    return true;
-}
-
-/* Stop and close the stream; the control path renders from here (drains).
- * Caller holds `lock`. A stream that won't stop stays open and is never
- * closed under a running callback: false. */
-static bool close_output_locked(void) {
-    atomic_store(&E.running, false);
-    if (!E.out) return true;
-    if (!stop_stream(E.out)) return false;
-    aa.close(E.out);
-    E.out = NULL;
-    pthread_mutex_lock(&E.ctl);
-    E.drains = true;
-    sp_drain(&SP, false);
-    pthread_mutex_unlock(&E.ctl);
-    return true;
-}
-
-/* Open and start the output stream at the device's rate; the renderer
- * takes over from the control path. Caller holds `lock`. */
-static aaudio_result_t open_output_locked(void) {
-    AAudioStreamBuilder *b;
-    aaudio_result_t r = aa.createStreamBuilder(&b);
-    if (r != AA_OK) return r;
-    aa.setDirection(b, AA_DIRECTION_OUTPUT);
-    aa.setChannelCount(b, 2);
-    aa.setFormat(b, AA_FORMAT_PCM_FLOAT);
-    aa.setSharingMode(b, AA_SHARING_SHARED);
-    aa.setPerformanceMode(b, AA_PERF_LOW_LATENCY);
-    aa.setUsage(b, AA_USAGE_MEDIA);
-    aa.setContentType(b, AA_CONTENT_MUSIC);
-    aa.setDataCallback(b, output_cb, NULL);
-    aa.setErrorCallback(b, output_error_cb, NULL);
-    AAudioStream *s = NULL;
-    r = aa.openStream(b, &s);
-    aa.builderDelete(b);
-    if (r != AA_OK) return r;
-
-    int rate = aa.getSampleRate(s);
-    E.burst = aa.getFramesPerBurst(s);
-    E.capacity = aa.getBufferCapacityInFrames(s);
-    /* Double buffering; the event thread adds a burst after an underrun. */
-    if (E.burst > 0) aa.setBufferSizeInFrames(s, 2 * E.burst);
-    int32_t buffer = aa.getBufferSizeInFrames(s);
-    atomic_store(&E.buffer_frames, buffer);
-    atomic_store(&E.rate, rate);
-    atomic_store(&SP.latency_frames, buffer);
-    E.xruns_base = 0;
-
-    pthread_mutex_lock(&E.ctl);
-    sp_cmd c = {.type = SP_CMD_RATE, .u.rate = rate};
-    push_cmd(&c);
-    sp_drain(&SP, false);
-    E.drains = false;
-    pthread_mutex_unlock(&E.ctl);
-
-    E.out = s;
-    atomic_store(&E.out_dead, false);
-    r = aa.requestStart(s);
-    if (r != AA_OK) {
-        LOGE("output start failed: %d", r);
-        close_output_locked();
-        return r;
-    }
-    atomic_store(&E.running, true);
-    LOGI("output open: device %d, %d Hz, burst %d, buffer %d of %d, %s, %s", aa.getDeviceId(s), rate, E.burst,
-         buffer, E.capacity, aa.getPerformanceMode(s) == AA_PERF_LOW_LATENCY ? "low latency" : "not low latency",
-         aa.getSharingMode(s) == AA_SHARING_EXCLUSIVE ? "exclusive" : "shared");
-    return AA_OK;
 }
 
 /* ── The event thread ────────────────────────────────────────────────────── */
@@ -578,7 +238,7 @@ static ERL_NIF_TERM step_struct(ErlNifEnv *env, const sp_event *ev) {
 
 static void record_latency(const sp_event *ev) {
     int64_t cf, cns;
-    int rate = atomic_load(&E.rate);
+    int rate = atomic_load(&OUT.rate);
     if (!sp_get_clock(&SP, &cf, &cns) || rate <= 0) return;
     double heard_ns = (double)cns + (double)(ev->frame - cf) * 1e9 / rate;
     float ms = (float)((heard_ns - (double)ev->t_ns) / 1e6);
@@ -592,10 +252,10 @@ static bool pad_started[SP_PADS];
 static int pad_last[SP_PADS]; /* 0 none, SP_EV_VOICE_START, SP_EV_VOICE_END */
 
 static void deliver_events(ErlNifEnv *env) {
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     bool has_owner = E.has_owner;
     ErlNifPid owner = E.owner;
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
 
     sp_event ev, head = {.type = 0xff};
     bool any_voice = false;
@@ -651,63 +311,13 @@ static void deliver_events(ErlNifEnv *env) {
                                     enif_make_int64(env, head.frame)));
 }
 
-static void refresh_clock(void) {
-    int64_t pos, time;
-    if (E.out && aa.getTimestamp(E.out, CLOCK_MONOTONIC, &pos, &time) == AA_OK)
-        sp_set_clock(&SP, pos + atomic_load(&E.frame_offset), time);
-}
-
-/* After an underrun, a burst more of buffer (up to the capacity). */
-static void tune_buffer(void) {
-    if (!E.out || E.burst <= 0) return;
-    int32_t xruns = aa.getXRunCount(E.out);
-    if (xruns <= E.xruns_base) return;
-    E.xruns_base = xruns;
-    int32_t size = aa.getBufferSizeInFrames(E.out);
-    if (size + E.burst <= E.capacity) {
-        aa.setBufferSizeInFrames(E.out, size + E.burst);
-        size = aa.getBufferSizeInFrames(E.out);
-        atomic_store(&E.buffer_frames, size);
-        atomic_store(&SP.latency_frames, size);
-        LOGI("underrun: buffer now %d frames", size);
-    }
-}
-
-/* The stream died: close it and open a new one, on whatever output the
- * system now routes to. Event thread, `lock` held. */
-static void reopen_locked(void) {
-    if (E.out && !close_output_locked()) return;
-    aaudio_result_t r = open_output_locked();
-    if (r == AA_OK) {
-        atomic_fetch_add(&E.reopens, 1);
-        LOGI("output reopened");
-    } else {
-        LOGE("output reopen failed: %d", r);
-    }
-}
-
 static void *events_main(void *arg) {
     (void)arg;
-    /* Android's audio priority, so playhead and voice events keep up with
-     * the UI. Best effort. */
-    if (setpriority(PRIO_PROCESS, (id_t)gettid(), -16) != 0) LOGE("events: could not raise the thread's priority");
+    /* So playhead and voice events keep up with the UI. */
+    raise_priority(-16, "events");
     ErlNifEnv *env = enif_alloc_env();
-    int64_t next_clock = 0, next_reopen = 0;
     while (atomic_load(&E.events_run)) {
         int64_t now = now_ns();
-        if (atomic_load(&E.out_dead) && now >= next_reopen && pthread_mutex_trylock(&E.lock) == 0) {
-            if (atomic_load(&E.events_run)) reopen_locked();
-            pthread_mutex_unlock(&E.lock);
-            next_reopen = now + REOPEN_PERIOD_NS;
-        }
-        if (now >= next_clock) {
-            if (atomic_load(&E.running)) {
-                refresh_clock();
-                tune_buffer();
-            }
-            refresh_input_clock();
-            next_clock = now + CLOCK_PERIOD_NS;
-        }
         deliver_events(env);
         deliver_input(env, now);
         sp_garbage g;
@@ -718,166 +328,13 @@ static void *events_main(void *arg) {
     return NULL;
 }
 
-/* ── Decoding (the loader thread) ────────────────────────────────────────── */
+/* ── Loading (the loader thread) ─────────────────────────────────────────── */
 
 typedef struct {
     int16_t *pcm; /* interleaved, `channels` per frame */
-    int64_t frames, capacity;
+    int64_t frames;
     int channels, rate;
 } decoded;
-
-static bool grow(decoded *d, int64_t need) {
-    if (need <= d->capacity) return true;
-    int64_t cap = d->capacity ? d->capacity : need;
-    while (cap < need) cap *= 2;
-    int16_t *p = realloc(d->pcm, (size_t)cap * (size_t)d->channels * sizeof(int16_t));
-    if (!p) return false;
-    d->pcm = p;
-    d->capacity = cap;
-    return true;
-}
-
-/* Decode the first audio track of `path` to 16-bit, keeping up to two
- * channels. NULL or a reason. */
-static const char *decode_file(const char *path, decoded *d) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return "not_found";
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        close(fd);
-        return "not_found";
-    }
-    AMediaExtractor *ex = md.exNew();
-    if (!ex) {
-        close(fd);
-        return "alloc";
-    }
-    if (md.exSetDataSourceFd(ex, fd, 0, st.st_size) != 0) {
-        md.exDelete(ex);
-        close(fd);
-        return "unsupported";
-    }
-
-    AMediaCodec *codec = NULL;
-    int32_t rate = 0, channels = 0;
-    int64_t duration_us = 0;
-    bool audio = false;
-    for (size_t i = 0; i < md.exGetTrackCount(ex) && !codec; i++) {
-        AMediaFormat *f = md.exGetTrackFormat(ex, i);
-        const char *mime = NULL;
-        if (md.fmtGetString(f, "mime", &mime) && strncmp(mime, "audio/", 6) == 0) {
-            audio = true;
-            md.fmtGetInt32(f, "sample-rate", &rate);
-            md.fmtGetInt32(f, "channel-count", &channels);
-            md.fmtGetInt64(f, "durationUs", &duration_us);
-            md.exSelectTrack(ex, i);
-            codec = md.codecCreateDecoderByType(mime);
-            if (codec && md.codecConfigure(codec, f, NULL, NULL, 0) != 0) {
-                md.codecDelete(codec);
-                codec = NULL;
-            }
-        }
-        md.fmtDelete(f);
-    }
-    const char *failure = NULL;
-    if (!audio) failure = "no_audio";
-    else if (!codec || rate <= 0 || channels <= 0) failure = "unsupported";
-    else if (duration_us > (int64_t)MAX_SECONDS * 1000000) failure = "too_long";
-    if (failure) {
-        if (codec) md.codecDelete(codec);
-        md.exDelete(ex);
-        close(fd);
-        return failure;
-    }
-
-    int out_channels = channels, out_rate = rate, encoding = PCM_16BIT;
-    d->channels = channels > 2 ? 2 : channels;
-    d->rate = rate;
-    if (!grow(d, duration_us > 0 ? duration_us * rate / 1000000 + rate / 4 : (int64_t)rate * 10)) failure = "alloc";
-    else if (md.codecStart(codec) != 0) failure = "decode_error";
-    bool input_done = false;
-
-    while (!failure) {
-        if (!input_done) {
-            ssize_t in = md.codecDequeueInputBuffer(codec, 5000);
-            if (in >= 0) {
-                size_t size = 0;
-                uint8_t *buf = md.codecGetInputBuffer(codec, (size_t)in, &size);
-                ssize_t n = buf ? md.exReadSampleData(ex, buf, size) : -1;
-                int queued;
-                if (n < 0) {
-                    queued = md.codecQueueInputBuffer(codec, (size_t)in, 0, 0, 0, CODEC_EOS);
-                    input_done = true;
-                } else {
-                    queued = md.codecQueueInputBuffer(codec, (size_t)in, 0, (size_t)n, (uint64_t)md.exGetSampleTime(ex), 0);
-                    md.exAdvance(ex);
-                }
-                if (!buf || queued != 0) failure = "decode_error";
-            } else if (in != CODEC_TRY_AGAIN) {
-                failure = "decode_error";
-            }
-            if (failure) break;
-        }
-
-        codec_buffer_info info;
-        ssize_t out = md.codecDequeueOutputBuffer(codec, &info, 5000);
-        if (out == CODEC_FORMAT_CHANGED) {
-            AMediaFormat *f = md.codecGetOutputFormat(codec);
-            md.fmtGetInt32(f, "channel-count", &out_channels);
-            md.fmtGetInt32(f, "sample-rate", &out_rate);
-            if (!md.fmtGetInt32(f, "pcm-encoding", &encoding)) encoding = PCM_16BIT;
-            md.fmtDelete(f);
-            if (d->frames == 0) d->rate = out_rate; /* e.g. HE-AAC decodes at twice the container's rate */
-            if (encoding != PCM_16BIT && encoding != PCM_FLOAT) failure = "unsupported";
-            if (out_channels <= 0) failure = "decode_error";
-            continue;
-        }
-        if (out == CODEC_TRY_AGAIN || out == CODEC_BUFFERS_CHANGED) continue;
-        if (out < 0) {
-            failure = "decode_error";
-            break;
-        }
-        size_t size = 0;
-        uint8_t *buf = md.codecGetOutputBuffer(codec, (size_t)out, &size);
-        if (!buf) {
-            md.codecReleaseOutputBuffer(codec, (size_t)out, false);
-            failure = "decode_error";
-            break;
-        }
-        int bytes = encoding == PCM_FLOAT ? 4 : 2;
-        int64_t frames = info.size / (int64_t)(bytes * out_channels);
-        /* At the rate the decoder delivers (HE-AAC: twice the container's). */
-        int64_t limit = (int64_t)MAX_SECONDS * d->rate + d->rate;
-        if (d->frames + frames > limit) failure = "too_long";
-        else if (!grow(d, d->frames + frames)) failure = "alloc";
-        if (!failure) {
-            const uint8_t *src = buf + info.offset;
-            int16_t *dst = d->pcm + d->frames * d->channels;
-            for (int64_t f = 0; f < frames; f++) {
-                for (int c = 0; c < d->channels; c++) {
-                    int k = c < out_channels ? c : 0; /* a mono stream after a stereo start feeds both */
-                    if (encoding == PCM_FLOAT) {
-                        float x = ((const float *)src)[f * out_channels + k] * 32767.0f;
-                        dst[f * d->channels + c] = (int16_t)(x > 32767 ? 32767 : x < -32768 ? -32768 : x);
-                    } else {
-                        dst[f * d->channels + c] = ((const int16_t *)src)[f * out_channels + k];
-                    }
-                }
-            }
-            d->frames += frames;
-        }
-        bool eos = (info.flags & CODEC_EOS) != 0;
-        md.codecReleaseOutputBuffer(codec, (size_t)out, false);
-        if (eos) break;
-    }
-
-    md.codecStop(codec);
-    md.codecDelete(codec);
-    md.exDelete(ex);
-    close(fd);
-    if (!failure && d->frames == 0) failure = "no_audio";
-    return failure;
-}
 
 static ERL_NIF_TERM peaks_term(ErlNifEnv *env, const int16_t *data, int64_t frames, int channels) {
     ERL_NIF_TERM peaks;
@@ -897,12 +354,12 @@ static ERL_NIF_TERM loaded_info(ErlNifEnv *env, const sp_sample *s, int source_r
 }
 
 static void send_loaded(ErlNifEnv *env, ERL_NIF_TERM id, ERL_NIF_TERM result) {
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     if (E.has_owner) {
         ERL_NIF_TERM msg = enif_make_tuple4(env, tag(env), atom(env, "loaded"), id, result);
         if (!enif_send(NULL, &E.owner, env, msg)) enif_clear_env(env);
     }
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
 }
 
 static bool job_current(const load_job *job) {
@@ -927,7 +384,7 @@ static const char *convert_pcm(load_job *job, decoded *d) {
 static void run_job(load_job *job) {
     int64_t t0 = now_ns();
     decoded d = {0};
-    const char *failure = job->path ? decode_file(job->path, &d) : convert_pcm(job, &d);
+    const char *failure = job->failure ? job->failure : convert_pcm(job, &d);
     sp_sample *s = NULL;
     if (!failure) {
         int64_t frames = d.frames;
@@ -948,7 +405,7 @@ static void run_job(load_job *job) {
     ErlNifEnv *env = enif_alloc_env();
     ERL_NIF_TERM id = enif_make_copy(env, job->id);
     ERL_NIF_TERM result;
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     if (!job_current(job)) {
         result = error_tuple(env, "cancelled");
     } else if (failure) {
@@ -977,14 +434,18 @@ static void run_job(load_job *job) {
             s = NULL;
         }
     }
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
     if (s) {
         atomic_fetch_sub(&E.sample_bytes, (int64_t)s->bytes);
         sp_sample_free(s);
     }
     send_loaded(env, id, result);
     enif_free_env(env);
-    LOGI("load %s: %s in %.0f ms", job->path ? job->path : "pcm", failure ? failure : "ok", load_ms);
+}
+
+static void free_job(load_job *job) {
+    if (job->env) enif_free_env(job->env);
+    free(job);
 }
 
 static void *loader_main(void *arg) {
@@ -997,21 +458,14 @@ static void *loader_main(void *arg) {
         if (!E.jobs_head) E.jobs_tail = NULL;
         pthread_mutex_unlock(&E.jobs_lock);
         run_job(job);
-        enif_free_env(job->env);
-        free(job->path);
-        free(job);
+        free_job(job);
     }
     return NULL;
 }
 
 /* ── NIF helpers ─────────────────────────────────────────────────────────── */
 
-#define REQUIRE_LIBS(env)                                                                                  \
-    if (!libs_ok)                                                                                          \
-    return enif_make_tuple2(env, atom(env, "error"),                                                       \
-                            enif_make_tuple2(env, atom(env, "missing"), atom(env, libs_error ? libs_error : "unknown")))
-
-/* Caller holds ctl. */
+/* Caller holds OUT.ctl. */
 static bool is_owner(ErlNifEnv *env) {
     ErlNifPid self;
     return enif_self(env, &self) && E.has_owner && enif_compare_pids(&E.owner, &self) == 0;
@@ -1044,27 +498,19 @@ static bool get_range(ErlNifEnv *env, ERL_NIF_TERM term, int lo, int hi, int *ou
 
 /* A control command for the owner: ok, not_owner, or busy (queue full). */
 static ERL_NIF_TERM control(ErlNifEnv *env, const sp_cmd *c) {
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     bool mine = is_owner(env);
     bool queued = mine && ctl_push(c);
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
     if (!mine) return error_tuple(env, "not_owner");
     return queued ? ok_atom(env) : error_tuple(env, "busy");
 }
 
 /* A live command: anyone, while a stream renders. */
 static ERL_NIF_TERM live(ErlNifEnv *env, sp_cmd *c) {
-    if (!atomic_load(&E.running)) return error_tuple(env, "not_running");
+    if (!atomic_load(&OUT.running)) return error_tuple(env, "not_running");
     c->t_ns = now_ns();
-    return push_cmd(c) ? ok_atom(env) : error_tuple(env, "busy");
-}
-
-static ERL_NIF_TERM stream_info(ErlNifEnv *env) {
-    ERL_NIF_TERM keys[4] = {atom(env, "rate"), atom(env, "burst"), atom(env, "buffer_frames"), atom(env, "low_latency")};
-    ERL_NIF_TERM vals[4] = {enif_make_int(env, atomic_load(&E.rate)), enif_make_int(env, E.burst),
-                            enif_make_int(env, atomic_load(&E.buffer_frames)),
-                            atom(env, E.out && aa.getPerformanceMode(E.out) == AA_PERF_LOW_LATENCY ? "true" : "false")};
-    return make_map(env, keys, vals, 4);
+    return mio_push(c) ? ok_atom(env) : error_tuple(env, "busy");
 }
 
 static void clear_ids_locked(void) {
@@ -1076,57 +522,20 @@ static void clear_ids_locked(void) {
 
 /* ── The input: the mic or other apps, into the recorder ─────────────────── *
  *
- * One input at a time feeds REC (recorder.c). The mic is an AAudio input
- * stream of its own (its callback is the producer), so recording never
- * touches the output callback; other apps are Android's playback capture
+ * One input at a time feeds REC (recorder.c) through IN (magpie_io.c). The
+ * mic is a mob_audio_io input stream of its own on "magpie_mic"
+ * (Magpie.Audio.Native.Io opens it once input_open/1 has made the input
+ * OPENING; its STARTED makes it OPEN), so recording never touches the
+ * output callback. Other apps are Android's playback capture
  * (MediaProjection + AudioRecord, API 29+) in Kotlin
  * (plugins/magpie_capture), whose read thread hands 16-bit PCM to
- * native_write. `IN.lock` covers the input's lifecycle and the recorder's
- * buffers (lock order in the header). Java is called with IN.lock held
- * (start/stop return without waiting on the UI thread); its callbacks
- * take IN.lock themselves, never from inside Kotlin's own lock, and
- * native_write takes no lock. */
+ * native_write. Java is called with IN.lock held (start/stop return
+ * without waiting on the UI thread); its callbacks take IN.lock
+ * themselves, never from inside Kotlin's own lock, and native_write takes
+ * no lock. */
 
-#define CAPTURE_CLASS "com.genericjam.magpie.capture.MagpieCapture"
 #define METER_PERIOD_NS 40000000LL
 #define COUNT_IN_BEATS 4
-
-extern JavaVM *g_jvm;
-extern jobject g_activity;
-
-enum { SRC_NONE, SRC_MIC, SRC_APPS };
-enum { IN_CLOSED, IN_OPENING, IN_OPEN };
-
-static rc_recorder REC;
-
-static struct {
-    pthread_mutex_t lock;
-    _Atomic int source, status;
-    /* The input's id: bumps on every open (the new input's id, which the
-     * owner's messages and Kotlin's calls carry) and every close. */
-    _Atomic int64_t gen;
-    /* Open for the input's id while it is IN_OPEN: its producer (the mic's
-     * callback, Kotlin's read thread) writes to REC only through it. */
-    rc_gate gate;
-    AAudioStream *mic; /* under lock */
-    int preset;
-    _Atomic bool mic_dead; /* its error callback ran: the event thread reports it */
-
-    /* Input frame `clk_pos` was captured at CLOCK_MONOTONIC `clk_ns` (seqlock;
-     * the event thread writes, the mic callback reads). */
-    _Atomic uint32_t clk_seq;
-    _Atomic int64_t clk_pos, clk_ns;
-    int64_t cb_frames; /* mic callback's own: frames it has been handed */
-    _Atomic int64_t callbacks, clock_misses, newest_ns;
-
-    /* The recording, under lock. */
-    bool armed, count_in, start_sent, full_sent;
-    int64_t peaks_sent, next_meter;
-
-    /* Java: MagpieCapture, found through the activity's class loader. */
-    jclass cls;
-    jmethodID start, stop;
-} IN;
 
 typedef struct {
     float *data;
@@ -1139,14 +548,29 @@ static void pcm_dtor(ErlNifEnv *env, void *obj) {
     free(((pcm_res *)obj)->data);
 }
 
+#ifdef __ANDROID__
+
+/* ── Other apps (Android): Java ── */
+
+#define CAPTURE_CLASS "com.genericjam.magpie.capture.MagpieCapture"
+
+extern JavaVM *g_jvm;
+extern jobject g_activity;
+
 /* Send `msg` (built in `menv`) to the owner, then free `menv`. `caller`:
  * the NIF's env, or NULL on a thread of our own. */
 static void tell_owner(ErlNifEnv *caller, ErlNifEnv *menv, ERL_NIF_TERM msg) {
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     if (E.has_owner) enif_send(caller, &E.owner, menv, msg);
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
     enif_free_env(menv);
 }
+
+/* MagpieCapture, found through the activity's class loader. Under IN.lock. */
+static struct {
+    jclass cls;
+    jmethodID start, stop;
+} CAP;
 
 static void tell_closed(ErlNifEnv *caller, int64_t id, const char *reason) {
     ErlNifEnv *m = enif_alloc_env();
@@ -1163,8 +587,6 @@ static void tell_started(ErlNifEnv *caller, int64_t id, const char *source, int 
                enif_make_tuple5(m, tag(m), atom(m, "input"), enif_make_int64(m, id), atom(m, "started"),
                                 make_map(m, keys, vals, 3)));
 }
-
-/* ── Java ── */
 
 static JNIEnv *jni_env(bool *attached) {
     *attached = false;
@@ -1192,31 +614,6 @@ static jmethodID method(JNIEnv *j, jclass cls, const char *name, const char *sig
     return jni_failed(j) ? NULL : id;
 }
 
-/* Whether the app holds RECORD_AUDIO (AAudio would open a silent stream
- * without it). True when Java can't be asked: the stream decides. */
-static bool mic_permitted(void) {
-    bool attached;
-    JNIEnv *j = jni_env(&attached);
-    if (!j || !g_activity) {
-        if (j) jni_done(attached);
-        return true;
-    }
-    bool ok = true;
-    if ((*j)->PushLocalFrame(j, 8) == JNI_OK) {
-        jmethodID check =
-            method(j, (*j)->GetObjectClass(j, g_activity), "checkSelfPermission", "(Ljava/lang/String;)I");
-        jstring name = (*j)->NewStringUTF(j, "android.permission.RECORD_AUDIO");
-        if (check && name) {
-            jint r = (*j)->CallIntMethod(j, g_activity, check, name);
-            if (!jni_failed(j)) ok = r == 0; /* PERMISSION_GRANTED */
-        }
-        jni_failed(j);
-        (*j)->PopLocalFrame(j, NULL);
-    }
-    jni_done(attached);
-    return ok;
-}
-
 /* MagpieCapture.nativeStarted(session, rate, channels): capture runs; false
  * tells Kotlin to stop (nobody waits for it any more). Kotlin calls it
  * before its read thread starts. `session` is the input's id. */
@@ -1225,8 +622,7 @@ static jboolean JNICALL native_started(JNIEnv *j, jclass cls, jlong session, jin
     (void)cls;
     pthread_mutex_lock(&IN.lock);
     bool current = session == atomic_load(&IN.gen) && atomic_load(&IN.source) == SRC_APPS &&
-                   atomic_load(&IN.status) == IN_OPENING && rate > 0 &&
-                   channels >= 1 && channels <= 2;
+                   atomic_load(&IN.status) == IN_OPENING && rate > 0 && channels >= 1 && channels <= 2;
     if (current) {
         rc_init(&REC, rate, channels);
         atomic_store(&IN.status, IN_OPEN);
@@ -1240,9 +636,9 @@ static jboolean JNICALL native_started(JNIEnv *j, jclass cls, jlong session, jin
 
 /* MagpieCapture.nativeWrite(session, buffer, frames, t0): 16-bit
  * interleaved PCM from a direct buffer, its first frame captured at `t0`
- * (System.nanoTime, CLOCK_MONOTONIC). The read thread; takes no lock. A
- * call for an input that is no longer open (a read thread that outlived
- * its stop) stops at the gate. */
+ * (System.nanoTime, CLOCK_MONOTONIC: mai_now_ns's clock on Android). The
+ * read thread; takes no lock. A call for an input that is no longer open
+ * (a read thread that outlived its stop) stops at the gate. */
 static void JNICALL native_write(JNIEnv *j, jclass cls, jlong session, jobject buffer, jint frames, jlong t0) {
     (void)cls;
     static float scratch[2 * 1024]; /* the gate admits one input's thread */
@@ -1288,7 +684,7 @@ static void JNICALL native_ended(JNIEnv *j, jclass cls, jlong session, jstring r
  * native thread only sees the system's) and register its natives. Caller
  * holds IN.lock. */
 static bool capture_bind(JNIEnv *j) {
-    if (IN.cls) return true;
+    if (CAP.cls) return true;
     if (!g_activity || (*j)->PushLocalFrame(j, 16) != JNI_OK) return false;
     bool ok = false;
     jmethodID get_loader =
@@ -1306,13 +702,13 @@ static bool capture_bind(JNIEnv *j) {
             {"nativeWrite", "(JLjava/nio/ByteBuffer;IJ)V", (void *)native_write},
             {"nativeEnded", "(JLjava/lang/String;)V", (void *)native_ended},
         };
-        IN.start = (*j)->GetStaticMethodID(j, cls, "start", "(IJ)Ljava/lang/String;");
-        if (jni_failed(j)) IN.start = NULL;
-        IN.stop = (*j)->GetStaticMethodID(j, cls, "stop", "()V");
-        if (jni_failed(j)) IN.stop = NULL;
-        if (IN.start && IN.stop && (*j)->RegisterNatives(j, cls, natives, 3) == 0 && !jni_failed(j)) {
-            IN.cls = (jclass)(*j)->NewGlobalRef(j, cls);
-            ok = IN.cls != NULL;
+        CAP.start = (*j)->GetStaticMethodID(j, cls, "start", "(IJ)Ljava/lang/String;");
+        if (jni_failed(j)) CAP.start = NULL;
+        CAP.stop = (*j)->GetStaticMethodID(j, cls, "stop", "()V");
+        if (jni_failed(j)) CAP.stop = NULL;
+        if (CAP.start && CAP.stop && (*j)->RegisterNatives(j, cls, natives, 3) == 0 && !jni_failed(j)) {
+            CAP.cls = (jclass)(*j)->NewGlobalRef(j, cls);
+            ok = CAP.cls != NULL;
         }
     }
     if (!ok) LOGE("other apps: %s not usable", CAPTURE_CLASS);
@@ -1332,7 +728,7 @@ static const char *capture_start(int rate, int64_t id) {
     if (!capture_bind(j)) {
         failure = "unsupported";
     } else {
-        jstring r = (jstring)(*j)->CallStaticObjectMethod(j, IN.cls, IN.start, (jint)rate, (jlong)id);
+        jstring r = (jstring)(*j)->CallStaticObjectMethod(j, CAP.cls, CAP.start, (jint)rate, (jlong)id);
         if (jni_failed(j)) {
             failure = "error";
         } else if (r) {
@@ -1354,93 +750,25 @@ static const char *capture_start(int rate, int64_t id) {
  * IN.lock. */
 static void capture_stop(void) {
     bool attached;
-    JNIEnv *j = IN.cls ? jni_env(&attached) : NULL;
+    JNIEnv *j = CAP.cls ? jni_env(&attached) : NULL;
     if (!j) return;
-    (*j)->CallStaticVoidMethod(j, IN.cls, IN.stop);
+    (*j)->CallStaticVoidMethod(j, CAP.cls, CAP.stop);
     jni_failed(j);
     jni_done(attached);
 }
 
-/* ── The mic ── */
+#else
 
-static bool input_clock(int64_t *pos, int64_t *ns) {
-    for (int tries = 0; tries < 4; tries++) {
-        uint32_t a = atomic_load_explicit(&IN.clk_seq, memory_order_acquire);
-        int64_t p = atomic_load_explicit(&IN.clk_pos, memory_order_relaxed);
-        int64_t t = atomic_load_explicit(&IN.clk_ns, memory_order_relaxed);
-        atomic_thread_fence(memory_order_acquire);
-        if (!(a & 1) && a == atomic_load_explicit(&IN.clk_seq, memory_order_relaxed)) {
-            *pos = p;
-            *ns = t;
-            return t > 0;
-        }
-    }
-    return false;
+/* Other apps' audio is Android's MediaProjection; iOS has no such thing. */
+static const char *capture_start(int rate, int64_t id) {
+    (void)rate;
+    (void)id;
+    return "unsupported";
 }
 
-/* The mic's callback: its frames go to the recorder, stamped with when
- * they were captured (the input timestamp; before the first one, "just
- * now"). Frame k of the stream is the k-th the callback is handed.
- * `user` is the input's id: a stream closed under it (one that wouldn't
- * stop) stops at the gate. */
-static int32_t mic_cb(AAudioStream *s, void *user, void *data, int32_t frames) {
-    (void)s;
-    if (!rc_enter(&IN.gate, (int64_t)(intptr_t)user)) return AA_CALLBACK_CONTINUE;
-    const int rate = REC.rate;
-    int64_t pos, ns, t0;
-    if (input_clock(&pos, &ns)) {
-        t0 = ns + (int64_t)((double)(IN.cb_frames - pos) * 1e9 / rate);
-    } else {
-        t0 = now_ns() - (int64_t)((double)frames * 1e9 / rate);
-        atomic_fetch_add_explicit(&IN.clock_misses, 1, memory_order_relaxed);
-    }
-    rc_write(&REC, data, frames, t0);
-    IN.cb_frames += frames;
-    rc_leave(&IN.gate);
-    atomic_fetch_add_explicit(&IN.callbacks, 1, memory_order_relaxed);
-    atomic_store_explicit(&IN.newest_ns, t0 + (int64_t)((double)frames * 1e9 / rate), memory_order_relaxed);
-    return AA_CALLBACK_CONTINUE;
-}
+static void capture_stop(void) {}
 
-/* `user` is the input's id, as for mic_cb: only the open mic's error counts. */
-static void mic_error_cb(AAudioStream *s, void *user, aaudio_result_t err) {
-    (void)s;
-    LOGE("mic stream error %d", err);
-    if ((int64_t)(intptr_t)user == atomic_load(&IN.gen)) atomic_store(&IN.mic_dead, true);
-}
-
-static aaudio_result_t open_mic(int rate, int preset, int64_t id) {
-    AAudioStreamBuilder *b;
-    aaudio_result_t r = aa.createStreamBuilder(&b);
-    if (r != AA_OK) return r;
-    aa.setDirection(b, AA_DIRECTION_INPUT);
-    aa.setSampleRate(b, rate);
-    aa.setChannelCount(b, 1);
-    aa.setFormat(b, AA_FORMAT_PCM_FLOAT);
-    aa.setSharingMode(b, AA_SHARING_SHARED);
-    aa.setPerformanceMode(b, AA_PERF_LOW_LATENCY);
-    aa.setInputPreset(b, preset);
-    aa.setDataCallback(b, mic_cb, (void *)(intptr_t)id);
-    aa.setErrorCallback(b, mic_error_cb, (void *)(intptr_t)id);
-    r = aa.openStream(b, &IN.mic);
-    aa.builderDelete(b);
-    return r;
-}
-
-/* The event thread, every 20 ms: the mic's timestamp. */
-static void refresh_input_clock(void) {
-    if (atomic_load(&IN.source) != SRC_MIC || pthread_mutex_trylock(&IN.lock) != 0) return;
-    int64_t pos, ns;
-    if (IN.mic && atomic_load(&IN.status) == IN_OPEN && aa.getTimestamp(IN.mic, CLOCK_MONOTONIC, &pos, &ns) == AA_OK) {
-        uint32_t s = atomic_load_explicit(&IN.clk_seq, memory_order_relaxed);
-        atomic_store_explicit(&IN.clk_seq, s + 1, memory_order_relaxed);
-        atomic_thread_fence(memory_order_release);
-        atomic_store_explicit(&IN.clk_pos, pos, memory_order_relaxed);
-        atomic_store_explicit(&IN.clk_ns, ns, memory_order_relaxed);
-        atomic_store_explicit(&IN.clk_seq, s + 2, memory_order_release);
-    }
-    pthread_mutex_unlock(&IN.lock);
-}
+#endif
 
 /* ── The recording ── */
 
@@ -1448,9 +776,9 @@ static void cancel_count_in_locked(void) {
     if (!IN.count_in) return;
     IN.count_in = false;
     sp_cmd c = {.type = SP_CMD_COUNT_IN, .u.count_in = {0, 0}};
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     ctl_push(&c);
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
 }
 
 /* Disarm and drop what was recorded. Caller holds IN.lock. */
@@ -1464,40 +792,26 @@ static void drop_recording_locked(void) {
 }
 
 /* Close whatever input is open; no producer writes to REC once its gate is
- * shut, the first thing here. False when the mic stream wouldn't stop: it
- * stays allocated (closed to the owner, shut out of the recorder) for the
- * next close to try again. Caller holds IN.lock. */
-static bool close_input_locked(void) {
+ * shut, the first thing here. The mic's stream is Magpie.Audio.Native.Io's
+ * to close (after this, so its STOPPED isn't taken for a lost device).
+ * Caller holds IN.lock. */
+static void close_input_locked(void) {
     int source = atomic_load(&IN.source);
     atomic_store(&IN.status, IN_CLOSED);
     rc_gate_shut(&IN.gate);
     drop_recording_locked();
-    if (source == SRC_MIC && IN.mic) {
-        if (!stop_stream(IN.mic)) return false;
-        aa.close(IN.mic);
-        IN.mic = NULL;
-    } else if (source == SRC_APPS) {
-        capture_stop();
-    }
+    if (source == SRC_APPS) capture_stop();
+    atomic_store(&IN.mic_stream, 0);
     atomic_store(&IN.source, SRC_NONE);
+    atomic_store(&IN.news, IN_NEWS_NONE);
     atomic_fetch_add(&IN.gen, 1); /* late calls and events from that input are stale */
-    atomic_store(&IN.mic_dead, false);
-    return true;
 }
 
 /* The event thread, on the count-in's event: the recorder starts with the
  * audio captured when the downbeat is heard (if that take is still armed;
  * the recorder ignores an earlier one's); the owner hears of the beats. */
 static void count_in_heard(ErlNifEnv *env, const ErlNifPid *owner, bool has_owner, const sp_event *ev) {
-    int rate = atomic_load(&E.rate);
-    int64_t cf, cns, heard;
-    if (sp_get_clock(&SP, &cf, &cns) && rate > 0) {
-        heard = cns + (int64_t)((double)(ev->until - cf) * 1e9 / rate);
-    } else {
-        int64_t ahead = ev->until - atomic_load(&E.engine_frame) + atomic_load(&SP.latency_frames);
-        heard = now_ns() + (int64_t)((double)ahead * 1e9 / (rate > 0 ? rate : DEFAULT_RATE));
-    }
-    rc_start_at(&REC, (uint32_t)ev->a, heard);
+    rc_start_at(&REC, (uint32_t)ev->a, mio_heard_ns(ev->until));
     if (has_owner)
         send_owner(owner, env,
                    enif_make_tuple5(env, tag(env), atom(env, "count_in"), enif_make_uint(env, (uint32_t)ev->a),
@@ -1520,24 +834,28 @@ static ERL_NIF_TERM take_term(ErlNifEnv *env) {
     return IN.armed ? enif_make_uint(env, atomic_load(&REC.gen)) : atom(env, "nil");
 }
 
-/* The event thread, every pass: a dead mic, the recording's start and end,
- * and every METER_PERIOD_NS the level and the new peaks. */
+/* The event thread, every pass: the mic's news (started, gone), the
+ * recording's start and end, and every METER_PERIOD_NS the level and the
+ * new peaks. */
 static void deliver_input(ErlNifEnv *env, int64_t now) {
     if (atomic_load(&IN.source) == SRC_NONE || pthread_mutex_trylock(&IN.lock) != 0) return;
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     bool has_owner = E.has_owner;
     ErlNifPid owner = E.owner;
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
 
     int64_t id = atomic_load(&IN.gen);
-    if (atomic_load(&IN.source) == SRC_MIC && atomic_exchange(&IN.mic_dead, false) &&
-        atomic_load(&IN.status) == IN_OPEN) {
-        atomic_store(&IN.status, IN_CLOSED);
-        rc_gate_shut(&IN.gate);
-        if (has_owner)
-            send_owner(&owner, env,
-                       enif_make_tuple5(env, tag(env), atom(env, "input"), enif_make_int64(env, id), atom(env, "closed"),
-                                        atom(env, "disconnected")));
+    int news = atomic_exchange(&IN.news, IN_NEWS_NONE);
+    if (news == IN_NEWS_STARTED && has_owner) {
+        ERL_NIF_TERM keys[3] = {atom(env, "source"), atom(env, "rate"), atom(env, "channels")};
+        ERL_NIF_TERM vals[3] = {atom(env, "mic"), enif_make_int(env, REC.rate), enif_make_int(env, REC.channels)};
+        send_owner(&owner, env,
+                   enif_make_tuple5(env, tag(env), atom(env, "input"), enif_make_int64(env, id), atom(env, "started"),
+                                    make_map(env, keys, vals, 3)));
+    } else if (news == IN_NEWS_LOST && has_owner) {
+        send_owner(&owner, env,
+                   enif_make_tuple5(env, tag(env), atom(env, "input"), enif_make_int64(env, id), atom(env, "closed"),
+                                    atom(env, "disconnected")));
     }
     if (atomic_load(&IN.status) == IN_OPEN && has_owner) {
         int state = atomic_load(&REC.state);
@@ -1587,8 +905,8 @@ static void deliver_input(ErlNifEnv *env, int64_t now) {
  * the bytes, their timestamp and the port's source and generation; it
  * parses them (one parser per source) and queues one SP_CMD_MIDI per
  * message. Out: the renderer stamps messages with engine frames into
- * SP.midi.out; the sending thread turns each frame into CLOCK_MONOTONIC
- * through the output timestamp, sleeps until then and queues the bytes on
+ * SP.midi.out; the sending thread turns each frame into mai_now_ns time
+ * through the engine clock, sleeps until then and queues the bytes on
  * every output with mob_midi_send, stamped with that time. */
 
 #define MIDI_SOURCES MOB_MIDI_MAX_SOURCES
@@ -1641,10 +959,10 @@ typedef struct {
 /* With no stream rendering, the control path renders: now, if it does
  * (else the stream being reopened does first). */
 static void midi_drain_offline(void) {
-    if (atomic_load(&E.running)) return;
-    pthread_mutex_lock(&E.ctl);
-    if (E.drains) sp_drain(&SP, false);
-    pthread_mutex_unlock(&E.ctl);
+    if (atomic_load(&OUT.running)) return;
+    pthread_mutex_lock(&OUT.ctl);
+    if (OUT.drains) sp_drain(&SP, false);
+    pthread_mutex_unlock(&OUT.ctl);
 }
 
 /* What input `source` held ends: SP_CMD_MIDI_GONE in the command queue, so
@@ -1652,7 +970,7 @@ static void midi_drain_offline(void) {
  * renderer applies after the commands queued by then (never lost). */
 static void source_gone(int source) {
     sp_cmd c = {.type = SP_CMD_MIDI_GONE, .u.midi = {.src = (uint8_t)source}};
-    if (!push_cmd(&c)) atomic_fetch_or(&SP.midi.gone, 1ull << source);
+    if (!mio_push(&c)) atomic_fetch_or(&SP.midi.gone, 1ull << source);
     midi_drain_offline();
 }
 
@@ -1667,8 +985,8 @@ static void midi_emit(void *ctx, mi_msg m) {
     uint8_t kind = m.status & 0xF0;
     bool release = m.status < 0xF0 && (kind == 0x80 || (kind == 0x90 && m.d2 == 0) ||
                                        (kind == 0xB0 && (m.d1 == 120 || m.d1 == 123)));
-    if (!atomic_load(&E.running) && !release) return;
-    if (!push_cmd(&c)) {
+    if (!atomic_load(&OUT.running) && !release) return;
+    if (!mio_push(&c)) {
         if (release) source_gone(x->src);
         return;
     }
@@ -1681,12 +999,12 @@ static void midi_emit(void *ctx, mi_msg m) {
  * another app sending into Magpie's own device): a fresh parser (no running
  * status or SysEx left by the port before), and what the old one held ends.
  * A timestamp of 0 (senders that don't stamp) or more than a second off
- * isn't CLOCK_MONOTONIC: the message counts as arriving now. */
+ * isn't on mob_midi_now_ns's clock: the message counts as arriving now. */
 static void midi_sink(void *ctx, uint32_t source, uint32_t generation, const uint8_t *bytes, size_t len,
                       int64_t timestamp_ns) {
     (void)ctx;
     if (source == 0 || source >= MIDI_SOURCES || generation == 0 || len == 0) return;
-    midi_ctx x = {.t_ns = mob_midi_timestamp_or(timestamp_ns, now_ns()), .src = (uint8_t)source};
+    midi_ctx x = {.t_ns = mob_midi_timestamp_or(timestamp_ns, mob_midi_now_ns()), .src = (uint8_t)source};
     midi_source *s = &MI.sources[source];
     pthread_mutex_lock(&s->lock);
     if (generation != s->generation) {
@@ -1737,27 +1055,37 @@ static void outs_retry(void) {
 }
 
 /* The sending thread's copy of the clock map: a read that loses to the
- * event thread's update (sp_get_clock gives up rather than spin) uses the
- * last one instead of sending early. */
+ * render's update (sp_get_clock gives up rather than spin) uses the last
+ * one instead of sending early. */
 typedef struct {
     int64_t frame, ns;
     int rate;
 } midi_clock;
 
-/* When engine frame `frame` is heard (CLOCK_MONOTONIC), or now before
- * there has been a timestamp. */
+/* When engine frame `frame` is heard (mai_now_ns), or now before there has
+ * been a presentation time. */
 static int64_t frame_ns(midi_clock *c, int64_t frame) {
     int64_t cf, cns;
-    int rate = atomic_load(&E.rate);
+    int rate = atomic_load(&OUT.rate);
     if (sp_get_clock(&SP, &cf, &cns) && rate > 0) *c = (midi_clock){cf, cns, rate};
     if (c->rate <= 0) return now_ns();
     return c->ns + (int64_t)((double)(frame - c->frame) * 1e9 / c->rate);
 }
 
+/* Until mai_now_ns() reaches `t`. Android: an absolute sleep on its clock
+ * (CLOCK_MONOTONIC). Elsewhere mai_now_ns is the host-tick clock no
+ * clock_nanosleep takes: relative sleeps until it is reached. */
 static void sleep_until(int64_t t) {
+#ifdef __ANDROID__
     struct timespec ts = {.tv_sec = (time_t)(t / 1000000000LL), .tv_nsec = (long)(t % 1000000000LL)};
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
     }
+#else
+    for (int64_t d = t - now_ns(); d > 0; d = t - now_ns()) {
+        struct timespec ts = {.tv_sec = (time_t)(d / 1000000000LL), .tv_nsec = (long)(d % 1000000000LL)};
+        nanosleep(&ts, NULL);
+    }
+#endif
 }
 
 static void stat_push(float *ring, int64_t *n, float v) {
@@ -1772,7 +1100,7 @@ static void stat_push(float *ring, int64_t *n, float v) {
  * would otherwise get a burst of clock); notes go however late. */
 static void *midi_out_main(void *arg) {
     (void)arg;
-    if (setpriority(PRIO_PROCESS, (id_t)gettid(), -19) != 0) LOGE("midi: could not raise the sending thread's priority");
+    raise_priority(-19, "midi");
     uint8_t buf[MIDI_SEND_MAX];
     mo_event evs[MIDI_SEND_MAX];
     midi_clock clk = {0, 0, 0};
@@ -1828,7 +1156,7 @@ static void *midi_out_main(void *arg) {
 }
 
 /* Start the sending thread. What is left in the out queue from an earlier
- * stream is stale: the notes whose other half went out go first, at once
+ * run is stale: the notes whose other half went out go first, at once
  * (mo_take_stale: a note-on that went out keeps its note-off, a voice still
  * holding its note gets its note-on), the rest is dropped. Caller holds
  * E.lock; the queue has no consumer until the thread starts. */
@@ -1854,7 +1182,7 @@ static void midi_stop_locked(void) {
 /* The event thread: a MIDI note's timestamp → when its voice is heard. */
 static void midi_in_latency(const sp_event *ev) {
     int64_t cf, cns;
-    int rate = atomic_load(&E.rate);
+    int rate = atomic_load(&OUT.rate);
     if (!sp_get_clock(&SP, &cf, &cns) || rate <= 0) return;
     double heard_ns = (double)cns + (double)(ev->frame - cf) * 1e9 / rate;
     stat_push(MI.in_ms, &MI.in_n, (float)((heard_ns - (double)ev->t_ns) / 1e6));
@@ -1890,77 +1218,61 @@ static ERL_NIF_TERM midi_info(ErlNifEnv *env) {
 
 /* ── NIFs ────────────────────────────────────────────────────────────────── */
 
-/* open(Owner) -> {ok, #{rate, burst, buffer_frames, low_latency}} | {error, Reason}.
- * Opens and starts the output stream if none runs (a stream left over from
- * a close that wouldn't stop, or a dead one, is closed first), and makes
- * Owner the engine's owner. Dirty IO. */
+/* open(Owner) -> ok | {error, thread | processors}: make Owner the engine's
+ * owner and start the event and MIDI sending threads (if they aren't). The
+ * output stream is Magpie.Audio.Native.Io's, on "magpie_out". Dirty IO. */
 static ERL_NIF_TERM nif_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
-    REQUIRE_LIBS(env);
     ErlNifPid owner;
     if (!enif_get_local_pid(env, argv[0], &owner)) return enif_make_badarg(env);
+    if (E.io_registered != MAI_OK) return error_tuple(env, "processors");
     pthread_mutex_lock(&E.lock);
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     E.owner = owner;
     E.has_owner = true;
-    pthread_mutex_unlock(&E.ctl);
-    if (E.out && !atomic_load(&E.running) && !close_output_locked()) {
-        pthread_mutex_unlock(&E.lock);
-        return error_tuple(env, "output_stuck");
-    }
-    if (!E.out) {
-        aaudio_result_t r = open_output_locked();
-        if (r != AA_OK) {
-            pthread_mutex_unlock(&E.lock);
-            LOGE("output open failed: %d", r);
-            return error_tuple(env, "output_unavailable");
-        }
-    }
+    pthread_mutex_unlock(&OUT.ctl);
     if (!atomic_load(&E.events_run)) {
-        pthread_mutex_lock(&E.ctl);
+        pthread_mutex_lock(&OUT.ctl);
         E.events_alive = true;
-        pthread_mutex_unlock(&E.ctl);
+        pthread_mutex_unlock(&OUT.ctl);
         atomic_store(&E.events_run, true);
         if (pthread_create(&E.events, NULL, events_main, NULL) != 0) {
             atomic_store(&E.events_run, false);
-            pthread_mutex_lock(&E.ctl);
+            pthread_mutex_lock(&OUT.ctl);
             E.events_alive = false;
-            pthread_mutex_unlock(&E.ctl);
-            close_output_locked();
+            pthread_mutex_unlock(&OUT.ctl);
             pthread_mutex_unlock(&E.lock);
             return error_tuple(env, "thread");
         }
     }
     midi_start_locked();
-    ERL_NIF_TERM info = stream_info(env);
     pthread_mutex_unlock(&E.lock);
-    return enif_make_tuple2(env, ok_atom(env), info);
+    return ok_atom(env);
 }
 
-/* close() -> ok | {error, not_owner | output_stuck}: stop and close the
- * stream (samples, pads and patterns stay). Dirty IO. */
+/* close() -> ok | {error, not_owner}: stop the event and MIDI sending
+ * threads (samples, pads and patterns stay; the output stream is closed
+ * by Magpie.Audio.Native.Io). Dirty IO. */
 static ERL_NIF_TERM nif_close(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     (void)argv;
-    REQUIRE_LIBS(env);
     pthread_mutex_lock(&E.lock);
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     bool mine = is_owner(env);
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
     if (!mine) {
         pthread_mutex_unlock(&E.lock);
         return error_tuple(env, "not_owner");
     }
     if (atomic_exchange(&E.events_run, false)) pthread_join(E.events, NULL);
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     E.events_alive = false;
     sp_garbage g;
     while (sp_pop_garbage(&SP, &g)) free_garbage(&g);
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
     midi_stop_locked();
-    bool closed = close_output_locked();
     pthread_mutex_unlock(&E.lock);
-    return closed ? ok_atom(env) : error_tuple(env, "output_stuck");
+    return ok_atom(env);
 }
 
 /* reset() -> ok | {error, not_owner | busy}: everything off: voices fade,
@@ -1969,15 +1281,15 @@ static ERL_NIF_TERM nif_close(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
 static ERL_NIF_TERM nif_reset(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     (void)argv;
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     if (!is_owner(env)) {
-        pthread_mutex_unlock(&E.ctl);
+        pthread_mutex_unlock(&OUT.ctl);
         return error_tuple(env, "not_owner");
     }
     sp_cmd c = {.type = SP_CMD_RESET};
     bool queued = ctl_push(&c);
     if (queued) clear_ids_locked();
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
     return queued ? ok_atom(env) : error_tuple(env, "busy");
 }
 
@@ -1997,132 +1309,173 @@ static bool ensure_loader(void) {
     return ok;
 }
 
-static void free_job(load_job *job) {
-    if (job->env) enif_free_env(job->env);
-    free(job->path);
-    free(job);
-}
-
-/* Queue `job` for sample `id`: claim (or reuse) its slot, make every
- * earlier load of it stale. */
-static ERL_NIF_TERM enqueue_load(ErlNifEnv *env, ERL_NIF_TERM id, load_job *job) {
-    if (!ensure_loader()) {
-        free_job(job);
-        return error_tuple(env, "thread");
-    }
-    pthread_mutex_lock(&E.ctl);
-    if (!is_owner(env)) {
-        pthread_mutex_unlock(&E.ctl);
-        free_job(job);
-        return error_tuple(env, "not_owner");
-    }
-    int slot = find_id(id);
-    if (slot < 0) {
-        for (int i = 0; i < SP_SLOTS && slot < 0; i++)
-            if (!E.ids[i].used) slot = i;
-        if (slot < 0) {
-            pthread_mutex_unlock(&E.ctl);
-            free_job(job);
-            return error_tuple(env, "too_many_samples");
-        }
-        E.ids[slot] = (id_entry){.used = true, .env = enif_alloc_env()};
-        E.ids[slot].id = enif_make_copy(E.ids[slot].env, id);
-    }
-    E.ids[slot].request = ++E.requests;
-    job->slot = slot;
-    job->request = E.ids[slot].request;
-    job->rate = atomic_load(&E.rate) > 0 ? atomic_load(&E.rate) : DEFAULT_RATE;
-    job->id = enif_make_copy(job->env, id);
-    pthread_mutex_unlock(&E.ctl);
-
+static void queue_job(load_job *job) {
     pthread_mutex_lock(&E.jobs_lock);
     if (E.jobs_tail) E.jobs_tail->next = job;
     else E.jobs_head = job;
     E.jobs_tail = job;
     pthread_cond_signal(&E.jobs_cv);
     pthread_mutex_unlock(&E.jobs_lock);
-    return ok_atom(env);
 }
 
-/* load_sample(Id, Path) -> ok | {error, not_owner | too_many_samples |
- * {missing, Lib}}. Decodes (MediaCodec) on the loader thread; the result
- * arrives as {magpie_audio, loaded, Id, {ok, Info} | {error, Reason}}. A
- * later load or unload of the same Id makes this one {error, cancelled}. */
-static ERL_NIF_TERM nif_load_sample(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
-    REQUIRE_LIBS(env);
-    ErlNifBinary path;
-    if (!enif_inspect_iolist_as_binary(env, argv[1], &path) || path.size == 0 || memchr(path.data, 0, path.size))
-        return enif_make_badarg(env);
-    load_job *job = calloc(1, sizeof(*job));
-    if (!job) return error_tuple(env, "alloc");
-    job->env = enif_alloc_env();
-    if (!(job->path = strndup((const char *)path.data, path.size))) {
-        free_job(job);
-        return error_tuple(env, "alloc");
+/* Claim (or reuse) sample `id`'s slot for a new request, making every
+ * earlier load of it stale: the slot, or -1 with `*failure` set. Caller
+ * holds OUT.ctl and is the owner. */
+static int claim_slot_locked(ERL_NIF_TERM id, uint64_t *request, const char **failure) {
+    int slot = find_id(id);
+    if (slot < 0) {
+        for (int i = 0; i < SP_SLOTS && slot < 0; i++)
+            if (!E.ids[i].used) slot = i;
+        if (slot < 0) {
+            *failure = "too_many_samples";
+            return -1;
+        }
+        E.ids[slot] = (id_entry){.used = true, .env = enif_alloc_env()};
+        E.ids[slot].id = enif_make_copy(E.ids[slot].env, id);
     }
-    return enqueue_load(env, argv[0], job);
+    E.ids[slot].request = ++E.requests;
+    *request = E.ids[slot].request;
+    return slot;
 }
 
-/* load_pcm(Id, Pcm, Rate, Channels) -> as load_sample/2, from interleaved
- * f32le PCM (the library's canonical form) instead of a file: no decoder.
- * The binary is held, not copied, until the loader has converted it. */
+/* load_pcm(Id, Pcm, Rate, Channels) -> ok | {error, not_owner |
+ * too_many_samples | thread | alloc}: interleaved f32le PCM (the library's
+ * canonical form) as sample Id, on the loader thread; the result arrives as
+ * {magpie_audio, loaded, Id, {ok, Info} | {error, Reason}}. A later load or
+ * unload of the same Id makes this one {error, cancelled}. The binary is
+ * held, not copied, until the loader has converted it. */
 static ERL_NIF_TERM nif_load_pcm(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     int rate, channels;
     if (!enif_is_binary(env, argv[1]) || !get_range(env, argv[2], 1000, 384000, &rate) ||
         !get_range(env, argv[3], 1, 8, &channels))
         return enif_make_badarg(env);
+    if (!ensure_loader()) return error_tuple(env, "thread");
     load_job *job = calloc(1, sizeof(*job));
     if (!job) return error_tuple(env, "alloc");
     job->env = enif_alloc_env();
     job->pcm = enif_make_copy(job->env, argv[1]);
     job->source_rate = rate;
     job->channels = channels;
-    return enqueue_load(env, argv[0], job);
-}
-
-/* decode(Path) -> {ok, #{pcm, rate, channels, frames, peaks, peak_frames}}
- * | {error, Reason}: a file (MediaCodec: wav, mp3, aac/m4a, flac, ogg, …)
- * as interleaved f32le at its own rate, up to two channels, for importing
- * into the library. Touches no engine state; anyone may call. Dirty IO. */
-static ERL_NIF_TERM nif_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
-    REQUIRE_LIBS(env);
-    ErlNifBinary path_bin;
-    if (!enif_inspect_iolist_as_binary(env, argv[0], &path_bin) || path_bin.size == 0 ||
-        memchr(path_bin.data, 0, path_bin.size))
-        return enif_make_badarg(env);
-    char *path = strndup((const char *)path_bin.data, path_bin.size);
-    if (!path) return error_tuple(env, "alloc");
-    decoded d = {0};
-    const char *failure = decode_file(path, &d);
-    free(path);
+    job->id = enif_make_copy(job->env, argv[0]);
+    const char *failure = NULL;
+    pthread_mutex_lock(&OUT.ctl);
+    if (!is_owner(env)) failure = "not_owner";
+    else job->slot = claim_slot_locked(argv[0], &job->request, &failure);
+    job->rate = mio_rate();
+    pthread_mutex_unlock(&OUT.ctl);
     if (failure) {
-        free(d.pcm);
+        free_job(job);
         return error_tuple(env, failure);
     }
-    ERL_NIF_TERM pcm;
-    size_t n = (size_t)d.frames * (size_t)d.channels;
-    unsigned char *out = enif_make_new_binary(env, n * sizeof(float), &pcm);
-    if (!out) {
-        free(d.pcm);
-        return error_tuple(env, "alloc");
-    }
-    for (size_t i = 0; i < n; i++) {
-        float x = d.pcm[i] / 32768.0f;
-        memcpy(out + 4 * i, &x, sizeof(x));
-    }
-    ERL_NIF_TERM keys[6] = {atom(env, "pcm"),    atom(env, "rate"),  atom(env, "channels"),
-                            atom(env, "frames"), atom(env, "peaks"), atom(env, "peak_frames")};
-    ERL_NIF_TERM vals[6] = {pcm,
-                            enif_make_int(env, d.rate),
-                            enif_make_int(env, d.channels),
-                            enif_make_int64(env, d.frames),
-                            peaks_term(env, d.pcm, d.frames, d.channels),
-                            enif_make_int(env, SP_PEAK_FRAMES)};
-    free(d.pcm);
-    return enif_make_tuple2(env, ok_atom(env), make_map(env, keys, vals, 6));
+    queue_job(job);
+    return ok_atom(env);
+}
+
+/* load_claim(Id) -> {ok, Ticket} | {error, not_owner | too_many_samples}:
+ * a file load of sample Id begins (Magpie.Audio.Native decodes it): the
+ * slot is claimed now, so loads and unloads of Id keep the order they were
+ * made in. load_ticket/5 or load_ticket_failed/3 finishes it. */
+static ERL_NIF_TERM nif_load_claim(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    const char *failure = NULL;
+    uint64_t request = 0;
+    int slot = -1;
+    pthread_mutex_lock(&OUT.ctl);
+    if (!is_owner(env)) failure = "not_owner";
+    else slot = claim_slot_locked(argv[0], &request, &failure);
+    pthread_mutex_unlock(&OUT.ctl);
+    if (failure) return error_tuple(env, failure);
+    return enif_make_tuple2(env, ok_atom(env),
+                            enif_make_tuple2(env, enif_make_int(env, slot), enif_make_uint64(env, request)));
+}
+
+static bool get_ticket(ErlNifEnv *env, ERL_NIF_TERM term, int *slot, uint64_t *request) {
+    const ERL_NIF_TERM *t;
+    int arity;
+    ErlNifUInt64 r;
+    if (!enif_get_tuple(env, term, &arity, &t) || arity != 2 || !get_range(env, t[0], 0, SP_SLOTS - 1, slot) ||
+        !enif_get_uint64(env, t[1], &r))
+        return false;
+    *request = r;
+    return true;
+}
+
+/* load_ticket(Id, Ticket, Pcm, Rate, Channels) -> ok | {error, thread |
+ * alloc}: the claimed load's decoded f32le PCM, as load_pcm/4 (stale if
+ * Id was loaded or unloaded since the claim: {error, cancelled}). Anyone
+ * (the decoding process). */
+static ERL_NIF_TERM nif_load_ticket(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    int slot, rate, channels;
+    uint64_t request;
+    if (!get_ticket(env, argv[1], &slot, &request) || !enif_is_binary(env, argv[2]) ||
+        !get_range(env, argv[3], 1000, 384000, &rate) || !get_range(env, argv[4], 1, 8, &channels))
+        return enif_make_badarg(env);
+    if (!ensure_loader()) return error_tuple(env, "thread");
+    load_job *job = calloc(1, sizeof(*job));
+    if (!job) return error_tuple(env, "alloc");
+    job->env = enif_alloc_env();
+    job->pcm = enif_make_copy(job->env, argv[2]);
+    job->source_rate = rate;
+    job->channels = channels;
+    job->slot = slot;
+    job->request = request;
+    job->rate = mio_rate();
+    job->id = enif_make_copy(job->env, argv[0]);
+    queue_job(job);
+    return ok_atom(env);
+}
+
+/* load_ticket_failed(Id, Ticket, Reason) -> ok | {error, thread | alloc}:
+ * the claimed load's file didn't decode; the owner hears {error, Reason}
+ * (in order with the loads queued before it). Anyone. */
+static ERL_NIF_TERM nif_load_ticket_failed(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    static const char *reasons[] = {"not_found", "unsupported", "no_audio", "decode_error",
+                                    "too_long",  "alloc",       "busy",     "cancelled"};
+    int slot;
+    uint64_t request;
+    char name[16];
+    const char *reason = NULL;
+    if (!get_ticket(env, argv[1], &slot, &request) ||
+        !enif_get_atom(env, argv[2], name, sizeof(name), ERL_NIF_LATIN1))
+        return enif_make_badarg(env);
+    for (size_t i = 0; i < sizeof(reasons) / sizeof(reasons[0]) && !reason; i++)
+        if (strcmp(name, reasons[i]) == 0) reason = reasons[i];
+    if (!reason) return enif_make_badarg(env);
+    if (!ensure_loader()) return error_tuple(env, "thread");
+    load_job *job = calloc(1, sizeof(*job));
+    if (!job) return error_tuple(env, "alloc");
+    job->env = enif_alloc_env();
+    job->failure = reason;
+    job->slot = slot;
+    job->request = request;
+    job->rate = mio_rate();
+    job->id = enif_make_copy(job->env, argv[0]);
+    queue_job(job);
+    return ok_atom(env);
+}
+
+/* import_chunk(Chunk, Channels) -> {Pcm, Peaks}: a decoded chunk of
+ * interleaved native-endian f32 (`Channels` per frame) as the library
+ * keeps it: the first two channels, clipped to ±1, with its peaks (one byte
+ * per 256 frames). Anyone. */
+static ERL_NIF_TERM nif_import_chunk(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    ErlNifBinary in;
+    int channels;
+    if (!enif_inspect_binary(env, argv[0], &in) || !get_range(env, argv[1], 1, 64, &channels) ||
+        in.size % (4 * (size_t)channels) != 0)
+        return enif_make_badarg(env);
+    int keep = channels > 2 ? 2 : channels;
+    int64_t frames = (int64_t)(in.size / (4 * (size_t)channels));
+    ERL_NIF_TERM pcm, peaks;
+    float *out = (float *)enif_make_new_binary(env, (size_t)frames * (size_t)keep * sizeof(float), &pcm);
+    uint8_t *p = enif_make_new_binary(env, (size_t)sp_peak_count(frames), &peaks);
+    if (!out || !p) return error_tuple(env, "alloc");
+    mio_import_chunk(in.data, frames, channels, keep, out, p);
+    return enif_make_tuple2(env, pcm, peaks);
 }
 
 /* unload_sample(Id) -> ok | {error, not_owner | unknown_sample | busy}.
@@ -2131,24 +1484,24 @@ static ERL_NIF_TERM nif_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
  * (the command queue is full) changes nothing. */
 static ERL_NIF_TERM nif_unload_sample(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     if (!is_owner(env)) {
-        pthread_mutex_unlock(&E.ctl);
+        pthread_mutex_unlock(&OUT.ctl);
         return error_tuple(env, "not_owner");
     }
     int slot = find_id(argv[0]);
     if (slot < 0) {
-        pthread_mutex_unlock(&E.ctl);
+        pthread_mutex_unlock(&OUT.ctl);
         return error_tuple(env, "unknown_sample");
     }
     sp_cmd c = {.type = SP_CMD_SAMPLE, .u.sample = {slot, NULL}};
     if (E.ids[slot].loaded && !ctl_push(&c)) {
-        pthread_mutex_unlock(&E.ctl);
+        pthread_mutex_unlock(&OUT.ctl);
         return error_tuple(env, "busy");
     }
     enif_free_env(E.ids[slot].env);
     E.ids[slot] = (id_entry){0};
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
     return ok_atom(env);
 }
 
@@ -2186,14 +1539,14 @@ static ERL_NIF_TERM nif_set_pad(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
         return enif_make_badarg(env);
     bool empty = enif_is_identical(t[0], atom(env, "nil"));
 
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     if (!is_owner(env)) {
-        pthread_mutex_unlock(&E.ctl);
+        pthread_mutex_unlock(&OUT.ctl);
         return error_tuple(env, "not_owner");
     }
     int slot = empty ? -1 : find_id(t[0]);
     if (!empty && (slot < 0 || !E.ids[slot].loaded)) {
-        pthread_mutex_unlock(&E.ctl);
+        pthread_mutex_unlock(&OUT.ctl);
         return error_tuple(env, "unknown_sample");
     }
     sp_cmd c = {.type = SP_CMD_PAD,
@@ -2211,7 +1564,7 @@ static ERL_NIF_TERM nif_set_pad(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
                           .choke = (uint8_t)choke,
                           .root = (uint8_t)root}};
     bool queued = ctl_push(&c);
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
     return queued ? ok_atom(env) : error_tuple(env, "busy");
 }
 
@@ -2245,16 +1598,16 @@ static ERL_NIF_TERM nif_set_pattern(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     }
     sp_pattern_sort(p);
 
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     if (!is_owner(env)) {
-        pthread_mutex_unlock(&E.ctl);
+        pthread_mutex_unlock(&OUT.ctl);
         free(p);
         return error_tuple(env, "not_owner");
     }
     p->id = ++E.patterns;
     sp_cmd c = {.type = SP_CMD_PATTERN, .u.pattern = {p, at_bar}};
     bool queued = ctl_push(&c);
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
     if (!queued) {
         free(p);
         return error_tuple(env, "busy");
@@ -2338,7 +1691,7 @@ static ERL_NIF_TERM nif_clock(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
     (void)argc;
     (void)argv;
     int64_t frame, ns;
-    int rate = atomic_load(&E.rate);
+    int rate = atomic_load(&OUT.rate);
     if (!sp_get_clock(&SP, &frame, &ns) || rate <= 0) return atom(env, "nil");
     int64_t offset = (int64_t)enif_monotonic_time(ERL_NIF_NSEC) - now_ns();
     ERL_NIF_TERM keys[3] = {atom(env, "frame"), atom(env, "time"), atom(env, "rate")};
@@ -2374,59 +1727,40 @@ static ERL_NIF_TERM ring_term(ErlNifEnv *env, const float *ring, const int64_t *
 
 static ERL_NIF_TERM latency_term(ErlNifEnv *env) { return ring_term(env, E.latency_ms, &E.latency_n, LATENCIES); }
 
-/* info() -> map of engine diagnostics. Dirty IO (takes `lock` to ask the
- * stream). */
+/* info() -> map of the engine's diagnostics (Magpie.Audio.Native merges
+ * the streams' from mob_audio_io). Dirty IO. */
 static ERL_NIF_TERM nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     (void)argv;
-    enum { N = 29 };
+    enum { N = 21 };
     pthread_mutex_lock(&E.lock);
-    AAudioStream *s = E.out;
-    int rate = atomic_load(&E.rate);
-    double out_latency_ms = -1;
-    int64_t pos, time;
-    if (s && libs_ok && aa.getTimestamp(s, CLOCK_MONOTONIC, &pos, &time) == AA_OK && rate > 0) {
-        double presented = (double)pos + (double)(now_ns() - time) * rate / 1e9;
-        out_latency_ms = 1000.0 * ((double)aa.getFramesWritten(s) - presented) / rate;
-    }
-    int64_t cbs = atomic_load(&E.cb_count), cb_sum = atomic_load(&E.cb_ns_sum), cb_frames = atomic_load(&E.cb_frames);
-    pthread_mutex_lock(&E.ctl);
+    int rate = atomic_load(&OUT.rate);
+    int64_t cbs = atomic_load(&OUT.cb_count), cb_sum = atomic_load(&OUT.cb_ns_sum),
+            cb_frames = atomic_load(&OUT.cb_frames);
+    pthread_mutex_lock(&OUT.ctl);
     int samples = 0;
     for (int i = 0; i < SP_SLOTS; i++) samples += E.ids[i].loaded;
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
     ERL_NIF_TERM keys[N] = {
-        atom(env, "libraries"),       atom(env, "running"),          atom(env, "rate"),
-        atom(env, "burst"),           atom(env, "buffer_frames"),    atom(env, "buffer_capacity"),
-        atom(env, "low_latency"),     atom(env, "exclusive"),        atom(env, "device"),
-        atom(env, "output_latency_ms"), atom(env, "underruns"),      atom(env, "reopens"),
-        atom(env, "callbacks"),       atom(env, "callback_mean_us"), atom(env, "callback_max_us"),
-        atom(env, "callback_gap_max_us"), atom(env, "cpu_load"),     atom(env, "voices_active"),
-        atom(env, "voices_peak"),     atom(env, "steals"),           atom(env, "hard_cuts"),
-        atom(env, "trigger_latency_ms"), atom(env, "samples"),       atom(env, "sample_bytes"),
-        atom(env, "dropped"),         atom(env, "playing"),          atom(env, "frame"),
-        atom(env, "input"),           atom(env, "midi"),
+        atom(env, "running"),          atom(env, "rate"),              atom(env, "callbacks"),
+        atom(env, "callback_mean_us"), atom(env, "callback_max_us"),   atom(env, "callback_gap_max_us"),
+        atom(env, "cpu_load"),         atom(env, "voices_active"),     atom(env, "voices_peak"),
+        atom(env, "steals"),           atom(env, "hard_cuts"),         atom(env, "trigger_latency_ms"),
+        atom(env, "samples"),          atom(env, "sample_bytes"),      atom(env, "dropped"),
+        atom(env, "playing"),          atom(env, "frame"),             atom(env, "starts"),
+        atom(env, "skipped"),          atom(env, "input"),             atom(env, "midi"),
     };
     ERL_NIF_TERM dropped[3] = {enif_make_uint64(env, atomic_load(&SP.cmds_dropped)),
                                enif_make_uint64(env, atomic_load(&SP.events_dropped)),
                                enif_make_uint64(env, atomic_load(&SP.actions_dropped))};
     ERL_NIF_TERM dropped_keys[3] = {atom(env, "commands"), atom(env, "events"), atom(env, "actions")};
     ERL_NIF_TERM vals[N] = {
-        libs_ok ? ok_atom(env) : atom(env, libs_error ? libs_error : "unknown"),
-        atom(env, atomic_load(&E.running) ? "true" : "false"),
+        atom(env, atomic_load(&OUT.running) ? "true" : "false"),
         enif_make_int(env, rate),
-        enif_make_int(env, E.burst),
-        enif_make_int(env, s ? aa.getBufferSizeInFrames(s) : 0),
-        enif_make_int(env, E.capacity),
-        atom(env, s && aa.getPerformanceMode(s) == AA_PERF_LOW_LATENCY ? "true" : "false"),
-        atom(env, s && aa.getSharingMode(s) == AA_SHARING_EXCLUSIVE ? "true" : "false"),
-        enif_make_int(env, s ? aa.getDeviceId(s) : 0),
-        enif_make_double(env, out_latency_ms),
-        enif_make_int(env, s ? aa.getXRunCount(s) : 0),
-        enif_make_int64(env, atomic_load(&E.reopens)),
         enif_make_int64(env, cbs),
         enif_make_double(env, cbs ? (double)cb_sum / cbs / 1000.0 : 0),
-        enif_make_double(env, atomic_load(&E.cb_ns_max) / 1000.0),
-        enif_make_double(env, atomic_load(&E.cb_gap_max) / 1000.0),
+        enif_make_double(env, atomic_load(&OUT.cb_ns_max) / 1000.0),
+        enif_make_double(env, atomic_load(&OUT.cb_gap_max) / 1000.0),
         enif_make_double(env, cb_frames && rate ? (double)cb_sum / (1e9 * (double)cb_frames / rate) : 0),
         enif_make_int(env, atomic_load(&SP.voices_active)),
         enif_make_int(env, atomic_load(&SP.voices_peak)),
@@ -2437,7 +1771,9 @@ static ERL_NIF_TERM nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         enif_make_int64(env, atomic_load(&E.sample_bytes)),
         make_map(env, dropped_keys, dropped, 3),
         atom(env, atomic_load(&SP.playing_now) ? "true" : "false"),
-        enif_make_int64(env, atomic_load(&E.engine_frame)),
+        enif_make_int64(env, atomic_load(&OUT.engine_frame)),
+        enif_make_int64(env, atomic_load(&OUT.starts)),
+        enif_make_int64(env, atomic_load(&OUT.skipped)),
         input_info(env),
         midi_info(env),
     };
@@ -2450,12 +1786,12 @@ static ERL_NIF_TERM nif_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
 static ERL_NIF_TERM nif_reset_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     (void)argv;
-    atomic_store(&E.cb_count, 0);
-    atomic_store(&E.cb_ns_sum, 0);
-    atomic_store(&E.cb_ns_max, 0);
-    atomic_store(&E.cb_gap_max, 0);
-    atomic_store(&E.cb_frames, 0);
-    atomic_store(&E.cb_last_start, 0);
+    atomic_store(&OUT.cb_count, 0);
+    atomic_store(&OUT.cb_ns_sum, 0);
+    atomic_store(&OUT.cb_ns_max, 0);
+    atomic_store(&OUT.cb_gap_max, 0);
+    atomic_store(&OUT.cb_frames, 0);
+    atomic_store(&OUT.cb_last_start, 0);
     atomic_store(&SP.voices_peak, 0);
     atomic_store(&SP.steals, 0);
     atomic_store(&SP.hard_cuts, 0);
@@ -2474,70 +1810,35 @@ static ERL_NIF_TERM nif_reset_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 }
 
 static bool owner_now(ErlNifEnv *env) {
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     bool mine = is_owner(env);
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
     return mine;
 }
 
-static void set_input_clock(int64_t pos, int64_t ns) {
-    uint32_t s = atomic_load(&IN.clk_seq);
-    atomic_store(&IN.clk_seq, s + 1);
-    atomic_store(&IN.clk_pos, pos);
-    atomic_store(&IN.clk_ns, ns);
-    atomic_store(&IN.clk_seq, s + 2);
+/* input_sources() -> [mic | apps]: the sources input_open/1 can open here
+ * (other apps' audio is Android's). */
+static ERL_NIF_TERM nif_input_sources(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    (void)argv;
+#ifdef __ANDROID__
+    return enif_make_list2(env, atom(env, "mic"), atom(env, "apps"));
+#else
+    return enif_make_list1(env, atom(env, "mic"));
+#endif
 }
 
-/* Open the mic as input `id`: mono float at `rate`, low latency, shared,
- * unprocessed (no AGC or noise suppression) where the phone has it. NULL
- * or a reason. Caller holds IN.lock, nothing is open. */
-static const char *open_mic_locked(ErlNifEnv *env, int rate, int64_t id) {
-    if (!mic_permitted()) return "no_permission";
-    aaudio_result_t r = open_mic(rate, AA_PRESET_UNPROCESSED, id);
-    if (r != AA_OK) {
-        LOGI("mic: unprocessed input refused (%d), voice recognition instead", r);
-        r = open_mic(rate, AA_PRESET_VOICE_RECOGNITION, id);
-    }
-    if (r != AA_OK) {
-        LOGE("mic open failed: %d", r);
-        return "input_unavailable";
-    }
-    int got = aa.getSampleRate(IN.mic), channels = aa.getChannelCount(IN.mic);
-    if (channels < 1 || channels > 2) channels = 1;
-    rc_init(&REC, got, channels);
-    IN.preset = aa.getInputPreset(IN.mic);
-    IN.cb_frames = 0;
-    set_input_clock(0, 0);
-    atomic_store(&IN.callbacks, 0);
-    atomic_store(&IN.clock_misses, 0);
-    atomic_store(&IN.mic_dead, false);
-    atomic_store(&IN.source, SRC_MIC);
-    atomic_store(&IN.status, IN_OPEN);
-    rc_gate_open(&IN.gate, id);
-    r = aa.requestStart(IN.mic);
-    if (r != AA_OK) {
-        LOGE("mic start failed: %d", r);
-        close_input_locked();
-        return "input_unavailable";
-    }
-    LOGI("mic open: device %d, %d Hz, %d channel(s), burst %d, preset %d, %s", aa.getDeviceId(IN.mic), got, channels,
-         aa.getFramesPerBurst(IN.mic), IN.preset,
-         aa.getPerformanceMode(IN.mic) == AA_PERF_LOW_LATENCY ? "low latency" : "not low latency");
-    tell_started(env, id, "mic", got, channels);
-    return NULL;
-}
-
-/* input_open(mic | apps) -> {ok, Input} | {error, Reason}: close any input,
- * then open this one as Input (a positive integer). The owner hears
- * {magpie_audio, input, Input, started, Info} (the mic: at once; other
- * apps: after the consent dialog and the capture service) or
- * {magpie_audio, input, Input, closed, Reason}. Reasons now: not_owner
- * (nothing changed), input_stuck (the open mic wouldn't stop: closed to
- * the owner, still allocated), no_permission, input_unavailable,
- * unsupported, busy, no_activity (what was open is closed). Dirty IO. */
+/* input_open(mic | apps) -> {ok, Input, Rate} | {ok, Input} | {error,
+ * Reason}: close any input, then open this one as Input (a positive
+ * integer). The mic: OPENING at the engine's Rate, until "magpie_mic"'s
+ * stream (Magpie.Audio.Native.Io opens it next) starts; other apps:
+ * Kotlin asks for consent. The owner hears {magpie_audio, input, Input,
+ * started, Info} or {magpie_audio, input, Input, closed, Reason}. Reasons
+ * now: not_owner (nothing changed), unsupported (other apps below API 29,
+ * or on iOS), busy, no_activity, error (what was open is closed). Dirty
+ * IO. */
 static ERL_NIF_TERM nif_input_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
-    REQUIRE_LIBS(env);
     int source = enif_is_identical(argv[0], atom(env, "mic"))    ? SRC_MIC
                  : enif_is_identical(argv[0], atom(env, "apps")) ? SRC_APPS
                                                                  : SRC_NONE;
@@ -2545,48 +1846,50 @@ static ERL_NIF_TERM nif_input_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     pthread_mutex_lock(&IN.lock);
     const char *failure = NULL;
     ERL_NIF_TERM opened = 0;
-    int rate = atomic_load(&E.rate) > 0 ? atomic_load(&E.rate) : DEFAULT_RATE;
+    int rate = mio_rate();
     if (!owner_now(env)) {
         failure = "not_owner";
-    } else if (!close_input_locked()) {
-        failure = "input_stuck";
     } else {
+        close_input_locked();
         int64_t id = atomic_fetch_add(&IN.gen, 1) + 1;
+        atomic_store(&IN.callbacks, 0);
+        atomic_store(&IN.clock_misses, 0);
+        atomic_store(&IN.newest_ns, 0);
+        atomic_store(&IN.source, source);
+        atomic_store(&IN.status, IN_OPENING);
         if (source == SRC_MIC) {
-            failure = open_mic_locked(env, rate, id);
+            opened = enif_make_tuple3(env, ok_atom(env), enif_make_int64(env, id), enif_make_int(env, rate));
         } else {
-            atomic_store(&IN.source, SRC_APPS);
-            atomic_store(&IN.status, IN_OPENING);
-            atomic_store(&IN.callbacks, 0);
             failure = capture_start(rate, id);
             if (failure) close_input_locked();
+            else opened = enif_make_tuple2(env, ok_atom(env), enif_make_int64(env, id));
         }
-        if (!failure) opened = enif_make_tuple2(env, ok_atom(env), enif_make_int64(env, id));
     }
     pthread_mutex_unlock(&IN.lock);
     return failure ? error_tuple(env, failure) : opened;
 }
 
-/* input_close() -> ok | {error, not_owner | input_stuck}: close the input;
- * a recording in progress is dropped. Dirty IO. */
+/* input_close() -> ok | {error, not_owner}: close the input; a recording
+ * in progress is dropped (the mic's stream: Magpie.Audio.Native.Io closes
+ * it after this). Dirty IO. */
 static ERL_NIF_TERM nif_input_close(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     (void)argv;
-    REQUIRE_LIBS(env);
     pthread_mutex_lock(&IN.lock);
-    const char *failure = !owner_now(env) ? "not_owner" : !close_input_locked() ? "input_stuck" : NULL;
+    bool mine = owner_now(env);
+    if (mine) close_input_locked();
     pthread_mutex_unlock(&IN.lock);
-    return failure ? error_tuple(env, failure) : ok_atom(env);
+    return mine ? ok_atom(env) : error_tuple(env, "not_owner");
 }
 
 /* record_start(now | on_sound | count_in, MaxSeconds, ThresholdDb,
  * PreRollMs) -> {ok, Take} | {error, not_owner | no_input | recording |
  * not_running | alloc | busy}. Arms the recorder on the open input as Take
- * (a positive integer), its
- * buffer for MaxSeconds allocated now. on_sound: from the first frame at
- * or over ThresholdDb (dBFS), PreRollMs before it; count_in: one bar of
- * clicks at the tempo (from the sequencer's next bar while it plays), then
- * from the audio captured when the downbeat after them is heard. */
+ * (a positive integer), its buffer for MaxSeconds allocated now. on_sound:
+ * from the first frame at or over ThresholdDb (dBFS), PreRollMs before it;
+ * count_in: one bar of clicks at the tempo (from the sequencer's next bar
+ * while it plays), then from the audio captured when the downbeat after
+ * them is heard. */
 static ERL_NIF_TERM nif_record_start(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     double max_s, db, pre_ms;
@@ -2603,7 +1906,7 @@ static ERL_NIF_TERM nif_record_start(ErlNifEnv *env, int argc, const ERL_NIF_TER
     if (!owner_now(env)) failure = "not_owner";
     else if (atomic_load(&IN.status) != IN_OPEN) failure = "no_input";
     else if (IN.armed) failure = "recording";
-    else if (mode == RC_AT_TIME && !atomic_load(&E.running)) failure = "not_running";
+    else if (mode == RC_AT_TIME && !atomic_load(&OUT.running)) failure = "not_running";
     if (!failure) {
         int rate = REC.rate;
         int64_t max_frames = llround(max_s * rate), pre = llround(pre_ms * rate / 1000.0);
@@ -2618,9 +1921,9 @@ static ERL_NIF_TERM nif_record_start(ErlNifEnv *env, int argc, const ERL_NIF_TER
         IN.count_in = false;
         if (mode == RC_AT_TIME) {
             sp_cmd c = {.type = SP_CMD_COUNT_IN, .u.count_in = {atomic_load(&REC.gen), COUNT_IN_BEATS}};
-            pthread_mutex_lock(&E.ctl);
+            pthread_mutex_lock(&OUT.ctl);
             bool queued = ctl_push(&c);
-            pthread_mutex_unlock(&E.ctl);
+            pthread_mutex_unlock(&OUT.ctl);
             if (queued) {
                 IN.count_in = true;
             } else {
@@ -2699,8 +2002,9 @@ static ERL_NIF_TERM nif_record_cancel(ErlNifEnv *env, int argc, const ERL_NIF_TE
     return mine ? ok_atom(env) : error_tuple(env, "not_owner");
 }
 
-/* The input in info/0: nil, or what is open and how it runs. Caller holds
- * nothing but `lock`. */
+/* The input in info/0: nil, or what is open and how it runs (the mic
+ * stream's own figures come from mob_audio_io, merged by
+ * Magpie.Audio.Native). Caller holds nothing but `lock`. */
 static ERL_NIF_TERM input_info(ErlNifEnv *env) {
     pthread_mutex_lock(&IN.lock);
     int source = atomic_load(&IN.source);
@@ -2708,26 +2012,22 @@ static ERL_NIF_TERM input_info(ErlNifEnv *env) {
     if (source != SRC_NONE) {
         int64_t newest = atomic_load(&IN.newest_ns);
         int status = atomic_load(&IN.status);
-        bool mic = source == SRC_MIC && IN.mic;
-        ERL_NIF_TERM keys[12] = {atom(env, "source"),    atom(env, "status"),        atom(env, "rate"),
-                                 atom(env, "channels"),  atom(env, "preset"),        atom(env, "callbacks"),
-                                 atom(env, "clock_misses"), atom(env, "latency_ms"), atom(env, "recorder"),
-                                 atom(env, "burst"),     atom(env, "overruns"),      atom(env, "low_latency")};
-        ERL_NIF_TERM vals[12] = {
+        bool open = status == IN_OPEN;
+        ERL_NIF_TERM keys[9] = {atom(env, "source"),       atom(env, "status"),     atom(env, "rate"),
+                                atom(env, "channels"),     atom(env, "callbacks"),  atom(env, "clock_misses"),
+                                atom(env, "latency_ms"),   atom(env, "recorder"),   atom(env, "stream")};
+        ERL_NIF_TERM vals[9] = {
             atom(env, source == SRC_MIC ? "mic" : "apps"),
-            atom(env, status == IN_OPEN ? "open" : status == IN_OPENING ? "opening" : "closed"),
-            enif_make_int(env, REC.rate),
-            enif_make_int(env, REC.channels),
-            enif_make_int(env, source == SRC_MIC ? IN.preset : 0),
+            atom(env, open ? "open" : status == IN_OPENING ? "opening" : "closed"),
+            enif_make_int(env, open ? REC.rate : 0),
+            enif_make_int(env, open ? REC.channels : 0),
             enif_make_int64(env, atomic_load(&IN.callbacks)),
             enif_make_int64(env, atomic_load(&IN.clock_misses)),
             enif_make_double(env, newest > 0 ? (double)(now_ns() - newest) / 1e6 : -1),
             atom(env, IN.armed ? rec_state_name(atomic_load(&REC.state)) : "idle"),
-            enif_make_int(env, mic ? aa.getFramesPerBurst(IN.mic) : 0),
-            enif_make_int(env, mic ? aa.getXRunCount(IN.mic) : 0),
-            atom(env, mic && aa.getPerformanceMode(IN.mic) == AA_PERF_LOW_LATENCY ? "true" : "false"),
+            enif_make_int(env, atomic_load(&IN.mic_stream)),
         };
-        result = make_map(env, keys, vals, 12);
+        result = make_map(env, keys, vals, 9);
     }
     pthread_mutex_unlock(&IN.lock);
     return result;
@@ -2775,15 +2075,15 @@ static ERL_NIF_TERM nif_set_midi(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
             m->out_note[i] = (int16_t)note;
         }
     }
-    pthread_mutex_lock(&E.ctl);
+    pthread_mutex_lock(&OUT.ctl);
     if (!is_owner(env)) {
-        pthread_mutex_unlock(&E.ctl);
+        pthread_mutex_unlock(&OUT.ctl);
         free(m);
         return error_tuple(env, "not_owner");
     }
     sp_cmd c = {.type = SP_CMD_MIDI_MAP, .u.map = m};
     bool queued = ctl_push(&c);
-    pthread_mutex_unlock(&E.ctl);
+    pthread_mutex_unlock(&OUT.ctl);
     if (!queued) {
         free(m);
         return error_tuple(env, "busy");
@@ -2830,26 +2130,29 @@ static ERL_NIF_TERM nif_midi_sources_changed(ErlNifEnv *env, int argc, const ERL
 static int on_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     (void)priv;
     (void)info;
-    pthread_mutex_init(&E.lock, NULL);
-    pthread_mutex_init(&IN.lock, NULL);
-    pthread_mutex_init(&MI.out_lock, NULL);
-    for (int i = 0; i < MIDI_SOURCES; i++) pthread_mutex_init(&MI.sources[i].lock, NULL);
     pcm_type = enif_open_resource_type(env, NULL, "magpie_pcm", pcm_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!pcm_type) return 1;
-    pthread_mutex_init(&E.ctl, NULL);
-    pthread_mutex_init(&E.push, NULL);
+    pthread_mutex_init(&E.lock, NULL);
+    pthread_mutex_init(&MI.out_lock, NULL);
+    for (int i = 0; i < MIDI_SOURCES; i++) pthread_mutex_init(&MI.sources[i].lock, NULL);
     pthread_mutex_init(&E.jobs_lock, NULL);
     pthread_mutex_init(&E.stats_lock, NULL);
     pthread_cond_init(&E.jobs_cv, NULL);
-    sp_init(&SP, DEFAULT_RATE);
-    E.drains = true;
-    libs_ok = bind_libraries();
-    if (!libs_ok) LOGE("could not bind %s", libs_error);
+    mio_init();
+    /* The output and the mic: open/1 refuses without them. */
+    E.io_registered = mio_register();
+    if (E.io_registered != MAI_OK)
+        LOGE("no processors (%d; mob_audio_io ABI %d, built against %d)", (int)E.io_registered,
+             (int)mai_abi_version(), MAI_ABI_VERSION);
+    /* Audio frames and MIDI timestamps must be on one clock. */
+    int64_t skew = mob_midi_now_ns() - mai_now_ns();
+    if (skew > 1000000 || skew < -1000000) LOGE("midi: mob_midi's clock is %lld ns off mob_audio_io's", (long long)skew);
     /* MIDI in from mob_midi's threads: the sources' locks are ready. */
     int rc = mob_midi_abi_version() == MOB_MIDI_ABI_VERSION ? mob_midi_set_sink(midi_sink, NULL) : MOB_MIDI_ERR_INVALID;
     MI.sink = rc == MOB_MIDI_OK;
-    if (!MI.sink) LOGE("midi: no sink (%d; mob_midi ABI %d, built against %d)", rc, mob_midi_abi_version(),
-                       MOB_MIDI_ABI_VERSION);
+    if (!MI.sink)
+        LOGE("midi: no sink (%d; mob_midi ABI %d, built against %d)", rc, (int)mob_midi_abi_version(),
+             MOB_MIDI_ABI_VERSION);
     return 0;
 }
 
@@ -2858,8 +2161,10 @@ static ErlNifFunc nif_funcs[] = {
     {"close", 0, nif_close, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"reset", 0, nif_reset, 0},
     {"load_pcm", 4, nif_load_pcm, 0},
-    {"decode", 1, nif_decode, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"load_sample", 2, nif_load_sample, 0},
+    {"load_claim", 1, nif_load_claim, 0},
+    {"load_ticket", 5, nif_load_ticket, 0},
+    {"load_ticket_failed", 3, nif_load_ticket_failed, 0},
+    {"import_chunk", 2, nif_import_chunk, 0},
     {"unload_sample", 1, nif_unload_sample, 0},
     {"set_pad", 3, nif_set_pad, 0},
     {"set_pattern", 3, nif_set_pattern, 0},
@@ -2874,6 +2179,7 @@ static ErlNifFunc nif_funcs[] = {
     {"clock", 0, nif_clock, 0},
     {"info", 0, nif_info, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"reset_stats", 0, nif_reset_stats, 0},
+    {"input_sources", 0, nif_input_sources, 0},
     {"input_open", 1, nif_input_open, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"input_close", 0, nif_input_close, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"record_start", 4, nif_record_start, ERL_NIF_DIRTY_JOB_IO_BOUND},

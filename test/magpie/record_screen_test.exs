@@ -79,6 +79,22 @@ defmodule Magpie.RecordScreenTest do
       assert "pairing comes later" in texts(view)
     end
 
+    test "a phone without other apps' audio (iOS): the source is shown, disabled" do
+      source_tap = fn view, key ->
+        node = Enum.find(Mob.ScreenCase.flatten(view), &(&1.props[:id] == "source_#{key}"))
+        node.props[:on_tap]
+      end
+
+      assert source_tap.(mounted(), :apps) == {self(), {:source, :apps}}
+      refute "not on this phone" in texts(mounted())
+
+      :ok = Fake.set_sources([:mic])
+      view = mounted()
+      assert source_tap.(view, :apps) == nil
+      assert source_tap.(view, :mic) == {self(), {:source, :mic}}
+      assert "not on this phone" in texts(view)
+    end
+
     test "the mic granted: the input opens, the magpie listens, READY" do
       view = mounted()
       assert %{source: :mic, status: :open} = Engine.state().input

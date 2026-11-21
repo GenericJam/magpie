@@ -1,11 +1,17 @@
 defmodule Magpie.Audio.Nif do
   @moduledoc """
   The `magpie_audio` NIF (`c_src/magpie_audio.c`, which includes
-  `c_src/sampler.c`), statically linked into the Android app (`mob.exs`'s
+  `c_src/magpie_io.c`, `c_src/sampler.c` and `c_src/recorder.c`),
+  statically linked into the app on Android and iOS (`mob.exs`'s
   `:static_nifs`). Use it through `Magpie.Audio.Native`; the messages it
   sends are documented in `Magpie.Audio`.
 
-  Off Android the library isn't there: the module still loads, and every
+  Loading it registers two `mob_audio_io` processors (`mai_register`):
+  `"magpie_out"` (render: the sampler) and `"magpie_mic"` (capture: the
+  recorder). Their streams are `Magpie.Audio.Native.Io`'s, opened with
+  `MobAudioIo.open/3` and `module: #{inspect(__MODULE__)}`.
+
+  Off the phone the library isn't there: the module still loads, and every
   function raises `:nif_not_loaded`.
   """
 
@@ -18,23 +24,46 @@ defmodule Magpie.Audio.Nif do
     :ok
   end
 
-  @doc "Open the stream if it isn't, and make `owner` the owner. `{:ok, stream} | {:error, reason}`."
+  @doc """
+  Make `owner` the owner and start the event and MIDI sending threads:
+  `:ok | {:error, :thread | :processors}` (`:processors`: they didn't
+  register, so no stream can open).
+  """
   def open(_owner), do: :erlang.nif_error(:nif_not_loaded)
 
-  @doc "Close the stream (owner only)."
+  @doc "Stop the event and MIDI sending threads (owner only); the streams are `Magpie.Audio.Native.Io`'s."
   def close, do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Everything off and unloaded (owner only)."
   def reset, do: :erlang.nif_error(:nif_not_loaded)
 
-  @doc "Queue a file decode for sample `id` (owner only); the result arrives as a `:loaded` message."
-  def load_sample(_id, _path), do: :erlang.nif_error(:nif_not_loaded)
-
   @doc "Queue f32le PCM for sample `id` (owner only); the result arrives as a `:loaded` message."
   def load_pcm(_id, _pcm, _rate, _channels), do: :erlang.nif_error(:nif_not_loaded)
 
-  @doc "Decode a file to f32le PCM and peaks, synchronously (dirty IO)."
-  def decode(_path), do: :erlang.nif_error(:nif_not_loaded)
+  @doc """
+  A file load of sample `id` begins (owner only): `{:ok, ticket}`, its
+  place among the loads and unloads of `id`. `load_ticket/5` or
+  `load_ticket_failed/3` finishes it; the result arrives as a `:loaded`
+  message.
+  """
+  def load_claim(_id), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "The claimed load's decoded f32le PCM (anyone); `{:error, :cancelled}` if `id` was loaded or unloaded since."
+  def load_ticket(_id, _ticket, _pcm, _rate, _channels), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  The claimed load's file didn't decode (anyone): `reason` (`:not_found`,
+  `:unsupported`, `:no_audio`, `:decode_error`, `:too_long`, `:alloc`,
+  `:busy`, `:cancelled`) reaches the owner in the load's turn.
+  """
+  def load_ticket_failed(_id, _ticket, _reason), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  A decoded chunk (native-endian f32, `channels` per frame) as the library
+  keeps it: `{pcm, peaks}`, the first two channels clipped to ±1 and one
+  peak byte per 256 frames (anyone).
+  """
+  def import_chunk(_chunk, _channels), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Unload sample `id` (owner only)."
   def unload_sample(_id), do: :erlang.nif_error(:nif_not_loaded)
@@ -69,17 +98,21 @@ defmodule Magpie.Audio.Nif do
   @doc "`%{frame, time, rate}` or nil."
   def clock, do: :erlang.nif_error(:nif_not_loaded)
 
-  @doc "Diagnostics (dirty IO)."
+  @doc "The engine's diagnostics (dirty IO); `Magpie.Audio.Native.info/0` adds the streams'."
   def info, do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Start callback timing, trigger latency, the voice peak, steals and hard cuts over."
   def reset_stats, do: :erlang.nif_error(:nif_not_loaded)
 
+  @doc "The sources `input_open/1` can open here: `[:mic, :apps]` on Android, `[:mic]` on iOS."
+  def input_sources, do: :erlang.nif_error(:nif_not_loaded)
+
   @doc """
-  Close any input, then open `source` (`:mic` | `:apps`): `{:ok, input}`
-  (owner only, dirty IO). The outcome arrives as `{:magpie_audio, :input,
-  input, :started, info}` or `{:magpie_audio, :input, input, :closed,
-  reason}`.
+  Close any input, then open `source` (owner only, dirty IO): the mic
+  answers `{:ok, input, rate}` and is opening until `"magpie_mic"`'s stream
+  (at `rate`) starts; other apps answer `{:ok, input}`. The outcome arrives
+  as `{:magpie_audio, :input, input, :started, info}` or `{:magpie_audio,
+  :input, input, :closed, reason}`.
   """
   def input_open(_source), do: :erlang.nif_error(:nif_not_loaded)
 

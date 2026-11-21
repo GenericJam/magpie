@@ -33,13 +33,16 @@ defmodule Magpie.Audio.Fake do
   instead (`{:input, input, :closed, reason}`, as a refused consent
   does); `refuse_input/1` makes it answer an error after the close (as
   the phone does when the new source can't open); `stick_input/1` makes
-  closes answer `{:error, :input_stuck}` (a mic stream that won't stop:
-  the input is gone, the close must be tried again). `end_input/1`
-  closes it as the system would. Audio arrives only through `feed/1`:
-  interleaved f32le at the input's channels. Each call is one meter
-  period: it runs the recorder over the frames and sends one `:meter`
-  (the fed frames' peak dBFS; the take, new peak bytes, one per 256
-  recorded frames, the partial block flushed on stop, as the C does).
+  closes answer `{:error, :input_stuck}` (an input that won't stop: the
+  input is gone, the close must be tried again). `end_input/1` closes it
+  as the system would. `input_sources/0` is `[:mic, :apps]` (Android's)
+  until `set_sources/1` changes it (`[:mic]`: iOS) for this engine
+  (`open/1` restores it); a source not in it closes the input and answers
+  `{:error, :unsupported}`, as iOS does for other apps. Audio arrives only
+  through `feed/1`: interleaved f32le at the input's channels. Each call
+  is one meter period: it runs the recorder over the frames and sends one
+  `:meter` (the fed frames' peak dBFS; the take, new peak bytes, one per
+  256 recorded frames, the partial block flushed on stop, as the C does).
 
   The recorder: `record_start/1` answers `{:ok, take}` (a new id each
   time; every recording message carries it). `:now` records from the
@@ -71,6 +74,8 @@ defmodule Magpie.Audio.Fake do
 
   @rate 48_000
   @peak_frames 256
+  # The sources input_open/1 takes (Android's: the mic and other apps).
+  @sources %{mic: true, apps: true}
 
   # ── Magpie.Audio ──────────────────────────────────────────────────────────
 
@@ -153,6 +158,9 @@ defmodule Magpie.Audio.Fake do
   def input_close, do: call(:input_close)
 
   @impl Magpie.Audio
+  def input_sources, do: call(:input_sources)
+
+  @impl Magpie.Audio
   def record_start(%{mode: _, max_seconds: _, threshold_db: _, pre_roll_ms: _} = opts),
     do: call({:record_start, opts})
 
@@ -207,6 +215,9 @@ defmodule Magpie.Audio.Fake do
   is gone (no meters, recording dropped) but not released.
   """
   def stick_input(count) when is_integer(count) and count >= 0, do: call({:stick_input, count})
+
+  @doc "What `input_sources/0` answers until the next `open/1` (`[:mic]`: as on iOS)."
+  def set_sources(sources) when is_list(sources), do: call({:set_sources, sources})
 
   @doc "The system closes the open input with `reason` (`:stopped`, `:disconnected`, …)."
   def end_input(reason), do: call({:end_input, reason})
@@ -270,7 +281,8 @@ defmodule Magpie.Audio.Fake do
       calls: [],
       midi: nil,
       midi_outputs: [],
-      midi_sources_changed: 0
+      midi_sources_changed: 0,
+      sources: @sources
     }
   end
 
@@ -281,7 +293,7 @@ defmodule Magpie.Audio.Fake do
   def handle_call({:open, owner}, _from, %{fail_open: nil} = s),
     do:
       {:reply, {:ok, %{rate: @rate, burst: 192, buffer_frames: 384, low_latency: true}},
-       %{s | owner: owner, open: true}}
+       %{s | owner: owner, open: true, sources: @sources}}
 
   def handle_call({:open, owner}, _from, s),
     do: {:reply, {:error, s.fail_open}, %{s | owner: owner, open: false}}
@@ -316,6 +328,12 @@ defmodule Magpie.Audio.Fake do
     do: {:reply, :ok, %{s | refuse_input: reason}}
 
   def handle_call({:stick_input, count}, _from, s), do: {:reply, :ok, %{s | stuck: count}}
+
+  def handle_call({:set_sources, sources}, _from, s),
+    do: {:reply, :ok, %{s | sources: Map.new(sources, &{&1, true})}}
+
+  def handle_call(:input_sources, _from, s),
+    do: {:reply, Enum.filter([:mic, :apps], &Map.has_key?(s.sources, &1)), s}
 
   def handle_call({:end_input, _reason}, _from, %{input: nil} = s),
     do: {:reply, {:error, :no_input}, s}
@@ -378,7 +396,8 @@ defmodule Magpie.Audio.Fake do
         :last_input,
         :last_take,
         :midi_outputs,
-        :midi_sources_changed
+        :midi_sources_changed,
+        :sources
       ])
 
     {:reply, :ok, Map.merge(fresh(s.owner, s.open, s.fail_open), keep)}
@@ -386,6 +405,10 @@ defmodule Magpie.Audio.Fake do
 
   def handle_call({:input_open, _source}, _from, %{stuck: stuck} = s) when stuck > 0,
     do: {:reply, {:error, :input_stuck}, %{s | input: nil, rec: nil, stuck: stuck - 1}}
+
+  def handle_call({:input_open, source}, _from, %{sources: sources} = s)
+      when not is_map_key(sources, source),
+      do: {:reply, {:error, :unsupported}, %{s | input: nil, rec: nil}}
 
   def handle_call({:input_open, _source}, _from, %{refuse_input: reason} = s)
       when reason != nil,
