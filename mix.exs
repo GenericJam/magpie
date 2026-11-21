@@ -40,10 +40,7 @@ defmodule Magpie.MixProject do
       {:mob_midi, "~> 0.4.0"},
       # The audio streams under the engine (c_src/magpie_io.c's processors):
       # the output, the microphone and file decoding, on Android and iOS.
-      # Temporary: main's commit until 0.1.0 is on Hex, then
-      # {:mob_audio_io, "~> 0.1"} (see mob.exs for its trust entry).
-      {:mob_audio_io,
-       github: "GenericJam/mob_audio_io", ref: "faf1de89b969f5d43a0bf43ff2740008cd35039b"},
+      {:mob_audio_io, "~> 0.1"},
       # Tests check kit files against design/kit.schema.json itself.
       {:jsv, "~> 0.28.0", only: :test},
       # Code quality — Credo + ex_slop (catches AI-generated patterns

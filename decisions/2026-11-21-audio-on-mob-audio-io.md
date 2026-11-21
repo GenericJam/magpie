@@ -86,8 +86,14 @@ plugin calls it only on API 31+.
 - Imported PCM keeps its float values (clipped to ±1) instead of passing
   through 16 bits; an import or a load stops within one codec buffer when
   its process exits.
-- The plugin is a git dependency until 0.1.0 is on Hex (`mix.exs`, and
-  `:acknowledge_unsafe_plugins` in `mob.exs` until it can be trusted).
+- Release cutover (2026-11-21): the plugin now uses the signed Hex
+  `{:mob_audio_io, "~> 0.1"}` package, locked to 0.1.0. `mob.exs` trusts
+  its shared release key; only the app-owned `:magpie_capture` retains an
+  unsafe acknowledgement. This supersedes the temporary `faf1de8` git pin.
+  The release blocker is resolved; device acceptance remains a merge blocker.
+  The earlier review's three findings were resolved by the existing
+  `509c0dc` fixes and its subsequent PR re-review; this dependency cutover
+  changes none of that audio code.
 - Not measured yet: everything above runs on the host only (device audio
   was paused). The PR lists the device checks: pad latency against master,
   underruns over a pattern, live recording timing, imports with cancel,

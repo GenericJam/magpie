@@ -71,11 +71,7 @@ config :mob, :plugins, [:magpie_capture, :mob_midi, :mob_audio_io]
 
 # magpie_capture is this app's own code, reviewed with it, so it builds
 # unsigned instead of carrying a signing key (mob_dev prints a banner).
-# mob_audio_io isn't released yet, so its checkout carries no signature for
-# the trust gate below: a git dependency pinned to a commit (mix.lock) of a
-# first-party repo. Once it is on Hex, drop it from this list and add it to
-# :trusted_plugins with the shared release key like the others.
-config :mob, :acknowledge_unsafe_plugins, [:magpie_capture, :mob_audio_io]
+config :mob, :acknowledge_unsafe_plugins, [:magpie_capture]
 
 # Trust gate for the first-party plugins. Each is signed in CI with the shared
 # mob release key; this is that key's public fingerprint. The build refuses an
@@ -87,6 +83,7 @@ config :mob, :acknowledge_unsafe_plugins, [:magpie_capture, :mob_audio_io]
 # [...]` for an unsigned prototype.
 config :mob, :trusted_plugins, %{
   mob_audio_capture: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
+  mob_audio_io: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
   mob_camera: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
   mob_location: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
   mob_biometric: "ed25519:nc56w+1Kx0gIt/4EkHxnMZCKHMzp4+S5kS/HoSzEZkg=",
